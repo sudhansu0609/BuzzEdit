@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from faster_whisper import WhisperModel
-from ..runtime.gpu_broker import gpu_broker
+from runtime.gpu_broker import gpu_broker
 
 logger = logging.getLogger("faster_whisper_engine")
 

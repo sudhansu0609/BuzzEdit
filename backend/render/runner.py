@@ -2,9 +2,9 @@ import asyncio
 import re
 import logging
 from typing import List, Callable, Optional
-from ..timeline.schema import Timeline, frame_to_time
-from .compiler import FilterGraphCompiler
-from .encoder import get_encoder_flags
+from timeline.schema import Timeline, frame_to_time
+from render.compiler import FilterGraphCompiler
+from render.encoder import get_encoder_flags
 
 logger = logging.getLogger("render_runner")
 

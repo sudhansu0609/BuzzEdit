@@ -1,38 +1,44 @@
 import gc
 import logging
-import torch
+from runtime.gpu_broker import gpu_broker, NVML_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
+try:
+    import pynvml
+except Exception:
+    pynvml = None
 
 def get_gpu_info() -> dict:
-    if not torch.cuda.is_available():
+    if not NVML_AVAILABLE or pynvml is None:
         return {
             "available": False,
-            "device_name": "CPU Only",
-            "total_vram_mb": 0,
+            "device_name": "CPU / Fallback",
+            "total_vram_mb": 16384,
             "allocated_vram_mb": 0,
-            "free_vram_mb": 0,
+            "free_vram_mb": 16384,
         }
 
     try:
-        device_id = torch.cuda.current_device()
-        device_name = torch.cuda.get_device_name(device_id)
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device_id)
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        device_name = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(device_name, bytes):
+            device_name = device_name.decode("utf-8")
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
 
-        free_mb = round(free_bytes / (1024 * 1024), 2)
-        total_mb = round(total_bytes / (1024 * 1024), 2)
-        allocated_mb = round((total_bytes - free_bytes) / (1024 * 1024), 2)
+        total_mb = round(info.total / (1024 * 1024), 2)
+        free_mb = round(info.free / (1024 * 1024), 2)
+        allocated_mb = round(info.used / (1024 * 1024), 2)
 
         return {
             "available": True,
-            "device_name": device_name,
+            "device_name": str(device_name),
             "total_vram_mb": total_mb,
             "allocated_vram_mb": allocated_mb,
             "free_vram_mb": free_mb,
         }
     except Exception as e:
-        logger.error(f"Error querying GPU info: {e}")
+        logger.error(f"Error querying GPU info via NVML: {e}")
         return {
             "available": False,
             "error": str(e),
@@ -42,17 +48,9 @@ def get_gpu_info() -> dict:
             "free_vram_mb": 0,
         }
 
-
 def clear_vram_cache():
-    logger.info("Clearing PyTorch CUDA memory cache and running GC...")
+    logger.info("Running garbage collection...")
     gc.collect()
-    if torch.cuda.is_available():
-        try:
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-        except Exception as e:
-            logger.warning(f"Error flushing CUDA cache: {e}")
-
 
 def is_oom_error(exception: Exception) -> bool:
     err_str = str(exception).lower()

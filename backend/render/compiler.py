@@ -1,5 +1,5 @@
 from typing import Dict, List, Tuple
-from ..timeline.schema import Timeline, frame_to_time
+from timeline.schema import Timeline, frame_to_time
 
 class FilterGraphCompiler:
     def __init__(self, timeline: Timeline):

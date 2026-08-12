@@ -2,10 +2,10 @@ import logging
 import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from ..timeline import Timeline, SourceFile, add_broll_item
-from ..comfyui_bridge.workflow_loader import prepare_broll_workflow
-from ..comfyui_bridge.queue_manager import ComfyUIQueueManager
-from ..utils.ffmpeg_utils import run_ffmpeg
+from timeline import Timeline, SourceFile, add_broll_item
+from comfyui_bridge.workflow_loader import prepare_broll_workflow
+from comfyui_bridge.queue_manager import ComfyUIQueueManager
+from utils.ffmpeg_utils import run_ffmpeg
 
 logger = logging.getLogger("broll_agent")
 

@@ -2,7 +2,7 @@ import json
 import logging
 import httpx
 from typing import List, Dict, Any, Optional
-from ..runtime.gpu_broker import gpu_broker
+from runtime.gpu_broker import gpu_broker
 
 logger = logging.getLogger("lm_studio_client")
 
