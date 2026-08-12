@@ -85,6 +85,21 @@ export async function getSegments(projectId: string): Promise<any> {
   return api(`/api/analysis/${projectId}/segments`);
 }
 
+export async function getTimeline(projectId: string): Promise<any> {
+  return api(`/api/timeline/${projectId}`);
+}
+
+export async function generateTimeline(projectId: string): Promise<any> {
+  return api(`/api/timeline/${projectId}/generate`, { method: 'POST' });
+}
+
+export async function toggleWordApi(projectId: string, wordId: string, enabled: boolean): Promise<any> {
+  return api(`/api/timeline/${projectId}/toggle_word`, {
+    method: 'POST',
+    body: JSON.stringify({ word_id: wordId, enabled }),
+  });
+}
+
 export async function getRenderStatus(jobId: string): Promise<any> {
   return api(`/api/rendering/status/${jobId}`);
 }
@@ -205,10 +220,6 @@ export async function convertToShorts(projectId: string): Promise<any> {
     body: JSON.stringify({ project_id: projectId }),
   });
 }
-
-
-
-
 
 export function useApi() {
   const [loading, setLoading] = useState(false);

@@ -1,9 +1,11 @@
+from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from models import TranscribeJob, TranscriptionResult, TranscriptSegment
 from config import PROJECTS_DIR
 from store.project_store import ProjectStore
-from utils.ffmpeg_utils import extract_audio
-from asr import whisper_engine
+from utils.ffmpeg_utils import extract_audio, get_video_info
+from asr import whisper_engine, analyze_disfluencies
+from timeline import build_timeline_from_transcript
 
 router = APIRouter()
 project_store = ProjectStore(base_dir=str(PROJECTS_DIR))
@@ -16,8 +18,8 @@ async def transcribe_video(job: TranscribeJob):
         raise HTTPException(status_code=404, detail="Project not found")
 
     source_video = p_data.get("source_video")
-    if not source_video:
-        raise HTTPException(status_code=400, detail="No source video")
+    if not source_video or not Path(source_video).exists():
+        raise HTTPException(status_code=400, detail="Source video missing")
 
     job_id = f"trans_{job.project_id}"
     jobs[job_id] = {
@@ -29,17 +31,38 @@ async def transcribe_video(job: TranscribeJob):
     }
 
     try:
-        words = await whisper_engine.transcribe_audio_async(source_video)
+        # 1. Extract WAV audio
+        audio_path = extract_audio(source_video)
 
-        # Convert to TranscriptSegment models
+        # 2. Get Video info
+        v_info = get_video_info(source_video)
+
+        # 3. Transcribe via faster-whisper
+        words = await whisper_engine.transcribe_audio_async(audio_path, language=job.language or "en")
+
+        # 4. Disfluency analysis
+        ann_words = analyze_disfluencies(words)
+
+        # 5. Build EDL Timeline
+        tl = build_timeline_from_transcript(
+            source_path=source_video,
+            duration_seconds=v_info.get("duration", 0.0),
+            transcript_words=ann_words,
+            fps_num=int(round(v_info.get("fps", 30))),
+            fps_den=1,
+            width=v_info.get("width", 1920),
+            height=v_info.get("height", 1080)
+        )
+
+        # Convert to TranscriptSegment list for legacy UI components
         segments = []
-        if words:
+        if ann_words:
             seg = TranscriptSegment(
                 id=0,
-                start=words[0]["start"],
-                end=words[-1]["end"],
-                text=" ".join([w["word"] for w in words]),
-                words=words,
+                start=ann_words[0]["start"],
+                end=ann_words[-1]["end"],
+                text=" ".join([w["word"] for w in ann_words]),
+                words=ann_words,
                 confidence=1.0
             )
             segments.append(seg)
@@ -47,10 +70,11 @@ async def transcribe_video(job: TranscribeJob):
         res = TranscriptionResult(
             segments=segments,
             language=job.language or "en",
-            duration=words[-1]["end"] if words else 0.0
+            duration=ann_words[-1]["end"] if ann_words else 0.0
         )
 
         p_data["transcript"] = res.model_dump()
+        p_data["timeline"] = tl.model_dump()
         p_data["status"] = "transcribed"
         project_store.save_project(job.project_id, p_data)
 
@@ -62,6 +86,7 @@ async def transcribe_video(job: TranscribeJob):
             "status": "completed",
             "job_id": job_id,
             "segments": len(segments),
+            "timeline": tl
         }
     except Exception as e:
         jobs[job_id]["status"] = "failed"

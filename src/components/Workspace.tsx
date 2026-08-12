@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useProjectStore } from '../hooks/store';
-import { transcribeProject, analyzeProject, renderProject, autoEditProject, getProject, getTranscript, getSegments, updateSettings } from '../hooks/api';
+import { transcribeProject, analyzeProject, renderProject, autoEditProject, getProject, getTranscript, getSegments, getTimeline } from '../hooks/api';
 import PreviewPlayer from './PreviewPlayer';
 import Timeline from './Timeline';
 import TranscriptEditor from './TranscriptEditor';
@@ -21,13 +21,14 @@ export default function Workspace() {
 
   const loadProjectData = async (projectId: string) => {
     try {
-      const [projectData, transcriptData, segmentsData] = await Promise.allSettled([
+      const [projectData, transcriptData, segmentsData, timelineData] = await Promise.allSettled([
         getProject(projectId),
         getTranscript(projectId).catch(() => null),
         getSegments(projectId).catch(() => null),
+        getTimeline(projectId).catch(() => null),
       ]);
 
-      if (projectData.status === 'fulfilled') {
+      if (projectData.status === 'fulfilled' && projectData.value) {
         setProject(projectData.value);
       }
       if (transcriptData.status === 'fulfilled' && transcriptData.value) {
@@ -35,6 +36,9 @@ export default function Workspace() {
       }
       if (segmentsData.status === 'fulfilled' && segmentsData.value) {
         updateProject({ detectedSegments: segmentsData.value.segments });
+      }
+      if (timelineData.status === 'fulfilled' && timelineData.value) {
+        updateProject({ timeline: timelineData.value });
       }
     } catch (err: any) {
       console.error('Failed to load project data:', err);
@@ -44,7 +48,7 @@ export default function Workspace() {
   const handleTranscribe = useCallback(async () => {
     if (!project) return;
     setProcessing(true);
-    setProgress(0, 'Transcribing audio...');
+    setProgress(0, 'Transcribing audio & building EDL...');
     try {
       await transcribeProject(project.id);
       setProgress(1, 'Transcription complete');
@@ -74,7 +78,7 @@ export default function Workspace() {
   const handleRender = useCallback(async () => {
     if (!project) return;
     setProcessing(true);
-    setProgress(0, 'Rendering video...');
+    setProgress(0, 'Rendering video single-pass...');
     try {
       await renderProject(project.id);
       setProgress(1, 'Render complete');
@@ -101,10 +105,6 @@ export default function Workspace() {
     }
   }, [project, setProcessing, setProgress, setError]);
 
-  const canTranscribe = project?.status === 'draft';
-  const canAnalyze = project?.status === 'transcribed';
-  const canRender = project?.status === 'analyzed' || project?.status === 'transcribed';
-
   return (
     <div className="workspace">
       <div className="workspace-main">
@@ -112,22 +112,22 @@ export default function Workspace() {
           <PreviewPlayer />
           <div className="toolbar">
             <button
-              className={`btn ${canTranscribe ? 'btn-primary' : ''}`}
-              disabled={!canTranscribe || isProcessing}
+              className="btn btn-primary"
+              disabled={isProcessing}
               onClick={handleTranscribe}
             >
               Transcribe
             </button>
             <button
-              className={`btn ${canAnalyze ? 'btn-primary' : ''}`}
-              disabled={!canAnalyze || isProcessing}
+              className="btn btn-primary"
+              disabled={isProcessing}
               onClick={handleAnalyze}
             >
               Analyze
             </button>
             <button
-              className={`btn ${canRender ? 'btn-success' : ''}`}
-              disabled={!canRender || isProcessing}
+              className="btn btn-success"
+              disabled={isProcessing}
               onClick={handleRender}
             >
               Render

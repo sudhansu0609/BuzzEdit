@@ -151,17 +151,17 @@ class JobScheduler:
                 await asyncio.sleep(2)
 
     async def _process_job(self, job: Dict[str, Any]):
-        from routes.projects import projects
+        from store.project_store import ProjectStore
         from models import Project
 
         project_id = job["project_id"]
-        project_dir = PROJECTS_DIR / project_id
-        proj_file = project_dir / "project.json"
+        store = ProjectStore(base_dir=str(PROJECTS_DIR))
+        p_data = store.get_project(project_id)
 
-        if not proj_file.exists():
-            raise FileNotFoundError(f"Project directory/file not found for {project_id}")
+        if not p_data:
+            raise FileNotFoundError(f"Project data not found for {project_id}")
 
-        project = Project.model_validate_json(proj_file.read_text())
+        project = Project.model_validate(p_data)
 
         # Date-organized output folder: output/YYYY-MM-DD/project_name/
         today_str = datetime.now().strftime("%Y-%m-%d")
