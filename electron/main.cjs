@@ -125,19 +125,18 @@ async function startBackend() {
 }
 
 async function findPython() {
-  const portablePy = 'B:\\ComfyUI_windows_portable_nvidia_cu118_or_cpu\\ComfyUI_windows_portable\\python_embeded\\python.exe';
-  if (fs.existsSync(portablePy)) {
-    return portablePy;
+  if (process.env.PYTHON_EXECUTABLE && fs.existsSync(process.env.PYTHON_EXECUTABLE)) {
+    return process.env.PYTHON_EXECUTABLE;
   }
-  const candidates = ['python', 'python3', 'py', 'python.exe'];
-  for (const cmd of candidates) {
-    try {
-      const { execSync } = require('child_process');
-      execSync(`${cmd} --version`, { stdio: 'pipe' });
-      return cmd;
-    } catch {}
+  const venvPy = path.join(__dirname, '../.venv/Scripts/python.exe');
+  if (fs.existsSync(venvPy)) {
+    return venvPy;
   }
-  return 'python';
+  const venvPyUnix = path.join(__dirname, '../.venv/bin/python');
+  if (fs.existsSync(venvPyUnix)) {
+    return venvPyUnix;
+  }
+  throw new Error('Project Python virtual environment (.venv) not found. Run `uv venv --python 3.11 .venv` and `uv pip install -r backend/requirements.txt`.');
 }
 
 async function waitForBackend(retries = 20) {
