@@ -1,22 +1,19 @@
 import uuid
-import json
 import shutil
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from fastapi import APIRouter, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from models import Project
-from config import PROJECTS_DIR, TEMP_DIR
-from utils.ffmpeg_utils import get_video_info, FFmpegError
+from config import PROJECTS_DIR
+from utils.ffmpeg_utils import get_video_info
+from store.project_store import ProjectStore
 
 router = APIRouter()
-projects: Dict[str, Project] = {}
-
+project_store = ProjectStore(base_dir=str(PROJECTS_DIR))
 
 class PathImportRequest(BaseModel):
     path: str
-
 
 @router.post("/import_path", response_model=Project)
 async def import_video_path(body: PathImportRequest):
@@ -50,13 +47,8 @@ async def import_video_path(body: PathImportRequest):
     project.settings["source_height"] = video_info["height"]
     project.settings["source_duration"] = video_info["duration"]
 
-    project_dir = PROJECTS_DIR / project_id
-    project_dir.mkdir(parents=True, exist_ok=True)
-    (project_dir / "project.json").write_text(project.model_dump_json(indent=2))
-    projects[project_id] = project
-
+    project_store.save_project(project_id, project.model_dump())
     return project
-
 
 @router.post("/upload", response_model=Project)
 async def upload_video(file: UploadFile = File(...)):
@@ -84,96 +76,44 @@ async def upload_video(file: UploadFile = File(...)):
     project.settings["source_height"] = video_info["height"]
     project.settings["source_duration"] = video_info["duration"]
 
-    project_dir = PROJECTS_DIR / project_id
-    project_dir.mkdir(parents=True, exist_ok=True)
-    (project_dir / "project.json").write_text(project.model_dump_json(indent=2))
-    projects[project_id] = project
-
+    project_store.save_project(project_id, project.model_dump())
     return project
-
 
 @router.get("/list")
 async def list_projects():
+    projs = project_store.list_projects()
     result = []
-    for pid, proj in projects.items():
+    for p in projs:
         result.append({
-            "id": proj.id,
-            "name": proj.name,
-            "status": proj.status,
-            "source_video": proj.source_video,
+            "id": p.get("id"),
+            "name": p.get("name"),
+            "status": p.get("status"),
+            "source_video": p.get("source_video"),
+            "sourceVideo": p.get("source_video"),
         })
     return {"projects": result}
 
-
 @router.get("/{project_id}", response_model=Project)
 async def get_project(project_id: str):
-    if project_id in projects:
-        return projects[project_id]
-
-    project_dir = PROJECTS_DIR / project_id
-    if not project_dir.exists():
+    data = project_store.get_project(project_id)
+    if not data:
         raise HTTPException(status_code=404, detail="Project not found")
-
-    proj_file = project_dir / "project.json"
-    if not proj_file.exists():
-        raise HTTPException(status_code=404, detail="Project file not found")
-
-    project = Project.model_validate_json(proj_file.read_text())
-    projects[project_id] = project
-    return project
-
+    return Project.model_validate(data)
 
 @router.put("/{project_id}", response_model=Project)
 async def update_project(project_id: str, updates: Dict[str, Any]):
-    if project_id not in projects:
+    data = project_store.get_project(project_id)
+    if not data:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    project = projects[project_id]
+    project = Project.model_validate(data)
     updated = project.model_copy(update=updates)
-
-    project_dir = PROJECTS_DIR / project_id
-    (project_dir / "project.json").write_text(updated.model_dump_json(indent=2))
-    projects[project_id] = updated
-
+    project_store.save_project(project_id, updated.model_dump())
     return updated
-
-
-@router.put("/{project_id}/settings", response_model=Project)
-async def update_settings(project_id: str, settings: Dict[str, Any]):
-    if project_id not in projects:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    project = projects[project_id]
-    merged = {**project.settings, **settings}
-    updated = project.model_copy(update={"settings": merged})
-
-    project_dir = PROJECTS_DIR / project_id
-    (project_dir / "project.json").write_text(updated.model_dump_json(indent=2))
-    projects[project_id] = updated
-
-    return updated
-
 
 @router.delete("/{project_id}")
 async def delete_project(project_id: str):
-    if project_id in projects:
-        del projects[project_id]
-
-    project_dir = PROJECTS_DIR / project_id
-    if project_dir.exists():
-        shutil.rmtree(project_dir, ignore_errors=True)
-
-    return {"status": "deleted", "id": project_id}
-
-
-@router.get("/{project_id}/video_info")
-async def get_video_info_endpoint(project_id: str):
-    if project_id not in projects:
+    success = project_store.delete_project(project_id)
+    if not success:
         raise HTTPException(status_code=404, detail="Project not found")
-
-    project = projects[project_id]
-    try:
-        info = get_video_info(project.source_video)
-        return info
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "deleted", "id": project_id}

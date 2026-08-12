@@ -9,16 +9,18 @@ export default function PreviewPlayer() {
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoReady, setVideoReady] = useState(false);
 
+  const sourceVideo = project?.source_video || project?.sourceVideo;
+
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !project?.sourceVideo) return;
+    if (!video || !sourceVideo) return;
 
     const handleTimeUpdate = () => setCurrentTime(video.currentTime);
     const handlePlay = () => setIsPlaying(true);
     const handlePause = () => setIsPlaying(false);
     const handleEnded = () => setIsPlaying(false);
     const handleLoadedData = () => setVideoReady(true);
-    const handleError = () => setVideoError('Failed to load video');
+    const handleError = () => setVideoError('Failed to stream video');
 
     video.addEventListener('timeupdate', handleTimeUpdate);
     video.addEventListener('play', handlePlay);
@@ -27,7 +29,8 @@ export default function PreviewPlayer() {
     video.addEventListener('loadeddata', handleLoadedData);
     video.addEventListener('error', handleError);
 
-    video.src = project.sourceVideo;
+    // Stream video through backend HTTP Range endpoint
+    video.src = `http://localhost:8099/api/media/stream?path=${encodeURIComponent(sourceVideo)}`;
     video.load();
 
     return () => {
@@ -38,10 +41,10 @@ export default function PreviewPlayer() {
       video.removeEventListener('loadeddata', handleLoadedData);
       video.removeEventListener('error', handleError);
     };
-  }, [project?.sourceVideo, setCurrentTime, setIsPlaying]);
+  }, [sourceVideo, setCurrentTime, setIsPlaying]);
 
   useEffect(() => {
-    if (videoRef.current) {
+    if (videoRef.current && Math.abs(videoRef.current.currentTime - currentTime) > 0.3) {
       videoRef.current.currentTime = currentTime;
     }
   }, [currentTime]);
@@ -88,23 +91,12 @@ export default function PreviewPlayer() {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  const getSelectedClip = () => {
-    if (!selectedClipId || !project) return null;
-    return project.clips.find(c => c.id === selectedClipId);
-  };
-
-  const selectedClip = getSelectedClip();
-  const clipInfo = selectedClip ? (
-    <div className="clip-info">
-      <span className="clip-type">{selectedClip.clipType}</span>
-      <span className="clip-time">{formatTime(selectedClip.startTime)} - {formatTime(selectedClip.endTime)}</span>
-    </div>
-  ) : null;
+  const duration = videoRef.current?.duration || 60;
 
   return (
     <div className="preview-player">
       <div className="video-container">
-        {project?.sourceVideo ? (
+        {sourceVideo ? (
           <>
             <video
               ref={videoRef}
@@ -114,17 +106,12 @@ export default function PreviewPlayer() {
             {!videoReady && !videoError && (
               <div className="video-loading">
                 <div className="spinner" />
-                <span>Loading video...</span>
+                <span>Loading video stream...</span>
               </div>
             )}
             {videoError && (
               <div className="video-error">
                 <span>{videoError}</span>
-              </div>
-            )}
-            {isPlaying && (
-              <div className="play-overlay">
-                <div className="pause-icon" />
               </div>
             )}
           </>
@@ -139,7 +126,7 @@ export default function PreviewPlayer() {
         <div className="seek-bar" onClick={handleSeek}>
           <div
             className="seek-progress"
-            style={{ width: `${(currentTime / (project?.transcript?.length ? Math.max(...project.transcript.map(s => s.end)) : 60)) * 100}%` }}
+            style={{ width: `${(currentTime / duration) * 100}%` }}
           />
         </div>
 
@@ -149,7 +136,7 @@ export default function PreviewPlayer() {
           </button>
 
           <span className="time-display font-mono text-xs">
-            {formatTime(currentTime)} / {formatTime(project?.transcript?.length ? Math.max(...project.transcript.map(s => s.end)) : 60)}
+            {formatTime(currentTime)} / {formatTime(duration)}
           </span>
 
           <div className="volume-control">
@@ -166,8 +153,6 @@ export default function PreviewPlayer() {
               className="volume-slider"
             />
           </div>
-
-          {clipInfo}
         </div>
       </div>
     </div>

@@ -14,10 +14,10 @@ export default function Workspace() {
   const [activeTab, setActiveTab] = useState<'transcript' | 'agents' | 'queue' | 'export'>('transcript');
 
   useEffect(() => {
-    if (project) {
+    if (project?.id) {
       loadProjectData(project.id);
     }
-  }, [project]);
+  }, [project?.id]);
 
   const loadProjectData = async (projectId: string) => {
     try {

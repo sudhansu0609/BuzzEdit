@@ -30,6 +30,8 @@ export interface Project {
   id: string;
   name: string;
   sourceVideo: string;
+  source_video?: string;
+  timeline?: any;
   clips: Clip[];
   transcript?: TranscriptSegment[];
   detectedSegments: DetectedSegment[];
