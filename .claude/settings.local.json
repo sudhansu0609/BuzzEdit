@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($p = \"C:\\\\Documents\\\\ComfyUI\"; Write-Output \"ComfyUI exists: $\\(Test-Path $p\\)\"; Write-Output \"Workflows: $\\(Test-Path \"$p\\\\user\\\\default\\\\workflows\"\\)\"; Write-Output \"Whisper: $\\(Test-Path \"$p\\\\models\\\\stt\\\\whisper\"\\)\"; Write-Output \"---FFMPEG---\"; try { \\(ffmpeg -version 2>&1 | Select-Object -First 1\\) } catch { \"ffmpeg not on PATH\" }; Write-Output \"---PYTHON---\"; try { python --version } catch { \"python not on PATH\" }; Write-Output \"---NODE---\"; try { node --version } catch { \"node not found\" })"
+    ]
+  }
+}
