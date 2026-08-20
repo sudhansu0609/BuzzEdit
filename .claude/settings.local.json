@@ -1,7 +1,23 @@
 {
   "permissions": {
     "allow": [
-      "PowerShell($p = \"C:\\\\Documents\\\\ComfyUI\"; Write-Output \"ComfyUI exists: $\\(Test-Path $p\\)\"; Write-Output \"Workflows: $\\(Test-Path \"$p\\\\user\\\\default\\\\workflows\"\\)\"; Write-Output \"Whisper: $\\(Test-Path \"$p\\\\models\\\\stt\\\\whisper\"\\)\"; Write-Output \"---FFMPEG---\"; try { \\(ffmpeg -version 2>&1 | Select-Object -First 1\\) } catch { \"ffmpeg not on PATH\" }; Write-Output \"---PYTHON---\"; try { python --version } catch { \"python not on PATH\" }; Write-Output \"---NODE---\"; try { node --version } catch { \"node not found\" })"
+      "PowerShell($p = \"C:\\\\Documents\\\\ComfyUI\"; Write-Output \"ComfyUI exists: $\\(Test-Path $p\\)\"; Write-Output \"Workflows: $\\(Test-Path \"$p\\\\user\\\\default\\\\workflows\"\\)\"; Write-Output \"Whisper: $\\(Test-Path \"$p\\\\models\\\\stt\\\\whisper\"\\)\"; Write-Output \"---FFMPEG---\"; try { \\(ffmpeg -version 2>&1 | Select-Object -First 1\\) } catch { \"ffmpeg not on PATH\" }; Write-Output \"---PYTHON---\"; try { python --version } catch { \"python not on PATH\" }; Write-Output \"---NODE---\"; try { node --version } catch { \"node not found\" })",
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(.venv/Scripts/python.exe backend/main.py)",
+      "PowerShell($c = Get-NetTCPConnection -LocalPort 8099 -State Listen -ErrorAction SilentlyContinue; if \\($c\\) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; \"Backend running on 8099 -> PID $\\($c.OwningProcess\\) [$\\($p.Path\\)]\" } else { \"No backend currently on 8099\" })",
+      "Bash(../.venv/Scripts/python.exe -c \"from config import PROJECTS_DIR; print\\(PROJECTS_DIR\\); import os; print\\('files:', os.listdir\\(PROJECTS_DIR\\)[:20] if os.path.exists\\(PROJECTS_DIR\\) else 'MISSING'\\)\")",
+      "Bash(../.venv/Scripts/python.exe -m pytest tests/test_clip_ops.py -q)",
+      "Bash(../.venv/Scripts/python.exe -c \"import routes.timeline; print\\('routes import OK'\\)\")",
+      "Bash(../.venv/Scripts/python.exe -m pytest tests/ -q)",
+      "Bash(../.venv/Scripts/python.exe -c \"import routes.projects; import models; print\\('OK'\\)\")",
+      "Bash(../.venv/Scripts/python.exe -m pytest tests/test_asr.py -q)",
+      "Bash(../.venv/Scripts/python.exe -c ' *)",
+      "Bash(npm i *)",
+      "Bash(npx playwright *)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "playwright"
+  ],
+  "enableAllProjectMcpServers": true
 }

@@ -51,7 +51,7 @@
   },
   "9": {
     "inputs": {
-      "filename_prefix": "buzzcaf_broll",
+      "filename_prefix": "buzzedit_broll",
       "images": ["8", 0]
     },
     "class_type": "SaveImage"

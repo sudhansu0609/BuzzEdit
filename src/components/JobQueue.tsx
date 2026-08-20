@@ -7,6 +7,9 @@ import {
   clearCompletedJobs,
   pauseScheduler,
   resumeScheduler,
+  getComfyUIWorkflows,
+  updateAppSettings,
+  type ComfyWorkflowList,
 } from '../hooks/api';
 
 export default function JobQueue() {
@@ -24,6 +27,47 @@ export default function JobQueue() {
   });
 
   const [selectedPriority, setSelectedPriority] = useState<'urgent' | 'normal' | 'low'>('normal');
+  const [jobType, setJobType] = useState<'presentation' | 'full_edit'>('presentation');
+  // Empty means "start as soon as the queue reaches it". A time means the next
+  // occurrence of it, so the GPU work happens while nobody is using the machine.
+  const [startAt, setStartAt] = useState('');
+  const [showOptions, setShowOptions] = useState(false);
+  const [passOptions, setPassOptions] = useState({
+    broll: true, broll_video: true, popups: true,
+    face_zoom: true, captions: true, thumbnail: true,
+  });
+  // Which ComfyUI workflow serves each generation role. Fetched lazily the
+  // first time the options panel is opened; picking one writes the app setting.
+  const [workflows, setWorkflows] = useState<ComfyWorkflowList | null>(null);
+  const [savingRole, setSavingRole] = useState<string | null>(null);
+
+  const loadWorkflows = useCallback(async () => {
+    try {
+      setWorkflows(await getComfyUIWorkflows());
+    } catch (err) {
+      console.error('Failed to load ComfyUI workflows:', err);
+    }
+  }, []);
+
+  const handlePickWorkflow = async (role: string, file: string) => {
+    if (!workflows) return;
+    const key = workflows.settings_key[role];
+    if (!key) return;
+    setSavingRole(role);
+    try {
+      // Empty selection clears the setting (role falls back to manifest/default,
+      // or nothing at all for video/graphic which have no bundled default).
+      await updateAppSettings({ [key]: file || null });
+      setWorkflows({
+        ...workflows,
+        selection: { ...workflows.selection, [role]: file || null },
+      });
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setSavingRole(null);
+    }
+  };
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -45,9 +89,15 @@ export default function JobQueue() {
     setProcessing(true);
     setProgress(0, 'Enqueueing project for nightly batch execution...');
     try {
-      await enqueueJob(project.id, selectedPriority);
+      await enqueueJob(project.id, selectedPriority, {
+        job_type: jobType,
+        start_at: startAt || null,
+        settings: jobType === 'presentation' ? passOptions : {},
+      });
       await fetchStatus();
-      setProgress(1, 'Project enqueued for overnight execution');
+      setProgress(1, startAt
+        ? `Queued — starts at ${startAt}`
+        : 'Project enqueued for overnight execution');
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -118,7 +168,16 @@ export default function JobQueue() {
       {project && (
         <div style={{ background: '#1e1e2e', padding: '12px', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
           <span style={{ fontSize: '13px', fontWeight: 'bold' }}>Queue Current Project:</span>
-          <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <select
+              value={jobType}
+              onChange={(e: any) => setJobType(e.target.value)}
+              title="A presentation pass generates B-roll, zooms, pop-ups and captions. A full edit just cuts and renders."
+              style={{ padding: '8px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}
+            >
+              <option value="presentation">🎬 Presentation pass</option>
+              <option value="full_edit">✂ Full edit only</option>
+            </select>
             <select
               value={selectedPriority}
               onChange={(e: any) => setSelectedPriority(e.target.value)}
@@ -128,10 +187,98 @@ export default function JobQueue() {
               <option value="normal">⚡ Normal Priority</option>
               <option value="low">🌙 Low Priority</option>
             </select>
-            <button className="btn btn-primary" style={{ flex: 1 }} onClick={handleEnqueueCurrent}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}
+              title="Leave empty to start straight away. Set a time and the machine stays idle until then.">
+              Start at
+              <input
+                type="time"
+                value={startAt}
+                onChange={(e) => setStartAt(e.target.value)}
+                style={{ padding: '7px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}
+              />
+            </label>
+            {jobType === 'presentation' && (
+              <button className="btn btn-sm" onClick={() => {
+                setShowOptions(v => !v);
+                if (!workflows) loadWorkflows();
+              }}>
+                {showOptions ? '▾' : '▸'} Options
+              </button>
+            )}
+            <button className="btn btn-primary" style={{ flex: 1, minWidth: 160 }}
+              onClick={handleEnqueueCurrent}>
               + Enqueue Overnight Job
             </button>
           </div>
+
+          {jobType === 'presentation' && showOptions && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px 16px', fontSize: 12 }}>
+              {([
+                ['broll', 'B-roll cutaways'],
+                ['broll_video', 'Generated video'],
+                ['popups', 'Topic pop-ups'],
+                ['face_zoom', 'Punch-ins on my face'],
+                ['captions', 'Captions'],
+                ['thumbnail', 'Thumbnail'],
+              ] as [keyof typeof passOptions, string][]).map(([key, label]) => (
+                <label key={key} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                  <input
+                    type="checkbox"
+                    checked={passOptions[key]}
+                    onChange={(e) => setPassOptions(o => ({ ...o, [key]: e.target.checked }))}
+                  />
+                  {label}
+                </label>
+              ))}
+            </div>
+          )}
+
+          {jobType === 'presentation' && showOptions && (
+            <div style={{ borderTop: '1px solid #313244', paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <span style={{ fontSize: 12, fontWeight: 'bold', color: '#a6adc8' }}>
+                Generation workflows
+              </span>
+              {!workflows ? (
+                <span style={{ fontSize: 11, color: '#6c7086' }}>Loading ComfyUI workflows…</span>
+              ) : workflows.workflows.length === 0 ? (
+                <span style={{ fontSize: 11, color: '#f38ba8' }}>
+                  No workflow files found in the <code>workflows/</code> folder.
+                </span>
+              ) : (
+                ([
+                  ['broll_image', 'Images (B-roll)', false],
+                  ['broll_video', 'Video (B-roll)', true],
+                  ['thumbnail', 'Thumbnail', false],
+                ] as [string, string, boolean][]).map(([role, label, allowNone]) => {
+                  const options = workflows.workflows.filter(w => w.valid && w.roles_ok?.[role]);
+                  const current = workflows.selection[role] ?? '';
+                  return (
+                    <label key={role} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                      <span style={{ minWidth: 120 }}>{label}</span>
+                      <select
+                        value={current}
+                        disabled={savingRole === role}
+                        onChange={(e) => handlePickWorkflow(role, e.target.value)}
+                        style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}
+                      >
+                        {allowNone && <option value="">— none (skip) —</option>}
+                        {options.length === 0 && !allowNone && (
+                          <option value="" disabled>No compatible workflow</option>
+                        )}
+                        {options.map(w => (
+                          <option key={w.file} value={w.file}>{w.file}</option>
+                        ))}
+                      </select>
+                    </label>
+                  );
+                })
+              )}
+              <span style={{ fontSize: 10, color: '#6c7086' }}>
+                Drop a workflow <code>.json</code> into the <code>workflows/</code> folder and it
+                appears here — bindings are detected automatically.
+              </span>
+            </div>
+          )}
         </div>
       )}
 
@@ -159,9 +306,27 @@ export default function JobQueue() {
               </div>
 
               {job.status === 'running' && (
-                <div style={{ height: '4px', background: '#313244', borderRadius: '2px', overflow: 'hidden' }}>
-                  <div style={{ width: '100%', height: '100%', background: '#3b82f6', animation: 'pulse 1.5s infinite' }} />
-                </div>
+                <>
+                  {/* A real bar now that stages report where they have got to.
+                      It used to pulse indeterminately for the whole run. */}
+                  <div style={{ height: '4px', background: '#313244', borderRadius: '2px', overflow: 'hidden' }}>
+                    <div style={{
+                      width: `${Math.round((job.progress ?? 0) * 100)}%`,
+                      height: '100%', background: '#3b82f6', transition: 'width 0.4s',
+                    }} />
+                  </div>
+                  {job.message && (
+                    <span style={{ fontSize: '11px', color: '#a6adc8' }}>
+                      {job.message} · {Math.round((job.progress ?? 0) * 100)}%
+                    </span>
+                  )}
+                </>
+              )}
+
+              {job.status === 'pending' && job.start_at && (
+                <span style={{ fontSize: '11px', color: '#a6adc8' }}>
+                  ⏰ Starts {new Date(job.start_at).toLocaleString()}
+                </span>
               )}
 
               {job.error && (
@@ -169,6 +334,16 @@ export default function JobQueue() {
               )}
               {job.result?.output_directory && (
                 <span style={{ fontSize: '11px', color: '#10b981' }}>Saved: {job.result.output_directory}</span>
+              )}
+              {job.result?.report && (
+                <span style={{ fontSize: '11px', color: '#a6adc8' }}>
+                  {job.result.report.broll_placed} cutaways ·{' '}
+                  {job.result.report.zooms_segment + job.result.report.zooms_windowed} zooms ·{' '}
+                  {job.result.report.popups_placed} pop-ups ·{' '}
+                  {job.result.report.captions} captions
+                  {job.result.report.degraded?.length > 0
+                    ? ` · degraded: ${job.result.report.degraded.join(', ')}` : ''}
+                </span>
               )}
             </div>
           ))

@@ -1,25 +1,105 @@
-import { useRef, useEffect, useCallback, useState } from 'react';
+import { useRef, useEffect, useCallback, useState, useMemo } from 'react';
 import { useProjectStore } from '../hooks/store';
+
+type PreviewMode = 'cut' | 'result' | 'source';
 
 export default function PreviewPlayer() {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const { project, currentTime, setCurrentTime, isPlaying, setIsPlaying, selectedClipId } = useProjectStore();
+  const { project, currentTime, setCurrentTime, isPlaying, setIsPlaying, isScrubbing } = useProjectStore();
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoReady, setVideoReady] = useState(false);
 
   const sourceVideo = project?.source_video || project?.sourceVideo;
+  const renderedOutput: string | undefined =
+    (project as any)?.output_path || (project as any)?.rendered_video || project?.outputPath;
+  // Bumps every time the render is regenerated (the file's mtime). Appended to
+  // the Rendered stream URL so the browser refetches instead of replaying the
+  // previous render — without it a fresh zoom/B-roll pass writes the same
+  // filename and the preview keeps showing the stale, flat video.
+  const renderVersion = (project as any)?.output_version;
+  const timeline = (project as any)?.timeline;
+
+  // The kept source ranges (seconds), straight from the V1 segments. Playing
+  // these in order — skipping the gaps between them — reconstructs the CURRENT
+  // cut live from the source, so it always matches the transcript strikes with
+  // no re-render. This is what fixes "the strikes aren't reflected in the cut":
+  // the rendered file can be stale after an edit, but this never is.
+  const keptIntervals = useMemo<Array<[number, number]>>(() => {
+    const items: any[] = Array.isArray(timeline?.items) ? timeline.items : [];
+    const fps = (timeline?.fps_num ?? 30) / (timeline?.fps_den ?? 1) || 30;
+    return items
+      .filter((i) => i.track === 'V1' && i.source_end_frame > i.source_start_frame)
+      .map((i) => [i.source_start_frame / fps, i.source_end_frame / fps] as [number, number])
+      .sort((a, b) => a[0] - b[0]);
+  }, [timeline]);
+
+  const hasCut = keptIntervals.length > 0;
+
+  // Edit-time mapping. The cut preview plays the SOURCE file and skips gaps, so
+  // video.currentTime is source time — but the user is watching the *edit*, and
+  // the seek bar/clock must run on edit time or a 3:15 source cut down to 1:45
+  // still reads "/ 03:15" and looks like the cuts were never applied.
+  const cutDuration = useMemo(
+    () => keptIntervals.reduce((acc, [s, e]) => acc + (e - s), 0), [keptIntervals]);
+
+  const srcToEdit = useCallback((t: number) => {
+    let acc = 0;
+    for (const [s, e] of keptIntervals) {
+      if (t >= e) { acc += e - s; continue; }
+      if (t > s) acc += t - s;
+      break;
+    }
+    return acc;
+  }, [keptIntervals]);
+
+  const editToSrc = useCallback((editTime: number) => {
+    let remaining = Math.max(0, editTime);
+    for (let i = 0; i < keptIntervals.length; i++) {
+      const [s, e] = keptIntervals[i];
+      if (remaining <= e - s || i === keptIntervals.length - 1) {
+        return Math.min(s + remaining, e);
+      }
+      remaining -= e - s;
+    }
+    return keptIntervals[0]?.[0] ?? 0;
+  }, [keptIntervals]);
+
+  // Default: the live cut when we have a timeline, else the source.
+  const [mode, setMode] = useState<PreviewMode>('cut');
+  useEffect(() => {
+    setMode(hasCut ? 'cut' : (renderedOutput ? 'result' : 'source'));
+  }, [hasCut, renderedOutput, project?.id]);
+
+  const activeSrc = (mode === 'result' && renderedOutput) ? renderedOutput : sourceVideo;
+
+  // Refs so the (stable) timeupdate handler reads the latest values.
+  const scrubRef = useRef(isScrubbing); scrubRef.current = isScrubbing;
+  const modeRef = useRef(mode); modeRef.current = mode;
+  const intervalsRef = useRef(keptIntervals); intervalsRef.current = keptIntervals;
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !sourceVideo) return;
+    if (!video || !activeSrc) return;
+    setVideoReady(false);
+    setVideoError(null);
 
-    const handleTimeUpdate = () => setCurrentTime(video.currentTime);
+    const handleTimeUpdate = () => {
+      if (scrubRef.current) return;
+      setCurrentTime(video.currentTime);
+    };
     const handlePlay = () => setIsPlaying(true);
     const handlePause = () => setIsPlaying(false);
     const handleEnded = () => setIsPlaying(false);
-    const handleLoadedData = () => setVideoReady(true);
+    const handleLoadedData = () => {
+      setVideoReady(true);
+      // Start the live cut at the first kept moment.
+      if (modeRef.current === 'cut' && intervalsRef.current.length) {
+        const first = intervalsRef.current[0][0];
+        if (video.currentTime < first) video.currentTime = first;
+      }
+    };
     const handleError = () => setVideoError('Failed to stream video');
 
     video.addEventListener('timeupdate', handleTimeUpdate);
@@ -29,8 +109,12 @@ export default function PreviewPlayer() {
     video.addEventListener('loadeddata', handleLoadedData);
     video.addEventListener('error', handleError);
 
-    // Stream video through backend HTTP Range endpoint
-    video.src = `http://localhost:8099/api/media/stream?path=${encodeURIComponent(sourceVideo)}`;
+    // Cache-bust only the rendered file: every re-render overwrites the same
+    // path, so a stable URL would keep the stale render on screen. The source
+    // clip never changes, so it needs no token.
+    const bust = (mode === 'result' && renderedOutput && renderVersion != null)
+      ? `&v=${encodeURIComponent(String(renderVersion))}` : '';
+    video.src = `http://localhost:8099/api/media/stream?path=${encodeURIComponent(activeSrc)}${bust}`;
     video.load();
 
     return () => {
@@ -41,33 +125,122 @@ export default function PreviewPlayer() {
       video.removeEventListener('loadeddata', handleLoadedData);
       video.removeEventListener('error', handleError);
     };
-  }, [sourceVideo, setCurrentTime, setIsPlaying]);
+  }, [activeSrc, mode, renderedOutput, renderVersion, setCurrentTime, setIsPlaying]);
+
+function updateVideoTransform(video: HTMLVideoElement | null, t: number, timeline: any, mode: PreviewMode) {
+  if (!video) return;
+  if (mode !== 'cut' || !timeline?.items) {
+    if (video.style.transform !== '') video.style.transform = '';
+    if (video.style.opacity !== '') video.style.opacity = '';
+    return;
+  }
+  const fps = (timeline.fps_num ?? 30) / (timeline.fps_den ?? 1) || 30;
+  const items: any[] = timeline.items;
+  let activeTransform: any = null;
+  let segStart = 0;
+  let segEnd = 0;
+
+  for (const item of items) {
+    if (item.track === 'V1' && item.enabled !== false && item.kind === 'media') {
+      const s = item.source_start_frame / fps;
+      const e = item.source_end_frame / fps;
+      if (t >= s && t <= e + 0.05) {
+        activeTransform = item.transform;
+        segStart = s;
+        segEnd = e;
+        break;
+      }
+    }
+  }
+
+  if (!activeTransform) {
+    if (video.style.transform !== '') video.style.transform = '';
+    if (video.style.opacity !== '') video.style.opacity = '';
+    return;
+  }
+
+  const duration = Math.max(0.001, segEnd - segStart);
+  const p = Math.max(0, Math.min(1, (t - segStart) / duration));
+  const easeP = p * p * (3 - 2 * p);
+  const scaleStart = activeTransform.scale ?? 1.0;
+  const scaleEnd = activeTransform.scale_end ?? scaleStart;
+  const scale = scaleStart + (scaleEnd - scaleStart) * easeP;
+  const posXStart = activeTransform.pos_x ?? 0.0;
+  const posXEnd = activeTransform.pos_x_end ?? posXStart;
+  const posX = posXStart + (posXEnd - posXStart) * easeP;
+  const posYStart = activeTransform.pos_y ?? 0.0;
+  const posYEnd = activeTransform.pos_y_end ?? posYStart;
+  const posY = posYStart + (posYEnd - posYStart) * easeP;
+
+  const flipH = activeTransform.flip_h ? -1 : 1;
+  const flipV = activeTransform.flip_v ? -1 : 1;
+  const rotate = activeTransform.rotation ?? 0;
+  const opacity = activeTransform.opacity ?? 1;
+
+  video.style.transform = `scale(${scale * flipH}, ${scale * flipV}) translate(${posX * 10}%, ${posY * 10}%) rotate(${rotate}deg)`;
+  video.style.opacity = `${opacity}`;
+  video.style.transformOrigin = 'center center';
+}
+
+  // Frame-accurate gap skipping for the live cut. This used to hang off the
+  // `timeupdate` event, which browsers fire only ~4 times a second — so up to a
+  // quarter second of every removed fumble played before the jump, and a short
+  // cut could play through entirely. The strikes looked "not applied" even
+  // though the EDL was right. An rAF loop checks every screen frame (~16ms).
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || mode !== 'cut' || keptIntervals.length === 0) return;
+    let raf = 0;
+    const tick = () => {
+      if (!video.paused && !video.seeking && !scrubRef.current) {
+        const iv = intervalsRef.current;
+        const t = video.currentTime;
+        // First kept interval that hasn't fully played yet.
+        const idx = iv.findIndex(([, e]) => t < e - 0.005);
+        if (idx === -1) {
+          // Past the last kept range — the cut is over.
+          video.pause();
+          video.currentTime = iv[0][0];
+          setCurrentTime(iv[0][0]);
+        } else if (t < iv[idx][0] - 0.005) {
+          // Inside a removed gap — jump to the next kept range.
+          video.currentTime = iv[idx][0];
+        }
+      }
+      updateVideoTransform(video, video.currentTime, timeline, modeRef.current);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [mode, keptIntervals, setCurrentTime, timeline]);
 
   useEffect(() => {
     if (videoRef.current && Math.abs(videoRef.current.currentTime - currentTime) > 0.3) {
       videoRef.current.currentTime = currentTime;
     }
-  }, [currentTime]);
+    updateVideoTransform(videoRef.current, currentTime, timeline, mode);
+  }, [currentTime, timeline, mode]);
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
-    if (isPlaying) {
-      video.pause();
-    } else {
-      video.play().catch(() => {});
-    }
+    if (isPlaying) video.pause();
+    else video.play().catch(() => {});
   }, [isPlaying]);
 
   const handleSeek = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / rect.width;
+    const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
     const video = videoRef.current;
     if (!video || !video.duration) return;
-    const newTime = x * video.duration;
+    // In cut mode the bar spans the EDIT, so a click lands on the kept material
+    // it points at — never inside a removed region.
+    const newTime = (modeRef.current === 'cut' && intervalsRef.current.length)
+      ? editToSrc(x * cutDuration)
+      : x * video.duration;
     video.currentTime = newTime;
     setCurrentTime(newTime);
-  }, [setCurrentTime]);
+  }, [setCurrentTime, editToSrc, cutDuration]);
 
   const toggleMute = useCallback(() => {
     const video = videoRef.current;
@@ -91,18 +264,39 @@ export default function PreviewPlayer() {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  const duration = videoRef.current?.duration || 60;
+  // The cut preview reports edit time: total = kept material only, and the
+  // playhead position counts only kept seconds behind it.
+  const isCutMode = mode === 'cut' && hasCut;
+  const duration = isCutMode ? cutDuration : (videoRef.current?.duration || 60);
+  const displayTime = isCutMode ? srcToEdit(currentTime) : currentTime;
+
+  const MODES: Array<{ id: PreviewMode; label: string; show: boolean; title: string }> = [
+    { id: 'cut', label: 'Cut', show: hasCut,
+      title: 'Live preview of the current edit — plays the kept words, skips the struck ones (always matches the transcript)' },
+    { id: 'result', label: 'Rendered', show: !!renderedOutput,
+      title: 'The last rendered file (B-roll, zoom, captions baked in — may be behind recent edits)' },
+    { id: 'source', label: 'Source', show: !!sourceVideo,
+      title: 'The untouched original clip' },
+  ];
 
   return (
     <div className="preview-player">
-      <div className="video-container">
-        {sourceVideo ? (
+      <div className="video-container" style={{ position: 'relative' }}>
+        {(hasCut || renderedOutput) && (
+          <div style={{ position: 'absolute', top: 8, left: 8, zIndex: 5, display: 'flex', gap: 4 }}>
+            {MODES.filter((m) => m.show).map((m) => (
+              <button
+                key={m.id}
+                className={`btn btn-sm ${mode === m.id ? 'btn-primary' : ''}`}
+                onClick={() => setMode(m.id)}
+                title={m.title}
+              >{m.label}</button>
+            ))}
+          </div>
+        )}
+        {activeSrc ? (
           <>
-            <video
-              ref={videoRef}
-              className="video-element"
-              onClick={togglePlay}
-            />
+            <video ref={videoRef} className="video-element" onClick={togglePlay} />
             {!videoReady && !videoError && (
               <div className="video-loading">
                 <div className="spinner" />
@@ -124,10 +318,7 @@ export default function PreviewPlayer() {
 
       <div className="player-controls">
         <div className="seek-bar" onClick={handleSeek}>
-          <div
-            className="seek-progress"
-            style={{ width: `${(currentTime / duration) * 100}%` }}
-          />
+          <div className="seek-progress" style={{ width: `${Math.min(100, (displayTime / (duration || 1)) * 100)}%` }} />
         </div>
 
         <div className="controls-row">
@@ -136,7 +327,7 @@ export default function PreviewPlayer() {
           </button>
 
           <span className="time-display font-mono text-xs">
-            {formatTime(currentTime)} / {formatTime(duration)}
+            {formatTime(displayTime)} / {formatTime(duration)}
           </span>
 
           <div className="volume-control">
@@ -144,13 +335,8 @@ export default function PreviewPlayer() {
               {isMuted ? '🔇' : volume < 0.5 ? '🔉' : '🔊'}
             </button>
             <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.01"
-              value={volume}
-              onChange={handleVolumeChange}
-              className="volume-slider"
+              type="range" min="0" max="1" step="0.01"
+              value={volume} onChange={handleVolumeChange} className="volume-slider"
             />
           </div>
         </div>

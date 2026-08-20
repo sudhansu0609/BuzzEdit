@@ -9,16 +9,20 @@ scheduler_instance = JobScheduler()
 
 class EnqueueJobRequest(BaseModel):
     project_id: str
-    job_type: str = "full_edit"
-    priority: str = "normal" # urgent, normal, low
-    generate_broll: bool = True
+    job_type: str = "full_edit"        # "full_edit" | "presentation"
+    priority: str = "normal"           # urgent, normal, low
+    # "23:00" for the next occurrence of that time, or an ISO timestamp. Empty
+    # means start as soon as the queue reaches it.
+    start_at: Optional[str] = None
+    # Free-form settings for the job type; PresentationSettings for a presentation.
+    settings: Dict[str, Any] = {}
     generate_thumbnail: bool = True
     burn_captions: bool = True
 
 
-@router.on_event("startup")
-async def startup_scheduler():
-    scheduler_instance.start()
+# The scheduler is started/stopped by the application lifespan in main.py.
+# A router-level @on_event("startup") is deprecated in FastAPI and only fired
+# under the merged-lifespan shim.
 
 
 @router.get("/jobs")
@@ -33,16 +37,22 @@ async def get_scheduler_status():
 
 @router.post("/enqueue")
 async def enqueue_job(req: EnqueueJobRequest):
-    settings = {
-        "generate_broll": req.generate_broll,
-        "generate_thumbnail": req.generate_thumbnail,
-        "burn_captions": req.burn_captions,
-    }
+    # A presentation job is configured entirely by `settings`; the legacy
+    # booleans belong to the older full_edit job and would be meaningless there.
+    if req.job_type == "presentation":
+        settings = dict(req.settings)
+    else:
+        settings = {
+            "generate_thumbnail": req.generate_thumbnail,
+            "burn_captions": req.burn_captions,
+            **req.settings,
+        }
     job = scheduler_instance.enqueue_job(
         project_id=req.project_id,
         job_type=req.job_type,
         priority=req.priority,
         settings=settings,
+        start_at=req.start_at,
     )
     return {"status": "enqueued", "job": job}
 

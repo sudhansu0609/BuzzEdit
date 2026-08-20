@@ -1,6 +1,6 @@
 import uuid
-from typing import List, Dict, Any
-from .schema import Timeline, SourceFile, WordItem, time_to_frame
+from typing import Any, Dict, List, Optional, Tuple
+from .schema import Timeline, SourceFile, WordItem, Transition, time_to_frame
 from .ops import rebuild_primary_tracks
 
 def build_timeline_from_transcript(
@@ -10,7 +10,13 @@ def build_timeline_from_transcript(
     fps_num: int = 30,
     fps_den: int = 1,
     width: int = 1920,
-    height: int = 1080
+    height: int = 1080,
+    has_audio: bool = True,
+    speech_regions: Optional[List[Tuple[float, float]]] = None,
+    max_pause_seconds: Optional[float] = None,
+    pause_padding_seconds: Optional[float] = None,
+    energy_envelope: Optional[Dict[str, Any]] = None,
+    default_transition: Optional[Transition] = None,
 ) -> Timeline:
     """
     Build an initial Timeline object from source video metadata and timestamped words.
@@ -24,7 +30,7 @@ def build_timeline_from_transcript(
         height=height,
         fps_num=fps_num,
         fps_den=fps_den,
-        has_audio=True
+        has_audio=has_audio,
     )
 
     words: List[WordItem] = []
@@ -49,15 +55,34 @@ def build_timeline_from_transcript(
             start_frame=start_f,
             end_frame=end_f,
             enabled=enabled,
-            disfluency=disfluency
+            disfluency=disfluency,
+            reason=w.get("reason") or None,
+            candidate=bool(w.get("candidate", False)),
         ))
 
     timeline = Timeline(
         fps_num=fps_num,
         fps_den=fps_den,
+        width=width,
+        height=height,
         sources={source_id: source_file},
-        words=words
+        words=words,
+        default_transition=default_transition,
     )
+
+    # Speech regions let the rebuild cut silence out of the middle of a word,
+    # not merely between words — see Timeline.speech_regions.
+    if speech_regions:
+        timeline.speech_regions = [
+            [time_to_frame(start, fps_num, fps_den), time_to_frame(end, fps_num, fps_den)]
+            for start, end in speech_regions
+        ]
+    if energy_envelope:
+        timeline.energy_envelope = energy_envelope
+    if max_pause_seconds is not None:
+        timeline.max_pause_seconds = float(max_pause_seconds)
+    if pause_padding_seconds is not None:
+        timeline.pause_padding_seconds = float(pause_padding_seconds)
 
     rebuild_primary_tracks(timeline, source_id)
     return timeline

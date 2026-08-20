@@ -46,11 +46,21 @@ class ThumbnailAgent:
         except Exception as e:
             logger.warning(f"ComfyUI thumbnail generation offline ({e}). Generating fallback thumbnail.")
 
-        # Fallback thumbnail with text overlay on keyframe
+        # Fallback thumbnail with text overlay on keyframe. drawtext needs an
+        # explicit fontfile — the fontconfig default crashes on Windows ffmpeg
+        # builds with no config. Scale the title to the frame so it reads as a
+        # title rather than a tiny fixed 48px line pinned near the bottom.
+        from utils.fonts import resolve_font_file
+        from render.effects import escape_filter_path
+        font_file = resolve_font_file(None)
+        font_arg = f"fontfile='{escape_filter_path(font_file)}':" if font_file else ""
         safe_title = display_title.replace("'", "").replace('"', "")
         run_ffmpeg([
             "-i", str(keyframe_path),
-            "-vf", f"eq=contrast=1.2:saturation=1.3,drawtext=text='{safe_title}':fontcolor=yellow:fontsize=48:x=(w-text_w)/2:y=h-120:box=1:boxcolor=black@0.6:boxborderw=10",
+            "-vf", (f"eq=contrast=1.2:saturation=1.3,"
+                    f"drawtext={font_arg}text='{safe_title}':fontcolor=yellow:"
+                    f"fontsize=h/12:x=(w-text_w)/2:y=h-(h/8):"
+                    f"box=1:boxcolor=black@0.6:boxborderw=10"),
             "-q:v", "2",
             "-y",
             str(thumbnail_path),

@@ -38,8 +38,11 @@ class GPUBroker:
             logger.warning(f"NVML get memory info error: {e}")
             return 8192.0
 
-    async def release_comfyui_vram(self, comfyui_url: str = "http://127.0.0.1:8188") -> bool:
+    async def release_comfyui_vram(self, comfyui_url: Optional[str] = None) -> bool:
         """Request ComfyUI to unload models and free VRAM if queue is idle."""
+        if comfyui_url is None:
+            from config import COMFYUI_URL
+            comfyui_url = COMFYUI_URL
         try:
             # Check if queue is empty first
             res = requests.get(f"{comfyui_url}/queue", timeout=3)

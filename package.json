@@ -1,5 +1,5 @@
 {
-  "name": "buzzcaf-editor",
+  "name": "buzzedit",
   "version": "1.0.0",
   "description": "AI-Powered Automated Video Editor",
   "main": "electron/main.cjs",
@@ -8,7 +8,6 @@
     "start": "START_APP.bat",
     "start:all": "START_APP.bat",
     "dev:react": "vite",
-
     "dev:electron": "wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .",
     "dev:backend": "cd backend && python main.py",
     "build": "tsc && vite build",
@@ -24,6 +23,7 @@
     "cross-env": "^7.0.3",
     "electron": "^28.0.0",
     "electron-builder": "^24.9.1",
+    "playwright": "^1.62.1",
     "typescript": "^5.3.3",
     "vite": "^5.0.8",
     "wait-on": "^7.2.0"
@@ -35,8 +35,8 @@
     "zustand": "^4.4.7"
   },
   "build": {
-    "appId": "com.buzzcaf.editor",
-    "productName": "Buzzcaf Editor",
+    "appId": "com.buzzedit.app",
+    "productName": "BuzzEdit",
     "win": {
       "target": "nsis",
       "icon": "build/icon.ico"

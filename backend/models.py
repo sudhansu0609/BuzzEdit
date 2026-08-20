@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any, Literal
 from enum import Enum
 
@@ -38,7 +38,9 @@ class TranscriptSegment(BaseModel):
     id: int
     start: float
     end: float
-    text: str
+    text: str                              # primary display text (Hinglish for Indic speech, else native)
+    text_native: Optional[str] = None      # original script (e.g. Devanagari)
+    text_english: Optional[str] = None     # English translation
     words: Optional[List[Dict[str, Any]]] = None
     confidence: float = 0.0
 
@@ -65,7 +67,25 @@ class Project(BaseModel):
     transcript: Optional[TranscriptionResult] = None
     detected_segments: List[DetectedSegment] = []
     output_path: Optional[str] = None
+    # Modification time of the rendered `output_path`, filled in by the read
+    # route. The Rendered preview appends it to the stream URL as a cache-buster:
+    # every re-render overwrites the same filename, so without a token that
+    # changes the browser keeps serving the previous render and a fresh zoom /
+    # B-roll pass looks like it did nothing.
+    output_version: Optional[float] = None
+    media_pool: List[Dict[str, Any]] = []
     status: Literal["draft", "transcribed", "analyzed", "rendered", "error"] = "draft"
+
+    @field_validator("transcript", mode="before")
+    @classmethod
+    def _coerce_transcript(cls, v):
+        # The frontend persists `transcript` as a bare list of segments, while
+        # the backend writes a full TranscriptionResult ({segments, language,
+        # duration}). Accept either so loading a project never 500s.
+        if isinstance(v, list):
+            return {"segments": v}
+        return v
+
     settings: Dict[str, Any] = {
         "resolution": "1920x1080",
         "fps": 30,
@@ -97,7 +117,7 @@ class RenderJob(BaseModel):
 class TranscribeJob(BaseModel):
     project_id: str
     model: str = "large-v3"
-    language: str = "en"
+    language: Optional[str] = None  # None = auto-detect the spoken language
 
 
 class AnalyzeJob(BaseModel):

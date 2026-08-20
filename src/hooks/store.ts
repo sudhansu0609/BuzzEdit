@@ -22,7 +22,9 @@ export interface TranscriptSegment {
   id: number;
   start: number;
   end: number;
-  text: string;
+  text: string;            // primary display text (Hinglish for Indic speech, else native)
+  text_native?: string;    // original script (e.g. Devanagari)
+  text_english?: string;   // English translation
   confidence: number;
 }
 
@@ -47,8 +49,11 @@ export interface PipelineState {
   progressMessage: string;
   error: string | null;
   selectedClipId: string | null;
+  /** Full selection, primary clip first. Compounding needs more than one clip. */
+  selectedClipIds: string[];
   currentTime: number;
   isPlaying: boolean;
+  isScrubbing: boolean;
   zoom: number;
   showTranscript: boolean;
   showSegments: boolean;
@@ -59,8 +64,10 @@ export interface PipelineState {
   setProgress: (p: number, label?: string) => void;
   setError: (e: string | null) => void;
   setSelectedClip: (id: string | null) => void;
+  toggleSelectedClip: (id: string) => void;
   setCurrentTime: (t: number) => void;
   setIsPlaying: (v: boolean) => void;
+  setScrubbing: (v: boolean) => void;
   setZoom: (z: number) => void;
   setShowTranscript: (v: boolean) => void;
   setShowSegments: (v: boolean) => void;
@@ -74,8 +81,10 @@ export const useProjectStore = create<PipelineState>((set) => ({
     progressMessage: 'Idle',
   error: null,
   selectedClipId: null,
+  selectedClipIds: [],
   currentTime: 0,
   isPlaying: false,
+  isScrubbing: false,
   zoom: 1,
   showTranscript: true,
   showSegments: false,
@@ -86,9 +95,19 @@ export const useProjectStore = create<PipelineState>((set) => ({
   setProcessing: (v) => set({ isProcessing: v }),
   setProgress: (p, label) => set({ progress: p, progressMessage: label || 'Processing...' }),
   setError: (e) => set({ error: e }),
-  setSelectedClip: (id) => set({ selectedClipId: id }),
+  setSelectedClip: (id) => set({ selectedClipId: id, selectedClipIds: id ? [id] : [] }),
+  toggleSelectedClip: (id) =>
+    set((s) => {
+      const next = s.selectedClipIds.includes(id)
+        ? s.selectedClipIds.filter((x) => x !== id)
+        : [...s.selectedClipIds, id];
+      // The primary selection drives the inspector, so keep it on a clip that
+      // is still selected.
+      return { selectedClipIds: next, selectedClipId: next[next.length - 1] ?? null };
+    }),
   setCurrentTime: (t) => set({ currentTime: t }),
   setIsPlaying: (v) => set({ isPlaying: v }),
+  setScrubbing: (v) => set({ isScrubbing: v }),
   setZoom: (z) => set({ zoom: z }),
   setShowTranscript: (v) => set({ showTranscript: v }),
   setShowSegments: (v) => set({ showSegments: v }),
@@ -99,6 +118,7 @@ export const useProjectStore = create<PipelineState>((set) => ({
   progressMessage: 'Idle',
     error: null,
     selectedClipId: null,
+    selectedClipIds: [],
     currentTime: 0,
     isPlaying: false,
     zoom: 1,

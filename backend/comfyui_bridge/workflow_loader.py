@@ -18,51 +18,13 @@ def load_workflow(workflow_name: str) -> Dict[str, Any]:
     return json.loads(file_path.read_text())
 
 
-def prepare_broll_workflow(
-    prompt: str,
-    negative_prompt: str = "blurry, low quality, distorted, text, watermark",
-    width: int = 1280,
-    height: int = 720,
-    seed: Optional[int] = None,
-    output_prefix: str = "buzzcaf_broll",
-) -> Dict[str, Any]:
-    workflow = load_workflow("broll_generation.json")
-
-    import random
-    if seed is None:
-        seed = random.randint(1, 1000000000)
-
-    # In key nodes
-    for node_id, node in workflow.items():
-        class_type = node.get("class_type", "")
-        inputs = node.get("inputs", {})
-
-        if class_type == "CLIPTextEncode":
-            if node_id == "6" or "positive" in node_id.lower() or inputs.get("text") == "cinematic b-roll footage, high quality, 4k":
-                inputs["text"] = prompt
-            elif node_id == "7" or "negative" in node_id.lower():
-                inputs["text"] = negative_prompt
-
-        elif class_type == "EmptyLatentImage":
-            inputs["width"] = width
-            inputs["height"] = height
-
-        elif class_type == "KSampler":
-            inputs["seed"] = seed
-
-        elif class_type == "SaveImage":
-            inputs["filename_prefix"] = output_prefix
-
-    return workflow
-
-
 def prepare_thumbnail_workflow(
     prompt: str,
     negative_prompt: str = "boring, dull, low quality, dark, blurry",
     width: int = 1280,
     height: int = 720,
     seed: Optional[int] = None,
-    output_prefix: str = "buzzcaf_thumbnail",
+    output_prefix: str = "buzzedit_thumbnail",
 ) -> Dict[str, Any]:
     workflow = load_workflow("thumbnail.json")
 

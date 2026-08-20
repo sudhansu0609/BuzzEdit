@@ -9,5 +9,14 @@ __pycache__/
 *.log
 data/projects/
 data/jobs.json
+data/temp/
+data/models/
 backend/data/
 output/
+
+# Tooling / scratch artifacts
+graphify-out/
+.playwright-mcp/
+*.bak
+kept.txt
+fresh_kept.txt

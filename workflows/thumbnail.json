@@ -51,7 +51,7 @@
   },
   "9": {
     "inputs": {
-      "filename_prefix": "buzzcaf_thumbnail",
+      "filename_prefix": "buzzedit_thumbnail",
       "images": ["8", 0]
     },
     "class_type": "SaveImage"

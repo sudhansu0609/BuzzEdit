@@ -68,11 +68,19 @@ class CaptionAgent:
         segments: List[TranscriptSegment],
         font_size: int,
     ) -> str:
+        # drawtext with no fontfile falls back to fontconfig's default, which on a
+        # Windows ffmpeg build with no fontconfig config aborts the whole render
+        # (exit 139). Resolve a real font once and pin it on every line.
+        from utils.fonts import resolve_font_file
+        from render.effects import escape_filter_path
+        font_file = resolve_font_file(None)
+        font_arg = f"fontfile='{escape_filter_path(font_file)}':" if font_file else ""
+
         drawtext_filters = []
         for seg in segments[:20]: # Escape text for FFmpeg drawtext
             safe_text = seg.text.replace("'", "").replace(":", "").replace("\\", "")
             drawtext_filters.append(
-                f"drawtext=text='{safe_text}':fontcolor=white:fontsize={font_size}:"
+                f"drawtext={font_arg}text='{safe_text}':fontcolor=white:fontsize={font_size}:"
                 f"x=(w-text_w)/2:y=h-80:enable='between(t,{seg.start},{seg.end})':"
                 f"box=1:boxcolor=black@0.6:boxborderw=6"
             )

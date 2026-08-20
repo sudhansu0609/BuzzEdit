@@ -7,4 +7,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   windowMaximize: () => ipcRenderer.invoke('app:windowMaximize'),
   windowClose: () => ipcRenderer.invoke('app:windowClose'),
   getApiUrl: () => ipcRenderer.invoke('app:getApiUrl'),
+  openPath: (filePath) => ipcRenderer.invoke('shell:openPath', filePath),
+  showItemInFolder: (filePath) => ipcRenderer.invoke('shell:showItemInFolder', filePath),
 });

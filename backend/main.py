@@ -21,11 +21,19 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting Buzzcaf Media Editor backend...")
-    yield
+    logger.info("Starting BuzzEdit backend...")
+    # Start the nightly job scheduler here rather than via a router startup
+    # event (deprecated in FastAPI, and only worked under the lifespan shim).
+    # Imported locally: the routes package is imported further down this module.
+    from routes.scheduler import scheduler_instance
+    scheduler_instance.start()
+    try:
+        yield
+    finally:
+        scheduler_instance.stop()
 
 app = FastAPI(
-    title="Buzzcaf Media Editor API",
+    title="BuzzEdit API",
     description="AI-powered video editing backend with single-pass EDL compiler",
     version="0.2.0",
     lifespan=lifespan,
@@ -54,7 +62,12 @@ from routes import (
     system,
     advanced,
     media,
-    timeline
+    timeline,
+    settings,
+    llm,
+    presets,
+    style,
+    presentation,
 )
 
 app.include_router(health.router, prefix="/api", tags=["health"])
@@ -69,10 +82,15 @@ app.include_router(agents.router, prefix="/api/agents", tags=["agents"])
 app.include_router(scheduler.router, prefix="/api/scheduler", tags=["scheduler"])
 app.include_router(system.router, prefix="/api/system", tags=["system"])
 app.include_router(advanced.router, prefix="/api/advanced", tags=["advanced"])
+app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
+app.include_router(llm.router, prefix="/api/llm", tags=["llm"])
+app.include_router(presets.router, prefix="/api/presets", tags=["presets"])
+app.include_router(style.router, prefix="/api/style", tags=["style"])
+app.include_router(presentation.router, prefix="/api/presentation", tags=["presentation"])
 
 @app.get("/")
 async def root():
-    return {"message": "Buzzcaf Media Editor API", "version": "0.2.0"}
+    return {"message": "BuzzEdit API", "version": "0.2.0"}
 
 if __name__ == "__main__":
     import uvicorn

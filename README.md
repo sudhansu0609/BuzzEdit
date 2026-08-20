@@ -1,4 +1,4 @@
-# Buzzcaf Editor - AI-Powered Video Editor
+# BuzzEdit - AI-Powered Video Editor
 
 ## Project Structure
 - `backend/` - FastAPI backend for video processing pipeline

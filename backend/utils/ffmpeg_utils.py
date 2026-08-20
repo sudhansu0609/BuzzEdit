@@ -55,6 +55,21 @@ def get_video_duration(path: str) -> float:
     raise FFmpegError("Could not determine duration")
 
 
+def parse_frame_rate(rate: str, default_num: int = 30, default_den: int = 1) -> tuple[int, int]:
+    """Parse an ffprobe frame-rate string (e.g. "30000/1001" or "25/1") into an
+    exact (numerator, denominator) integer pair. Falls back to the default on
+    malformed or zero rates (ffprobe reports "0/0" for streams with no timing)."""
+    try:
+        num_str, _, den_str = str(rate).partition("/")
+        num = int(num_str)
+        den = int(den_str) if den_str else 1
+        if num <= 0 or den <= 0:
+            return default_num, default_den
+        return num, den
+    except (ValueError, TypeError):
+        return default_num, default_den
+
+
 def get_video_info(path: str) -> dict:
     info = run_ffprobe(path)
     video_stream = None
@@ -65,11 +80,16 @@ def get_video_info(path: str) -> dict:
         elif s.get("codec_type") == "audio":
             audio_stream = s
 
+    raw_fps = video_stream.get("r_frame_rate", "30/1") if video_stream else "30/1"
+    fps_num, fps_den = parse_frame_rate(raw_fps)
+
     return {
         "duration": float(info["format"]["duration"]) if "duration" in info["format"] else 0,
         "width": int(video_stream.get("width", 0)) if video_stream else 0,
         "height": int(video_stream.get("height", 0)) if video_stream else 0,
-        "fps": video_stream.get("r_frame_rate", "30/1") if video_stream else "30/1",
+        "fps": fps_num / fps_den,
+        "fps_num": fps_num,
+        "fps_den": fps_den,
         "video_codec": video_stream.get("codec_name", "unknown") if video_stream else "none",
         "audio_codec": audio_stream.get("codec_name", "unknown") if audio_stream else "none",
         "channels": int(audio_stream.get("channels", 0)) if audio_stream else 0,

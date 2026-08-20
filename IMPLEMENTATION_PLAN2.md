@@ -78,7 +78,7 @@ Phase 3 (the missing features): backend/llm/ + retake selection + filler adjudic
 Phase 4 (frontend): snake_case store (deletes the casing fault line behind 3 defects), [project?.id] dep fix, src/lib/edl.ts virtual player, real waveform, SSE progress, Timeline renders items with drag/trim → ops.
 Phase 5 (deferred): scheduler, thumbnails, Shorts, grading, ducking — all become timeline effects and output profiles rather than new endpoints.
 Files
-Create: B:\youtubeProjects\Buzzcaf Media\BuzzcafEditor\IMPLEMENTATION2_PLAN.md
+Create: B:\youtubeProjects\Buzzcaf Media\BuzzEdit\IMPLEMENTATION2_PLAN.md
 Modify: none — this step is documentation only. No code changes, no git init yet; those are Phase 0 of the new plan, executed on a later approval.
 Superseded (left in place): IMPLEMENTATION_PLAN.md, progress.md. The new doc opens by stating both are inaccurate and why.
 Filename note: user wrote "implimentation2_plan"; using IMPLEMENTATION2_PLAN.md to match the existing correctly-spelled IMPLEMENTATION_PLAN.md. Trivial to rename.

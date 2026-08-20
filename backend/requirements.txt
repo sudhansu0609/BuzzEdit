@@ -20,6 +20,9 @@ scenedetect[opencv]>=0.6.2
 faster-whisper>=1.0.0
 onnxruntime>=1.16.0
 
+# Transliteration (native script -> Hinglish/romanized Latin)
+indic-transliteration>=2.3.0
+
 # Hardware & System
 nvidia-ml-py>=12.535.133
 
