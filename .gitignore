@@ -20,3 +20,7 @@ graphify-out/
 *.bak
 kept.txt
 fresh_kept.txt
+
+# Regenerable / downloaded runtime data (see backend/tools/fetch_geo.py, presentation/sound.py)
+data/audio_synth/
+data/geo/

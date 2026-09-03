@@ -369,9 +369,36 @@ class LMStudioClient:
         finally:
             await gpu_broker.release_lease("lm_studio")
 
+    async def ask_with_schema(self, system_prompt: str, user_prompt: str,
+                              schema: Dict[str, Any]) -> Optional[str]:
+        """One completion constrained to `schema` (LM Studio json_schema format).
+
+        This is what makes the span contract land on a small local model: asked
+        in prose for DELETE lines, the available 12B ignored the format on every
+        real window and rewrote the transcript instead; constrained, it answers
+        in span form every time. `_chat_json` already falls back to a plain
+        request when the server refuses the schema, and the caller treats a
+        non-JSON answer as "ask in prose instead", so nothing here is fatal.
+        """
+        await gpu_broker.acquire_lease("lm_studio", required_vram_mb=7000.0)
+        try:
+            model = await ensure_lm_ready(self.base_url, self.model_name)
+            if not model:
+                logger.warning("LM Studio not ready; skipping the schema-constrained ask.")
+                return None
+            return await self._chat_json(model, system_prompt, user_prompt, schema=schema)
+        except Exception as e:
+            logger.warning(f"Schema-constrained ask failed: {e}")
+            return None
+        finally:
+            await gpu_broker.release_lease("lm_studio")
+
     @staticmethod
     def _safe(w: Dict[str, Any]) -> str:
-        return str(w.get("word", w.get("text", ""))).strip().replace(" ", "_") or "_"
+        # Judge on the native Devanagari when the word carries one, so the model
+        # reads real Hindi rather than its romanization. See asr.fluency._token.
+        text = w.get("word_native") or w.get("word") or w.get("text", "")
+        return str(text).strip().replace(" ", "_") or "_"
 
     async def _adjudicate_window(self, numbered_text: str, candidates: List[int],
                                  aggressiveness: float, model: Optional[str] = None):
@@ -383,9 +410,10 @@ class LMStudioClient:
         # the rule for which copy survives.
         system_prompt = (
             "You are a precise video editor cleaning a speech transcript. Tokens are "
-            "shown as [index]word; candidates for removal are marked with '*'. The text "
-            "may be English or romanized Hindi/Hinglish. Decide which CANDIDATE indices are "
-            "true disfluencies to delete.\n"
+            "shown as [index]word; candidates for removal are marked with '*'. The speech "
+            "is Hindi in its native Devanagari script, with English words mixed in (or, "
+            "occasionally, wholly English). Judge it as Hindi, applying Hindi grammar. "
+            "Decide which CANDIDATE indices are true disfluencies to delete.\n"
             "Delete: filler words (um, uh, like, matlab, yaani, basically, you know), "
             "stutters, and ABANDONED ATTEMPTS.\n"
             "An abandoned attempt is where the speaker starts a sentence, breaks off, and "

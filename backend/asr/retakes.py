@@ -34,9 +34,15 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .tokens import is_latin, spoken
+
 logger = logging.getLogger("retakes")
 
-_PUNCT_RE = re.compile(r"[^\w]", re.UNICODE)
+# Keep Unicode letters, digits AND combining marks. Python's `\w` excludes
+# combining marks, so the old pattern stripped the matras off Devanagari — नहीं
+# became नह — which merged words the matcher must keep apart.
+_PUNCT_RE = re.compile(r"[^\ẁ-ͯऀ-ःऺ-ॏ॑-ॗॢॣ]",
+                       re.UNICODE)
 
 # How far ahead to look for a restart. Speakers routinely get most of a sentence
 # out before abandoning it — one real example ran 16 words before starting over,
@@ -60,6 +66,33 @@ MAX_INTERREGNUM_GAP_SECONDS = 6.0
 # by accident, however far they had got before deciding to start again.
 MAX_ABANDONED_TAIL = 3
 TAIL_PER_MATCHED_WORD = 2.5
+
+# Grammatical frame words. Hindi lists repeat their frame — "दाग लग गया हो या
+# फिर जूता फट गया हो या फिर बाल खराब हो" — and a short match made ONLY of these
+# is the frame recurring, not the speaker restarting: cutting one copy tore
+# "गया हो या फिर" out of the middle of a list on the real recording and left
+# "दाग लग जूता फट". A short all-function match is therefore a candidate for the
+# model, never a structural cut. Content words (दाग, जूता, दोस्तों…) are what
+# make a short repeat a restart, and one is enough.
+FUNCTION_WORDS = {
+    # Devanagari
+    "गया", "गए", "गई", "हो", "होगा", "होता", "होती", "है", "हैं", "था", "थे",
+    "थी", "या", "फिर", "और", "कि", "की", "के", "का", "को", "से", "पे", "पर",
+    "में", "तो", "भी", "ही", "ये", "यह", "वो", "वह", "जो", "कुछ", "अगर", "जब",
+    "तब", "हुआ", "हुई", "हुए", "किया", "करी", "कर", "रहे", "रहा", "रही", "ने",
+    "एक", "इस", "उस", "अब", "पास", "साथ", "बाद", "तक", "वाला", "वाले", "आप",
+    "हम", "मैं", "वे", "उन", "इन",
+    # the same words romanized
+    "gaya", "gae", "gayi", "ho", "hoga", "hota", "hoti", "hai", "hain", "tha",
+    "the", "thi", "ya", "phir", "fir", "aur", "ki", "ke", "ka", "ko", "se",
+    "pe", "par", "mein", "men", "me", "to", "toh", "bhi", "hi", "ye", "yah",
+    "vo", "voh", "wo", "woh", "jo", "kuch", "agar", "jab", "tab", "hua",
+    "hui", "hue", "kiya", "kar", "rahe", "raha", "rahi", "ne", "ek", "is",
+    "us", "ab", "paas", "saath", "sath", "baad", "tak", "vala", "vale",
+    "wala", "wale", "aap", "ap", "ham", "hum", "main", "ve", "un", "in",
+}
+# A match longer than this is proof by sheer length, whatever it is made of.
+MAX_FUNCTION_ONLY_MATCH = 4
 
 
 @dataclass
@@ -169,7 +202,14 @@ def token_similarity(a: str, b: str) -> float:
         return 0.0
     if a == b:
         return 1.0
-    if len(a) >= 2 and len(b) >= 2 and phonetic(a) == phonetic(b):
+    # The two folds below repair ROMANIZATION drift and describe Latin spelling.
+    # On native script they are not merely useless but actively wrong: `phonetic`
+    # keeps only ASCII, so on two Devanagari tokens it compares "" with "" and
+    # calls every pair of unrelated Hindi words an 0.85 match. Native script does
+    # not drift anyway — that is the whole reason the matcher now reads it — so
+    # exact equality, the prefix rule and edit distance carry it alone.
+    latin = is_latin(a) and is_latin(b)
+    if latin and len(a) >= 2 and len(b) >= 2 and phonetic(a) == phonetic(b):
         return 0.85
     shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
     if longer.startswith(shorter):
@@ -185,7 +225,7 @@ def token_similarity(a: str, b: str) -> float:
     # just above the matching threshold: enough to keep a run going through one
     # mangled word, not enough to open a match on its own (see `_match_run`,
     # where skips are rationed and never start a run).
-    if len(shorter) >= _MIN_SKELETON_TOKEN:
+    if latin and len(shorter) >= _MIN_SKELETON_TOKEN:
         left, right = skeleton(a), skeleton(b)
         if len(left) >= _MIN_SKELETON_LENGTH and left == right:
             return 0.8
@@ -196,7 +236,7 @@ def token_similarity(a: str, b: str) -> float:
 
 
 def _match_run(norms: List[str], start: int, repair: int, limit: int,
-               threshold: float = 0.8) -> Tuple[int, int, float, bool]:
+               threshold: float = 0.8, pair=None) -> Tuple[int, int, float, bool]:
     """How far the run at `repair` reproduces the run at `start`.
 
     Returns (matched_words, reparandum_words_consumed, quality, truncated).
@@ -211,7 +251,13 @@ def _match_run(norms: List[str], start: int, repair: int, limit: int,
     Also reports whether the match ended on a *truncated* word — "prob" where the
     good take says "probably". A clipped final word is direct evidence that the
     speaker broke off mid-word, which is worth more than the match length alone.
+
+    `pair(x, y)`, when given, scores two positions instead of
+    `token_similarity(norms[x], norms[y])` — `find_retakes` uses it to see
+    across a script flip (see `_cross_script_similarity`).
     """
+    if pair is None:
+        pair = lambda x, y: token_similarity(norms[x], norms[y])
     a_off = 0            # words consumed on the abandoned side
     b_off = 0            # words consumed on the retry side
     matched = 0
@@ -222,12 +268,10 @@ def _match_run(norms: List[str], start: int, repair: int, limit: int,
     def sim(a_index: int, b_index: int) -> float:
         if a_index >= repair or b_index >= limit:
             return 0.0
-        return token_similarity(norms[a_index], norms[b_index])
-
-    anchor = norms[start]
+        return pair(a_index, b_index)
 
     def is_anchor(index: int) -> bool:
-        return index < limit and token_similarity(norms[index], anchor) >= threshold
+        return index < limit and pair(start, index) >= threshold
 
     while start + a_off < repair and repair + b_off < limit and matched < MAX_LOOKAHEAD:
         # A recurrence of the anchor word is the start of *another attempt*.
@@ -237,7 +281,7 @@ def _match_run(norms: List[str], start: int, repair: int, limit: int,
         if (a_off > 0 and is_anchor(start + a_off)) or (b_off > 0 and is_anchor(repair + b_off)):
             break
         a, b = norms[start + a_off], norms[repair + b_off]
-        score = token_similarity(a, b)
+        score = pair(start + a_off, repair + b_off)
         if score >= threshold:
             truncated = (a != b and len(a) < len(b) and b.startswith(a))
             total += score
@@ -293,11 +337,25 @@ def find_retakes(
     out, and a two-word mismatch with it left in.
     """
     live = [i for i, w in enumerate(words)
-            if normalise(w.get("word", w.get("text", ""))) and not w.get("disfluency")]
+            if normalise(spoken(w)) and not w.get("disfluency")]
     if len(live) < 2:
         return []
 
-    norms = [normalise(words[i].get("word", words[i].get("text", ""))) for i in live]
+    norms = [normalise(spoken(words[i])) for i in live]
+    # Whisper flips script mid-transcript — the same name arrives as "थॉमल
+    # गिल्गोविच" in one take and "Thommel Gilgovich" in the next — and on the
+    # native spellings those score zero, so the doubled telling survived every
+    # structural pass. When the two sides are in different scripts, the
+    # romanized forms are the only common ground; compare those instead.
+    from .tokens import romanized
+    roman = [normalise(romanized(words[i])) for i in live]
+
+    def pair(x: int, y: int) -> float:
+        score = token_similarity(norms[x], norms[y])
+        if score < 0.8 and is_latin(norms[x]) != is_latin(norms[y]):
+            score = max(score, token_similarity(roman[x], roman[y]))
+        return score
+
     starts = [float(words[i].get("start", 0.0) or 0.0) for i in live]
     ends = [float(words[i].get("end", 0.0) or 0.0) for i in live]
     # True where an editing term was lifted out of the gap before this word.
@@ -330,10 +388,11 @@ def find_retakes(
                 worst_clean_gap = max(worst_clean_gap, gap)
             if not norms[repair]:
                 continue
-            if token_similarity(norms[index], norms[repair]) < 0.8:
+            if pair(index, repair) < 0.8:
                 continue
 
-            length, consumed, quality, truncated = _match_run(norms, index, repair, count)
+            length, consumed, quality, truncated = _match_run(norms, index, repair, count,
+                                                              pair=pair)
             if length < 1:
                 continue
 
@@ -353,6 +412,15 @@ def find_retakes(
             # sentences are full of "hai … hai": treating those as restarts would
             # eat the words between them.
             if length == 1 and repair != index + 1:
+                continue
+
+            # A short match made only of frame words is Hindi grammar repeating
+            # itself ("… गया हो या फिर … गया हो या फिर …"), not a restart. Not
+            # cut on structure alone — the model can still name it, with the
+            # sentence in front of it.
+            if (length <= MAX_FUNCTION_ONLY_MATCH
+                    and all(norms[index + offset] in FUNCTION_WORDS
+                            for offset in range(consumed))):
                 continue
 
             # Seeing through an editing term is what lets a real restart be
@@ -507,15 +575,21 @@ MIN_TAKE_COVERAGE = 0.8
 TAKE_SYSTEM = (
     "A speaker recording to camera said the same sentence more than once, "
     "restarting until they were happy. You are choosing which recording of it to "
-    "put in the video. The text is Hindi written in Latin letters (Hinglish), "
+    "put in the video. The text is Hindi in its native Devanagari script, "
     "possibly mixed with English.\n\n"
     "For each numbered group, pick the ONE take that is the most complete and "
     "fluent — the one a viewer should hear.\n\n"
     "How to judge:\n"
+    "- The line marked 'then:' is what the video says IMMEDIATELY AFTER the "
+    "chosen take. The take you choose must flow into it as continuous speech. A "
+    "take that ends mid-clause — hanging on a word like 'कि', 'में', 'और', "
+    "'किसी' — reads as broken when 'then:' starts a new thought, however much "
+    "of the sentence it got through. Read each take WITH the 'then:' line "
+    "before judging it.\n"
     "- Prefer the take that finishes its thought over one that breaks off.\n"
     "- Prefer the take without stumble words wedged into the middle of it.\n"
     "- **Spelling is never a reason to reject a take.** A machine wrote this text "
-    "down and romanises Hindi badly ('jaz' = judge, 'sabsakraaib' = subscribe). "
+    "down and spells badly ('जज' may be 'judge', 'सबस्क्राइब' 'subscribe'). "
     "Two takes spelled differently may be identical speech.\n"
     "- If the takes are equally good, choose the LAST one. It is the one the "
     "speaker settled on.\n\n"
@@ -541,14 +615,26 @@ def parse_take_choices(answer: str, groups: int) -> Dict[int, int]:
 
 
 def _cut_runs(words: Sequence[Dict[str, Any]]) -> List[List[int]]:
-    """Contiguous stretches of words cut as abandoned attempts."""
+    """Stretches of words cut as abandoned attempts, seen through other cuts.
+
+    A flounder is full of "[uh]"s, and those are cut as `filler_sound`, not
+    `retake` — requiring strict adjacency broke every real pile-up into
+    fragments at each filler, so best-take never saw the attempts whole and the
+    one group that needed a swap never even formed. Any other cut word is
+    transparent here: it is being removed regardless, so it does not interrupt
+    the attempt it sits inside. Only a surviving word ends a run.
+    """
     runs: List[List[int]] = []
+    open_run = False
     for index, word in enumerate(words):
         if word.get("disfluency") and word.get("reason") == "retake":
-            if runs and index == runs[-1][-1] + 1:
+            if open_run and runs:
                 runs[-1].append(index)
             else:
                 runs.append([index])
+                open_run = True
+        elif not word.get("disfluency"):
+            open_run = False
     return runs
 
 
@@ -561,7 +647,7 @@ def _surviving_take(words: Sequence[Dict[str, Any]], after: int,
         word = words[index]
         if word.get("disfluency"):
             continue
-        if not normalise(word.get("word", word.get("text", ""))):
+        if not normalise(spoken(word)):
             continue
         start = float(word.get("start", 0.0) or 0.0)
         if previous_end is not None and start - previous_end > max_gap:
@@ -574,8 +660,24 @@ def _surviving_take(words: Sequence[Dict[str, Any]], after: int,
 
 
 def _text(words: Sequence[Dict[str, Any]], indices: Sequence[int]) -> str:
-    return " ".join(str(words[i].get("word", words[i].get("text", ""))).strip()
-                    for i in indices)
+    return " ".join(spoken(words[i]).strip() for i in indices)
+
+
+def _continuation(words: Sequence[Dict[str, Any]], take: Sequence[int],
+                  limit: int = 10) -> List[int]:
+    """The surviving words that follow `take` — what the chosen take must flow
+    into. Bounded: a few words of context, not the rest of the video."""
+    if not take:
+        return []
+    out: List[int] = []
+    for index in range(take[-1] + 1, len(words)):
+        word = words[index]
+        if word.get("disfluency") or not normalise(spoken(word)):
+            continue
+        out.append(index)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _challengers(words: Sequence[Dict[str, Any]], run: List[int],
@@ -589,8 +691,7 @@ def _challengers(words: Sequence[Dict[str, Any]], run: List[int],
     """
     if len(take) < MIN_TAKE_WORDS:
         return []
-    tokens = {index: normalise(words[index].get("word", words[index].get("text", "")))
-              for index in run + take}
+    tokens = {index: normalise(spoken(words[index])) for index in run + take}
     opener = tokens[take[0]]
     if not opener:
         return []
@@ -636,6 +737,13 @@ async def choose_best_takes(words: List[Dict[str, Any]], ask) -> int:
         for take_number, attempt in enumerate(challengers, 1):
             lines.append(f"  take {take_number}: {_text(words, attempt)}")
         lines.append(f"  take {len(challengers) + 1}: {_text(words, take)}")
+        # What the video says next. Without it the model judges each take as a
+        # sentence in isolation and picks the longest — a live run swapped in an
+        # earlier attempt whose extra words were a dangling "कि आप किसी", because
+        # nothing showed that the video then moves on to a different sentence.
+        following = _continuation(words, take)
+        if following:
+            lines.append(f"  then: {_text(words, following)}")
         prompt_parts.append("\n".join(lines))
 
     answer = await ask(TAKE_SYSTEM, "Groups:\n" + "\n\n".join(prompt_parts))

@@ -56,6 +56,13 @@ MIN_JUDGED_WORDS = 4
 MAX_REPAIR_FRACTION = 0.5
 MIN_WORDS_AFTER_REPAIR = 3
 MIN_REPAIR_MATCH_RATIO = 0.5
+# The debris a repair exists for — a stumble, a half-word, the wedged remains of
+# a false start — is short. A single deletion longer than this is the model
+# re-cutting the sentence: a live repair removed eight consecutive words that
+# were the researchers' names ("था थौमल गिलगोविच केनट सविट्सकी और विक्टोरिया
+# मेडवेक"), which no grammatical judgement justifies. The percentage cap alone
+# cannot catch this — a long sentence affords a long "repair".
+MAX_REPAIR_RUN = 5
 
 # Words a repair may NEVER remove. Deleting a negation does not tidy a sentence,
 # it reverses it: the first live run of this pass "repaired" "hamane to notice
@@ -63,7 +70,12 @@ MIN_REPAIR_MATCH_RATIO = 0.5
 # Nothing about a grammatical judgement justifies that, so the words are simply
 # off limits — Hindi first, then the English a Hinglish speaker mixes in.
 PROTECTED_WORDS = {
-    # Hindi / Urdu negation and prohibition
+    # Hindi / Urdu negation and prohibition — native Devanagari, since the audit
+    # now judges the native script (normalise keeps the matras, so these match).
+    "नहीं", "नही", "नहि", "ना", "न", "मत", "बिना", "कभी", "कभ", "कोई", "कुछ",
+    "केवल", "सिर्फ", "बिल्कुल",
+    # The same words romanized, for English speech and any word without a native
+    # form (normalise strips the matra off some, so keep the stripped shapes too).
     "naheen", "nahin", "nahi", "nah", "na", "mat", "bina", "binaa", "kabhee",
     "kabhi", "koee", "koi", "kuch", "kuchh",
     # English negation and quantity, which invert meaning just as hard
@@ -114,7 +126,9 @@ class AuditResult:
 
 
 def _token(word: Dict[str, Any]) -> str:
-    return str(word.get("word", word.get("text", "")))
+    """The token to JUDGE — the native Devanagari when the word carries one, so
+    the audit reads real Hindi rather than its romanization. See fluency._token."""
+    return str(word.get("word_native") or word.get("word") or word.get("text", ""))
 
 
 def split_sentences(words: Sequence[Dict[str, Any]]) -> List[Sentence]:
@@ -146,25 +160,22 @@ def split_sentences(words: Sequence[Dict[str, Any]]) -> List[Sentence]:
 
 AUDIT_SYSTEM = (
     "You are proof-reading the transcript of a finished video edit. The speaker "
-    "talks in Hindi, written in Latin letters (Hinglish), mixing in English words "
-    "as Hindi speakers do.\n\n"
+    "talks in HINDI, written in its native Devanagari script, mixing in English "
+    "words as Hindi speakers do.\n\n"
     "For each numbered sentence, decide ONE thing: read aloud, is it a complete, "
-    "grammatical Hindi sentence?\n\n"
+    "grammatical HINDI sentence? Apply HINDI grammar and Hindi sentence sense — "
+    "not English. A sentence that is perfectly good spoken Hindi is OK even if a "
+    "word-for-word English reading would sound odd.\n\n"
     "Judge it as SPEECH, not as writing:\n"
     "- Mixing English words into Hindi is normal and correct. Not a fault.\n"
     "- Missing punctuation is not a fault.\n"
-    "- **Spelling is NEVER a fault.** This transcript was written down by a "
-    "machine that romanises Hindi badly: 'jaz' means judge, 'sabsakraaib' means "
-    "subscribe, 'phinamaanaa' means phenomenon, 'ooniversity' means university. "
-    "The speaker said these words perfectly. If a word only looks wrong because "
-    "of its spelling, the sentence is FINE.\n\n"
     "- A line ending in '...' was cut off by a pause, not by the speaker: the "
     "thought carries on in the next line. Judge only whether the words present "
     "are good speech, and never call such a line unfinished.\n\n"
     "A sentence is BROKEN only when the words themselves do not form a complete "
-    "thought — it breaks off unfinished, or it carries leftover stumble words "
-    "from a false start, such as 'kabhee aisaa ha aap vah hai ki' where "
-    "'ha aap vah' is debris.\n\n"
+    "Hindi thought — it breaks off unfinished, or it carries leftover stumble "
+    "words from a false start, such as 'कभी ऐसा ह आप वह है कि' where 'ह आप वह' is "
+    "debris left behind by the edit.\n\n"
     "Answer with one line per sentence and nothing else:\n"
     "<number>: OK\n"
     "<number>: BROKEN - <a few words on what is wrong>"
@@ -172,16 +183,16 @@ AUDIT_SYSTEM = (
 
 
 REPAIR_SYSTEM = (
-    "You are repairing sentences from a video edit. Each sentence has leftover "
-    "stumble words in it — debris from a false start the speaker made.\n\n"
+    "You are repairing sentences from a video edit. The speech is HINDI in its "
+    "native Devanagari script, with English words mixed in. Each sentence has "
+    "leftover stumble words in it — debris from a false start the speaker made.\n\n"
     "For each numbered sentence, write it again with ONLY the debris words "
-    "removed.\n\n"
+    "removed, so what is left is a complete, grammatical HINDI sentence.\n\n"
     "ABSOLUTE RULES:\n"
     "1. Use only the words given, spelled exactly as given, in the same order. "
-    "Delete words; never add, replace, reorder or re-spell anything.\n"
-    "2. **Never 'fix' a spelling.** The machine that wrote this romanises Hindi "
-    "badly ('jaz' = judge, 'sabsakraaib' = subscribe). Those words are correct "
-    "speech and must stay.\n"
+    "Delete words; never add, replace, reorder, re-spell, romanize or translate "
+    "anything.\n"
+    "2. Judge completeness by HINDI grammar, not English.\n"
     "3. Remove as little as possible — only what stops the sentence being a "
     "complete Hindi sentence.\n"
     "4. If nothing can be removed to fix it, write the sentence back unchanged.\n\n"
@@ -261,6 +272,19 @@ def repair_deletions(sentence: Sentence, repaired: str,
     if not deleted:
         return None
 
+    # Numbers and bare symbols are data, not debris, and the model cannot have
+    # reasoned about the sound under them: "%" reads as punctuation on the page
+    # but the audio says "percent" — a live repair deleted two of them and the
+    # cut dropped the spoken word both times. They are lifted OUT of the
+    # deletion set rather than refusing the whole repair, because unlike a
+    # negation their removal cannot invert the sentence the model approved —
+    # keeping them leaves that sentence exactly as it read.
+    deleted = {offset for offset in deleted
+               if normalise(original[offset])
+               and not any(ch.isdigit() for ch in original[offset])}
+    if not deleted:
+        return None
+
     protected = sorted(normalise(original[offset]) for offset in deleted
                        if normalise(original[offset]) in PROTECTED_WORDS)
     if protected:
@@ -276,6 +300,15 @@ def repair_deletions(sentence: Sentence, repaired: str,
     if len(deleted) / len(original) > MAX_REPAIR_FRACTION:
         logger.info("Repair for sentence %d ignored: would remove %d of %d words",
                     sentence.index + 1, len(deleted), len(original))
+        return None
+    longest = 0
+    run = 0
+    for offset in range(len(original)):
+        run = run + 1 if offset in deleted else 0
+        longest = max(longest, run)
+    if longest > MAX_REPAIR_RUN:
+        logger.info("Repair for sentence %d refused: a single %d-word removal "
+                    "is a rewrite, not a repair", sentence.index + 1, longest)
         return None
     if len(original) - len(deleted) < MIN_WORDS_AFTER_REPAIR:
         logger.info("Repair for sentence %d ignored: too little left", sentence.index + 1)
@@ -389,9 +422,11 @@ MAX_FRAGMENT_FRACTION = 0.15
 
 
 FRAGMENT_SYSTEM = (
-    "You are checking a video edit for abandoned sentences. The speaker sometimes "
-    "starts a thought, gives up, and starts again in different words. The "
-    "abandoned start is still in the edit and has to be removed whole.\n\n"
+    "You are checking a video edit for abandoned sentences. The speech is HINDI in "
+    "its native Devanagari script, with English words mixed in; judge it as Hindi. "
+    "The speaker sometimes starts a thought, gives up, and starts again in "
+    "different words. The abandoned start is still in the edit and has to be "
+    "removed whole.\n\n"
     "You are shown numbered pairs. For each pair:\n"
     "  A = a short line that may be an abandoned start.\n"
     "  B = the line that comes after it in the video.\n\n"
@@ -399,11 +434,8 @@ FRAGMENT_SYSTEM = (
     "  1. A is incomplete on its own — it breaks off and never finishes its thought.\n"
     "  2. B says the same thing properly, so nothing is lost by removing A.\n\n"
     "Answer KEEP for everything else. In particular answer KEEP when:\n"
-    "  - A is a complete thought, even a very short one ('haan', 'to dosto').\n"
-    "  - A says something B does not say.\n"
-    "  - A only looks wrong because of its spelling. This transcript was written "
-    "by a machine that romanises Hindi badly ('jaz' = judge, 'sabsakraaib' = "
-    "subscribe). Bad spelling is never a reason to drop a line.\n\n"
+    "  - A is a complete Hindi thought, even a very short one ('हाँ', 'तो दोस्तों').\n"
+    "  - A says something B does not say.\n\n"
     "When you are unsure, answer KEEP.\n\n"
     "Answer with one line per pair and nothing else:\n"
     "<number>: DROP\n"
@@ -441,6 +473,11 @@ def _fragment_candidates(words: Sequence[Dict[str, Any]], result: AuditResult,
             # Same rule as repair: removing a negation reverses the speaker
             # rather than tidying them, and no grammatical judgement is worth
             # that. See PROTECTED_WORDS.
+            continue
+        if any(any(ch.isdigit() for ch in _token(words[p]))
+               for p in sentence.positions):
+            # A number is data. A "fragment" carrying one is a thought with
+            # content in it, whatever its grammar looks like.
             continue
         candidates.append(sentence)
     return candidates

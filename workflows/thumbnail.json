@@ -7,16 +7,28 @@
       "sampler_name": "dpmpp_2m",
       "scheduler": "karras",
       "denoise": 1.0,
-      "model": ["4", 0],
-      "positive": ["6", 0],
-      "negative": ["7", 0],
-      "latent_image": ["5", 0]
+      "model": [
+        "4",
+        0
+      ],
+      "positive": [
+        "6",
+        0
+      ],
+      "negative": [
+        "7",
+        0
+      ],
+      "latent_image": [
+        "5",
+        0
+      ]
     },
     "class_type": "KSampler"
   },
   "4": {
     "inputs": {
-      "ckpt_name": "v1-5-pruned-emaonly.ckpt"
+      "ckpt_name": "Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors"
     },
     "class_type": "CheckpointLoaderSimple"
   },
@@ -31,28 +43,43 @@
   "6": {
     "inputs": {
       "text": "eye-catching YouTube thumbnail, dramatic lighting, vibrant colors, epic composition",
-      "clip": ["4", 1]
+      "clip": [
+        "4",
+        1
+      ]
     },
     "class_type": "CLIPTextEncode"
   },
   "7": {
     "inputs": {
       "text": "boring, dull, low quality, dark, blurry",
-      "clip": ["4", 1]
+      "clip": [
+        "4",
+        1
+      ]
     },
     "class_type": "CLIPTextEncode"
   },
   "8": {
     "inputs": {
-      "samples": ["3", 0],
-      "vae": ["4", 2]
+      "samples": [
+        "3",
+        0
+      ],
+      "vae": [
+        "4",
+        2
+      ]
     },
     "class_type": "VAEDecode"
   },
   "9": {
     "inputs": {
       "filename_prefix": "buzzedit_thumbnail",
-      "images": ["8", 0]
+      "images": [
+        "8",
+        0
+      ]
     },
     "class_type": "SaveImage"
   }

@@ -127,6 +127,69 @@ TEXT_PRESETS: Dict[str, Dict[str, Any]] = {
                   "box": True, "box_color": "#FFE97F@0.95", "box_padding": 22,
                   "animation": "pop"},
     },
+    # --- cards the presentation pass places from the transcript ---------------
+    "location_card": {
+        "label": "Location / Date Card",
+        "style": {"font_family": "Georgia", "font_size": 44, "color": "#EDE6D6",
+                  "stroke_width": 0, "shadow_x": 2, "shadow_y": 2,
+                  "shadow_color": "black@0.85", "align": "left",
+                  "pos_x": -0.92, "pos_y": -0.82, "line_spacing": 6,
+                  "animation": "typewriter", "animation_duration": 0.9},
+    },
+    "character_card": {
+        "label": "Character Card",
+        "style": {"font_family": "Montserrat", "font_size": 46, "bold": True,
+                  "color": "white", "box": True, "box_color": "#0B0B0B@0.7",
+                  "box_padding": 16, "align": "left", "pos_x": -0.92, "pos_y": 0.55,
+                  "line_spacing": 4, "animation": "slide-up", "animation_duration": 0.3},
+    },
+    "source_card": {
+        "label": "Source Citation",
+        "style": {"font_family": "Inter", "font_size": 30, "color": "#DDDDDD",
+                  "box": True, "box_color": "black@0.55", "box_padding": 10,
+                  "align": "right", "pos_x": 0.94, "pos_y": 0.88,
+                  "animation": "fade", "animation_duration": 0.3},
+    },
+    "chapter_title": {
+        "label": "Chapter Title",
+        "style": {"font_family": "Montserrat", "font_size": 88, "bold": True,
+                  "color": "white", "stroke_width": 5, "stroke_color": "black",
+                  "shadow_x": 4, "shadow_y": 4, "pos_y": -0.15,
+                  "animation": "scale_in", "animation_duration": 0.35},
+    },
+    "stat_callout": {
+        "label": "Stat Call-out",
+        "style": {"font_family": "Montserrat", "font_size": 150, "bold": True,
+                  "color": "#FFE23A", "stroke_width": 8, "stroke_color": "black",
+                  "shadow_x": 5, "shadow_y": 5, "pos_y": -0.05,
+                  "animation": "pop", "animation_duration": 0.25},
+    },
+    "stat_label": {
+        "label": "Stat Label",
+        "style": {"font_family": "Montserrat", "font_size": 44, "bold": True,
+                  "color": "white", "stroke_width": 4, "stroke_color": "black",
+                  "pos_y": 0.22, "animation": "fade", "animation_duration": 0.3},
+    },
+    "definition_card": {
+        "label": "Definition Card",
+        "style": {"font_family": "Inter", "font_size": 48, "color": "white",
+                  "box": True, "box_color": "#101418@0.85", "box_padding": 26,
+                  "line_spacing": 14, "pos_y": 0.0,
+                  "animation": "fade", "animation_duration": 0.3},
+    },
+    "end_screen": {
+        "label": "End Screen",
+        "style": {"font_family": "Montserrat", "font_size": 72, "bold": True,
+                  "color": "white", "stroke_width": 5, "stroke_color": "black",
+                  "pos_y": -0.62, "animation": "pop", "animation_duration": 0.3},
+    },
+    "horror_whisper": {
+        "label": "Horror Whisper",
+        "style": {"font_family": "Georgia", "font_size": 40, "italic": True,
+                  "color": "#C8C8C8", "opacity": 0.75, "stroke_width": 0,
+                  "shadow_x": 0, "shadow_y": 0, "pos_y": -0.7,
+                  "animation": "flicker", "animation_duration": 0.6},
+    },
 }
 
 
@@ -145,6 +208,17 @@ CAPTION_PRESETS: Dict[str, Dict[str, Any]] = {
         "style": {"font_family": "Arial", "font_size": 46, "color": "white",
                   "box": True, "box_color": "black@0.6", "box_padding": 12,
                   "pos_y": 0.75, "animation": "none"},
+    },
+    "karaoke_pop": {
+        "label": "Karaoke Word Highlight",
+        "words_per_caption": 4,
+        "max_gap_seconds": 0.6,
+        "uppercase": True,
+        "style": {"font_family": "Montserrat", "font_size": 80, "bold": True,
+                  "color": "white", "highlight_color": "#FFE23A",
+                  "stroke_width": 6, "stroke_color": "black",
+                  "shadow_x": 3, "shadow_y": 3, "pos_y": 0.4,
+                  "animation": "karaoke", "animation_duration": 0.1},
     },
     "youtube_shorts": {
         "label": "Shorts Word Pop",

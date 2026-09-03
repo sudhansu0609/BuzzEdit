@@ -1,4 +1,4 @@
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 from pydantic import BaseModel, Field
 
 # The shortest span the pipeline will both *detect* as a filler and *remove*
@@ -43,6 +43,16 @@ class WordItem(BaseModel):
     # The planner was unsure and something else decided. Kept so the UI can mark
     # a cut as a judgement call rather than a certainty.
     candidate: bool = False
+    # The word in the script the speaker actually spoke (Devanagari for Hindi),
+    # while `text` holds the romanized form the captions and the UI use. Every
+    # grammar/fluency pass judges the native script — to a model, romanized Hindi
+    # reads as broken English, so it scores good Hindi as wrong. This was being
+    # dropped at every dict-to-WordItem conversion, which meant the re-cut path
+    # ("Auto Edit" on an existing timeline) fed romanized text to prompts that
+    # state the input is Devanagari, and the Devanagari negations in
+    # verify.PROTECTED_WORDS could never match. None for English speech and for
+    # words added by hand.
+    word_native: Optional[str] = None
 
 class TimelineEffect(BaseModel):
     type: str  # "zoompan", "fade", "lut"
@@ -239,9 +249,13 @@ class TextStyle(BaseModel):
     box: bool = False
     box_color: str = "black@0.6"
     box_padding: int = 12
-    # Animation
-    animation: str = "none"        # "none" | "fade" | "pop" | "slide-up"
+    # Animation. drawtext draws none/fade/pop/slide-up; the rest go through the
+    # libass engine (render/ass.py): typewriter, karaoke, scale_in, blur_in,
+    # glitch, shake, flicker.
+    animation: str = "none"
     animation_duration: float = 0.3
+    # Karaoke: the colour of the word being spoken.
+    highlight_color: str = "#FFE23A"
 
 
 class TrackState(BaseModel):
@@ -265,6 +279,32 @@ class Transition(BaseModel):
     """
     type: str = "fade"          # any name from render/transitions.CATALOGUE
     duration: float = 0.5
+    # Who chose it. The presentation pass tags the transitions it picks per
+    # topic boundary ("presentation") so a re-run replaces only those and a
+    # transition the user set by hand is never overwritten.
+    origin: Optional[str] = None
+
+
+class AudioMaster(BaseModel):
+    """Programme-wide sound treatment: clean the voice, then hit a loudness target.
+
+    The voice chain (denoise, de-ess, compression) is applied to the A1 programme
+    audio *before* music and effects are mixed in, so it never pumps the music;
+    `loudness_lufs` is applied to the finished mix, which is what YouTube
+    measures (it normalises to -14 LUFS and turns down anything louder).
+    All values are neutral by default so an untouched master compiles to nothing.
+    """
+    voice_denoise: float = 0.0     # 0..1, FFT noise reduction on the voice
+    voice_deess: float = 0.0       # 0..1, de-esser strength
+    voice_compress: float = 0.0    # 0..1, gentle broadcast compression
+    # Integrated loudness target for the final mix, or None to leave levels alone.
+    loudness_lufs: Optional[float] = None
+    true_peak_db: float = -1.5
+    origin: Optional[str] = None
+
+    def is_identity(self) -> bool:
+        return (self.voice_denoise <= 0.0 and self.voice_deess <= 0.0
+                and self.voice_compress <= 0.0 and self.loudness_lufs is None)
 
 
 class AtmosphereEffect(BaseModel):
@@ -274,6 +314,9 @@ class AtmosphereEffect(BaseModel):
     speed: float = 1.0          # 0.1..4, relative
     color: Optional[str] = None  # 8-digit hex for the coloured effects
     enabled: bool = True
+    # Who put it here. The presentation pass tags its own layer ("presentation")
+    # so a re-run replaces exactly that one and leaves the user's effects alone.
+    origin: Optional[str] = None
 
 
 class TextClip(BaseModel):
@@ -281,6 +324,19 @@ class TextClip(BaseModel):
     content: str = "Text"
     style: TextStyle = Field(default_factory=TextStyle)
     preset: Optional[str] = None
+    # An animated number: {"to": 25, "from": 0, "prefix": "", "suffix": "%",
+    # "decimals": 0, "seconds": 1.2}. The content is then drawn as the count
+    # rising from `from` to `to` over `seconds` from the clip's start, and
+    # `content` is only the label kept for the UI.
+    counter: Optional[Dict[str, Any]] = None
+    # Word timings for karaoke-style captions: [{"text", "start_s", "end_s",
+    # "emphasis"?}] relative to the clip start. Filled by the caption
+    # generator; used by the animated text engine to highlight the word being
+    # spoken, and to draw an emphasised word (a number, a shouted word) larger.
+    words: List[Dict[str, Any]] = Field(default_factory=list)
+    # A smaller second line under the text (the English translation of a
+    # Hindi caption). Drawn by the animated engine only.
+    second_line: Optional[str] = None
 
 
 class TimelineItem(BaseModel):
@@ -319,6 +375,17 @@ class TimelineItem(BaseModel):
     children: List["TimelineItem"] = Field(default_factory=list)
     mute: bool = False
     volume: float = 1.0
+    # Audio-only switches for mix-track items (A2, A3, …). `loop` repeats a
+    # short source (a music bed, an ambience loop) for the item's whole span
+    # instead of going silent when the file runs out; the fades are seconds at
+    # either end; `duck` (0..1) is how hard the A1 voice pushes this item down
+    # while somebody is speaking — 0 leaves it alone, 1 is full ducking. Ducking
+    # is done with a sidechain compressor keyed off the programme voice, so it
+    # follows the speech exactly rather than a guessed envelope.
+    loop: bool = False
+    audio_fade_in: float = 0.0
+    audio_fade_out: float = 0.0
+    duck: float = 0.0
     label: Optional[str] = None
 
     @property
@@ -350,6 +417,10 @@ class Timeline(BaseModel):
     # colour+silence segment in front, so the pad survives transcript edits.
     program_offset_frames: int = 0
     program_offset_color: str = "black"
+    # How much of that offset is the cold open (a copied hook sentence played
+    # before the title). Kept apart so an intro card can be added or removed
+    # without shifting the cold open along with it.
+    cold_open_frames: int = 0
     # Auto-edit pacing. A pause longer than `max_pause_seconds` is trimmed down to
     # `pause_padding_seconds` either side of the speech rather than deleted, so a
     # tightened edit still breathes; shorter pauses are left exactly as recorded.
@@ -382,6 +453,8 @@ class Timeline(BaseModel):
     default_transition: Optional[Transition] = None
     # Generated atmosphere composited over the finished picture.
     effects: List[AtmosphereEffect] = Field(default_factory=list)
+    # Voice clean-up and the loudness target for the finished mix.
+    audio_master: Optional[AudioMaster] = None
     # Letterbox the programme to this aspect ratio (2.39 = cinematic scope).
     # The output resolution is unchanged; black bars are matted on.
     aspect_bars: Optional[float] = None

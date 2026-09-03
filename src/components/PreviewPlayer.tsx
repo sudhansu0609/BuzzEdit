@@ -10,6 +10,12 @@ export default function PreviewPlayer() {
   const [isMuted, setIsMuted] = useState(false);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoReady, setVideoReady] = useState(false);
+  // Path to a seek-friendly H.264 proxy of the source, once the backend has
+  // built one. iPhone 10-bit HEVC cannot be seeked in the browser, so the live
+  // "Cut" preview plays straight through the removed fumbles on the raw file.
+  // The proxy is what makes the cuts actually skip. null = use the raw source.
+  const [proxyPath, setProxyPath] = useState<string | null>(null);
+  const [proxyBuilding, setProxyBuilding] = useState(false);
 
   const sourceVideo = project?.source_video || project?.sourceVideo;
   const renderedOutput: string | undefined =
@@ -66,13 +72,54 @@ export default function PreviewPlayer() {
     return keptIntervals[0]?.[0] ?? 0;
   }, [keptIntervals]);
 
+  // Ask the backend for a seek-friendly proxy of the source. HEVC/10-bit phone
+  // footage can't be seeked in Chromium, so without this the cut preview plays
+  // through every removed region. Polls while the transcode runs, then swaps the
+  // preview over to the proxy. Plain H.264 reports `not_needed` and we stay on
+  // the original. Cancelled cleanly when the source changes.
+  useEffect(() => {
+    setProxyPath(null);
+    setProxyBuilding(false);
+    if (!sourceVideo) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+
+    const poll = async () => {
+      try {
+        const res = await fetch(
+          `http://localhost:8099/api/media/proxy?path=${encodeURIComponent(sourceVideo)}`);
+        if (cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
+        if (data.status === 'ready' && data.path) {
+          setProxyPath(data.path);
+          setProxyBuilding(false);
+        } else if (data.status === 'building') {
+          setProxyBuilding(true);
+          timer = setTimeout(poll, 2500);
+        } else {
+          // not_needed / none / error — the raw source is what we preview.
+          setProxyBuilding(false);
+        }
+      } catch {
+        if (!cancelled) setProxyBuilding(false);
+      }
+    };
+    poll();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [sourceVideo]);
+
   // Default: the live cut when we have a timeline, else the source.
   const [mode, setMode] = useState<PreviewMode>('cut');
   useEffect(() => {
     setMode(hasCut ? 'cut' : (renderedOutput ? 'result' : 'source'));
   }, [hasCut, renderedOutput, project?.id]);
 
-  const activeSrc = (mode === 'result' && renderedOutput) ? renderedOutput : sourceVideo;
+  // Cut and Source modes play the source itself — through the proxy when one is
+  // ready, so seeks (and therefore the gap-skipping that IS the cut) work.
+  // Rendered mode plays the finished file, which is already H.264 and seekable.
+  const previewSource = proxyPath || sourceVideo;
+  const activeSrc = (mode === 'result' && renderedOutput) ? renderedOutput : previewSource;
 
   // Refs so the (stable) timeupdate handler reads the latest values.
   const scrubRef = useRef(isScrubbing); scrubRef.current = isScrubbing;
@@ -306,6 +353,17 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
             {videoError && (
               <div className="video-error">
                 <span>{videoError}</span>
+              </div>
+            )}
+            {proxyBuilding && mode !== 'result' && (
+              <div style={{
+                position: 'absolute', bottom: 8, left: 8, zIndex: 5,
+                display: 'flex', alignItems: 'center', gap: 6,
+                background: 'rgba(0,0,0,0.65)', color: '#fff',
+                padding: '4px 8px', borderRadius: 4, fontSize: 11,
+              }}>
+                <div className="spinner" style={{ width: 12, height: 12 }} />
+                <span>Preparing preview — cuts will skip cleanly once ready</span>
               </div>
             )}
           </>

@@ -7,6 +7,8 @@ removed filler is such a gap, so short cuts were glued back into the render whil
 the UI showed them struck out. `audit_cut_coverage` is what makes that visible.
 """
 
+import pytest
+
 from asr.fluency import admissible_repair_cuts
 from timeline import build_timeline_from_transcript
 from timeline.ops import audit_cut_coverage
@@ -142,3 +144,50 @@ def test_a_long_run_of_words_that_recur_nearby_is_the_leftover_of_a_repeat():
 
 def test_nothing_proposed_removes_nothing():
     assert admissible_repair_cuts(["a", "b", "c"], set()) == set()
+
+
+@pytest.mark.asyncio
+async def test_the_final_read_never_cuts_the_sign_off():
+    """The end of the video is the sign-off and nothing follows to supersede it
+    — this pass once deleted the speaker's "बाय बाय" as debris."""
+    from asr.fluency import final_read
+    words = [{"word": f"w{i}", "start": i * 0.4, "end": i * 0.4 + 0.3}
+             for i in range(24)]
+    words[-1]["word"] = "babai"
+
+    async def ask(_system, user):
+        text = user.split("Transcript:\n")[1].split("\n\nCleaned transcript:")[0]
+        tokens = [t for t in text.split() if t != "|"]
+        return " ".join(tokens[:-1])
+
+    assert await final_read(words, ask) == set()
+
+
+@pytest.mark.asyncio
+async def test_a_word_doubled_at_the_tail_is_still_cut():
+    """The tail guard protects a unique sign-off, not the remains of a doubled
+    phrase — a stutter on the very last word still goes."""
+    from asr.fluency import final_read
+    words = [{"word": f"w{i}", "start": i * 0.4, "end": i * 0.4 + 0.3}
+             for i in range(22)]
+    words.extend([{"word": "bye", "start": 8.8, "end": 9.1},
+                  {"word": "bye", "start": 9.2, "end": 9.5}])
+
+    async def ask(_system, user):
+        text = user.split("Transcript:\n")[1].split("\n\nCleaned transcript:")[0]
+        tokens = [t for t in text.split() if t != "|"]
+        del tokens[22]
+        return " ".join(tokens)
+
+    # Either copy may be the one the diff lands on; both are the same sound.
+    cut = await final_read(words, ask)
+    assert len(cut) == 1 and cut <= {22, 23}
+
+
+def test_a_short_run_carrying_a_number_is_not_debris():
+    """"50" is data and "%" is the spoken word "percent" wearing punctuation —
+    a live pass cut both out of "more than 50% 60%". The short-run shape may
+    not touch them; only the repeat shape can, when the number is doubled."""
+    assert admissible_repair_cuts(["more", "den", "50", "log"], {1, 2}) == set()
+    assert admissible_repair_cuts(["more", "", "log"], {1}) == set()
+    assert admissible_repair_cuts(["50", "log", "50", "log"], {0, 1}) == {0, 1}

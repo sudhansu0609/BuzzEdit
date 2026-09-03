@@ -38,6 +38,24 @@ class GPUBroker:
             logger.warning(f"NVML get memory info error: {e}")
             return 8192.0
 
+    def get_total_vram_mb(self) -> float:
+        """Total VRAM on the card in MB — the ceiling a tenant can ever fit in.
+
+        Free memory answers "can this load right now"; total answers "can this
+        machine run this at all". A language model already resident but larger
+        than the card is not usable just because it loaded: llama.cpp offloaded
+        part of it and it dies on a real prompt.
+        """
+        if not NVML_AVAILABLE:
+            return 16384.0
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return float(info.total) / (1024.0 * 1024.0)
+        except Exception as e:
+            logger.warning(f"NVML get memory info error: {e}")
+            return 16384.0
+
     async def release_comfyui_vram(self, comfyui_url: Optional[str] = None) -> bool:
         """Request ComfyUI to unload models and free VRAM if queue is idle."""
         if comfyui_url is None:

@@ -58,6 +58,10 @@ def build_timeline_from_transcript(
             disfluency=disfluency,
             reason=w.get("reason") or None,
             candidate=bool(w.get("candidate", False)),
+            # Carry the spoken script forward. `text` is the romanization the UI
+            # shows; the fluency and grammar passes must judge this instead.
+            word_native=(str(w.get("word_native")).strip() or None)
+            if w.get("word_native") else None,
         ))
 
     timeline = Timeline(

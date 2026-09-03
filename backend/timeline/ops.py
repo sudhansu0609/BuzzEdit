@@ -21,11 +21,18 @@ def apply_auto_zoom(
     with `scale`/`scale_end` on the V1 clip's Transform, which the compiler already
     renders via `zoompan`.
 
-    Direction alternates so a run of segments does not ratchet the framing tighter
-    and tighter, and segments too short to read as a move (a fragment between two
-    cuts) are left flat. Only V1 media segments with no transform of their own are
-    touched, so a move the user placed — or one carried across a rebuild on an
-    anchor word — is never overwritten.
+    Every move pushes IN, deliberately: each clip starts wide and drifts
+    tighter, so at every join the frame steps back to wide by the whole depth
+    of the move — a punch-out, the standard disguise for a talking-head jump
+    cut. Alternating directions (the old behaviour) made the scale CONTINUOUS
+    across every join — a push-in ends at 1+depth exactly where the following
+    pull-back starts — so the head-position jump played completely bare. Depth
+    varies a little per segment so the rhythm does not feel mechanical, and
+    since each move resets to wide there is no ratchet. Segments too short to
+    read as a move (a fragment between two cuts) are left flat. Only V1 media
+    segments with no transform of their own are touched, so a move the user
+    placed — or one carried across a rebuild on an anchor word — is never
+    overwritten.
 
     Returns the number of segments moved.
     """
@@ -51,12 +58,10 @@ def apply_auto_zoom(
             continue
         if index % every != 0:
             continue
-        push_in = (applied % 2 == 0)
-        start_scale = 1.0 if push_in else 1.0 + depth
-        end_scale = 1.0 + depth if push_in else 1.0
+        jitter = 0.75 + 0.5 * ((index * 7) % 5) / 4.0   # 0.75..1.25, deterministic
         segment.transform = Transform(
-            scale=round(start_scale, 3),
-            scale_end=round(end_scale, 3),
+            scale=1.0,
+            scale_end=round(min(1.6, 1.0 + max(0.05, depth * jitter)), 3),
         )
         applied += 1
 
@@ -493,6 +498,88 @@ def toggle_word_range(timeline: Timeline, word_ids: List[str], enabled: bool, pr
     if count > 0:
         rebuild_primary_tracks(timeline, primary_source_id)
     return count
+
+def _subtract_regions(span: List[int], regions: List[List[int]]) -> List[List[int]]:
+    """[start,end] with every overlapping [a,b] in `regions` cut out of it.
+
+    Returns the surviving sub-spans, in order. A region that splits the span in
+    two yields two pieces; one that swallows it yields none.
+    """
+    pieces = [list(span)]
+    for a, b in regions:
+        out: List[List[int]] = []
+        for s, e in pieces:
+            if b <= s or a >= e:
+                out.append([s, e])                    # no overlap
+                continue
+            if a > s:
+                out.append([s, min(a, e)])            # keep the head
+            if b < e:
+                out.append([max(b, s), e])            # keep the tail
+        pieces = out
+    return [p for p in pieces if p[1] > p[0]]
+
+
+def trim_source_regions(timeline: Timeline, regions: List[List[int]],
+                        primary_source_id: str) -> int:
+    """Cut leaked source-frame regions out of the V1/A1 program and re-ripple.
+
+    The auto-edit's cut-verify finds moments the video plays that the transcript
+    removed — a fumble a wrong timestamp let through. This surgically removes
+    those source spans from the primary tracks without touching the word plan or
+    re-running the edit, then closes the timeline gaps they leave. Returns the
+    number of leaked regions applied.
+    """
+    merged = sorted([[int(a), int(b)] for a, b in regions if b > a])
+    if not merged:
+        return 0
+    collapsed: List[List[int]] = []
+    for region in merged:
+        if collapsed and region[0] <= collapsed[-1][1]:
+            collapsed[-1][1] = max(collapsed[-1][1], region[1])
+        else:
+            collapsed.append(region)
+
+    carried: dict = {}
+    for item in timeline.items:
+        if item.track in ("V1", "A1") and item.anchor_word_id and (
+                item.transform is not None or item.color is not None):
+            carried[(item.track, item.anchor_word_id)] = (item.transform, item.color)
+
+    v1 = sorted([i for i in timeline.items if i.track == "V1"],
+                key=lambda i: i.timeline_start_frame)
+    segments: List[tuple] = []
+    for item in v1:
+        for start, end in _subtract_regions(
+                [item.source_start_frame, item.source_end_frame], collapsed):
+            segments.append((start, end, item.anchor_word_id))
+    if len(segments) == len(v1):
+        return 0                                       # nothing overlapped
+
+    timeline.items = [i for i in timeline.items if i.track not in ("V1", "A1")]
+    current = max(0, timeline.program_offset_frames)
+    for idx, (src_start, src_end, anchor) in enumerate(segments):
+        duration = src_end - src_start
+        if duration <= 0:
+            continue
+        tl_start, tl_end = current, current + duration
+        for track in ("V1", "A1"):
+            item = TimelineItem(
+                id=f"{track.lower()}_{idx}_{uuid.uuid4().hex[:6]}",
+                track=track, source_id=primary_source_id,
+                source_start_frame=src_start, source_end_frame=src_end,
+                timeline_start_frame=tl_start, timeline_end_frame=tl_end,
+                enabled=True, anchor_word_id=anchor)
+            restored = carried.get((track, anchor))
+            if restored:
+                item.transform, item.color = restored
+            timeline.items.append(item)
+        current = tl_end
+
+    timeline.recalculate_duration()
+    timeline.revision += 1
+    return len(collapsed)
+
 
 def add_broll_item(
     timeline: Timeline,

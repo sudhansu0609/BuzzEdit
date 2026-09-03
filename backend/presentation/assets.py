@@ -79,6 +79,25 @@ def _canvas_default(canvas_size: Optional[Tuple[int, int]],
     return fallback
 
 
+# Video diffusion cost scales with pixels × frames. ~0.4MP (832x480-class) is
+# what a 14B model renders in a few minutes on a 16GB card; generating at a full
+# 1080p canvas instead takes ~5x longer and blows the per-clip timeout. The
+# video workflow upscales its frames afterwards, so capped generation still
+# fills the frame it is cut into.
+MAX_VIDEO_GEN_PIXELS = 832 * 480
+
+
+def _video_canvas_default(canvas_size: Optional[Tuple[int, int]]) -> Tuple[int, int]:
+    """The media's aspect at a generation-sized resolution, snapped for video
+    latents. An explicit gen_video_size setting bypasses this entirely."""
+    width, height = _canvas_default(canvas_size, DEFAULT_VIDEO_SIZE)
+    pixels = width * height
+    if pixels > MAX_VIDEO_GEN_PIXELS:
+        scale = (MAX_VIDEO_GEN_PIXELS / pixels) ** 0.5
+        width, height = width * scale, height * scale
+    return (_snap(int(width), 16), _snap(int(height), 16))
+
+
 def _upscale_image(path: Path, factor: float) -> None:
     """Enlarge a generated still by `factor` with a high-quality Lanczos resample.
 
@@ -228,9 +247,10 @@ async def _generate_one(beat: Beat, resolved: Dict[str, Optional[workflows.Resol
         upscale = 1.0
 
     if is_video:
-        # Match the media's aspect/size by default so the clip fills the frame.
+        # Match the media's aspect by default, capped to a generation-sized
+        # resolution so a clip takes minutes, not the whole night.
         width, height = tuple(_setting(
-            "gen_video_size", _canvas_default(canvas_size, DEFAULT_VIDEO_SIZE)))
+            "gen_video_size", _video_canvas_default(canvas_size)))
         length = int(_setting("gen_video_length", DEFAULT_VIDEO_LENGTH))
         fps = int(_setting("gen_video_fps", DEFAULT_VIDEO_FPS))
         timeout = int(_setting("gen_video_timeout_s", VIDEO_TIMEOUT))

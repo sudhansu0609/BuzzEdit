@@ -1,9 +1,28 @@
+import asyncio
 import os
 from pathlib import Path
+from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Request, Header
 from fastapi.responses import StreamingResponse
 
 router = APIRouter(prefix="/api/media", tags=["Media"])
+
+
+@router.get("/proxy")
+async def preview_proxy(path: str):
+    """Ensure a seek-friendly H.264 preview proxy for `path` and report its state.
+
+    The live "Cut" preview seeks the source `<video>` to skip removed regions;
+    on 10-bit HEVC phone footage those seeks stall and the cuts appear to do
+    nothing. This hands the player a proxy it can actually seek. Non-blocking:
+    the transcode runs in the background and the client polls until `ready`.
+    """
+    from utils.preview_proxy import ensure
+
+    result = await asyncio.to_thread(ensure, path)
+    if result.get("status") == "ready" and result.get("path"):
+        result["url"] = f"/api/media/stream?path={quote(result['path'])}"
+    return result
 
 @router.get("/stream")
 async def stream_media(path: str, request: Request, range: str = Header(None)):

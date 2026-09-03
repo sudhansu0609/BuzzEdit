@@ -68,6 +68,7 @@ from routes import (
     presets,
     style,
     presentation,
+    script,
 )
 
 app.include_router(health.router, prefix="/api", tags=["health"])
@@ -87,6 +88,7 @@ app.include_router(llm.router, prefix="/api/llm", tags=["llm"])
 app.include_router(presets.router, prefix="/api/presets", tags=["presets"])
 app.include_router(style.router, prefix="/api/style", tags=["style"])
 app.include_router(presentation.router, prefix="/api/presentation", tags=["presentation"])
+app.include_router(script.router, prefix="/api/projects", tags=["script"])
 
 @app.get("/")
 async def root():

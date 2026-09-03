@@ -10,6 +10,19 @@ from .transliterate import to_hinglish, is_transliterable
 
 logger = logging.getLogger("faster_whisper_engine")
 
+
+def _forced_alignment_enabled() -> bool:
+    """Whether to re-time words with forced alignment. On by default (when its
+    model is installed); set the `forced_alignment` app setting to false to keep
+    Whisper's own timings."""
+    try:
+        from store.app_settings import AppSettings
+        value = AppSettings().get("forced_alignment")
+        return True if value is None else bool(value)
+    except Exception:
+        return True
+
+
 def register_cuda_dll_directories():
     """Register CUDA DLL directories on Windows for CTranslate2 / faster-whisper."""
     if sys.platform != "win32":
@@ -122,6 +135,48 @@ class FasterWhisperEngine:
             logger.info(f"faster-whisper model loaded successfully on {self.model_device}.")
         return self.model
 
+    def release_gpu(self) -> float:
+        """Drop the ASR models so the language model can have the GPU. Returns MB freed.
+
+        The auto-edit runs the ASR and then the language model, in that order, in
+        one process — and the ASR was never letting go. On this machine that is
+        about 3GB of faster-whisper plus 1.2GB of the MMS aligner still resident
+        while LM Studio tries to fit a model into what is left, and the result was
+        not a slow edit but a silently *dead* one: llama-server answered
+        `{"error":"terminated"}`, `plan_fluent_cuts` got nothing, and the cut that
+        shipped was the structural fallback with `used_llm: False` buried in a log.
+
+        Safe to call at any time — the next transcription reloads what it needs,
+        which costs a few seconds against model passes that cost minutes.
+        """
+        freed = 0.0
+        try:
+            from runtime.gpu_broker import gpu_broker
+            before = gpu_broker.get_free_vram_mb()
+        except Exception:
+            before = None
+        if self.model is not None:
+            self.model = None
+            self.model_device = None
+        try:
+            from .forced_align import release_model
+            release_model()
+        except Exception:
+            pass
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        if before is not None:
+            try:
+                from runtime.gpu_broker import gpu_broker
+                freed = max(0.0, gpu_broker.get_free_vram_mb() - before)
+            except Exception:
+                freed = 0.0
+        logger.info("ASR released the GPU (%.0f MB freed).", freed)
+        return freed
+
     def _do_transcribe(
         self,
         model: WhisperModel,
@@ -178,6 +233,22 @@ class FasterWhisperEngine:
                         "end": w.end,
                         "probability": w.probability
                     })
+
+        # Replace Whisper's unreliable word times with acoustically-aligned ones.
+        # Whisper's cross-attention timestamps drift by many seconds on this
+        # footage, which makes the cut keep the wrong source frames (the video
+        # plays a fumble the transcript says was removed). Forced alignment is
+        # deterministic and accurate; it is optional and degrades to the Whisper
+        # timings when its model is not installed. Only the transcribe pass — the
+        # translate pass is English text we never cut on.
+        if task == "transcribe" and extracted_words and _forced_alignment_enabled():
+            try:
+                from .forced_align import align_words
+                extracted_words = align_words(
+                    audio_path, extracted_words, detected,
+                    device=self.model_device or "cuda")
+            except Exception as e:
+                logger.warning("Forced-alignment step errored (%s); using Whisper timings.", e)
         return extracted_words, detected
 
     def _detect_language_pooled(self, model: WhisperModel, audio_path: str) -> Optional[str]:

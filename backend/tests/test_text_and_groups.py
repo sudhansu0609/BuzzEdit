@@ -105,7 +105,9 @@ def test_drawtext_writes_a_sidecar_and_quotes_its_expressions(tmp_path):
     assert "enable='between(t,1,4)'" in built
     written = list(tmp_path.glob("text_*.txt"))
     assert len(written) == 1
-    assert written[0].read_text(encoding="utf-8") == "It's 3:30 — 100% ready"
+    # The percent sign is escaped for drawtext's expansion: a bare "%" is a
+    # parse error that draws nothing at all.
+    assert written[0].read_text(encoding="utf-8") == "It's 3:30 — 100\% ready"
 
 
 def test_identical_text_reuses_one_sidecar(tmp_path):
@@ -376,3 +378,68 @@ def test_text_is_burned_after_the_master_grade(tmp_path):
     _inputs, fc, vlabel, _a = FilterGraphCompiler(tl, assets_dir=tmp_path).compile()
     assert vlabel == "[text_v]"
     assert fc.index("[graded_v]") < fc.index("drawtext=")
+
+
+# --- captions that match the voice -----------------------------------------
+
+def test_native_script_captions_use_the_spoken_words_and_a_shaping_font():
+    """The romanizer writes "lie" for "लिए"; to a viewer that caption does not
+    match the voice, where the native spelling matches it exactly. Native mode
+    also swaps in a font that can shape Devanagari — the preset's Latin face
+    would draw boxes."""
+    words = [
+        {"word": "dosto", "word_native": "दोस्तों", "start": 0.0, "end": 0.5},
+        {"word": "aapke", "word_native": "आपके", "start": 0.5, "end": 1.0},
+        {"word": "lie", "word_native": "लिए", "start": 1.0, "end": 1.5},
+    ]
+    tl = build_timeline_from_transcript("C:/media/main.mp4", 5.0, words,
+                                        pause_padding_seconds=0.0)
+    caps = generate_captions(tl, preset="youtube_shorts", script="native")
+    assert caps
+    text = " ".join(c.text.content for c in caps)
+    assert "लिए" in text and "lie" not in text.lower()
+    assert all(c.text.style.font_family == "Nirmala UI" for c in caps)
+
+
+def test_romanized_captions_are_unchanged_by_default():
+    words = [
+        {"word": "dosto", "word_native": "दोस्तों", "start": 0.0, "end": 0.5},
+        {"word": "aapke", "word_native": "आपके", "start": 0.5, "end": 1.0},
+    ]
+    tl = build_timeline_from_transcript("C:/media/main.mp4", 5.0, words,
+                                        pause_padding_seconds=0.0)
+    caps = generate_captions(tl, preset="youtube_shorts")
+    assert "DOSTO" in caps[0].text.content
+
+
+def test_caption_script_resolution():
+    from backend.timeline.authoring import caption_script_for
+    assert caption_script_for({"language": "hi"}) == "native"
+    assert caption_script_for({"language": "en"}) == "romanized"
+    assert caption_script_for({"language": "hi",
+                               "caption_script": "romanized"}) == "romanized"
+    assert caption_script_for({"language": "en",
+                               "caption_script": "native"}) == "native"
+    assert caption_script_for(None) == "romanized"
+
+
+def test_a_caption_card_never_spans_a_cut():
+    """A cut ripples its two sides together on the timeline, so by gap alone
+    the words on either side land in ONE card — the tail of one sentence glued
+    to the head of the next while the voice audibly jumps. Cards must break at
+    every V1 join."""
+    words = [
+        {"word": "one", "start": 0.0, "end": 0.4},
+        {"word": "two", "start": 0.4, "end": 0.8},
+        # a removed stretch long enough to force a real cut
+        {"word": "bad", "start": 0.8, "end": 2.8, "disfluency": True},
+        {"word": "three", "start": 2.8, "end": 3.2},
+        {"word": "four", "start": 3.2, "end": 3.6},
+    ]
+    tl = build_timeline_from_transcript("C:/media/main.mp4", 5.0, words,
+                                        pause_padding_seconds=0.0)
+    v1 = [i for i in tl.items if i.track == "V1"]
+    assert len(v1) == 2, "the fixture needs a real cut"
+    caps = generate_captions(tl, preset="classic")   # 8 words/card would merge
+    contents = [c.text.content for c in caps]
+    assert contents == ["one two", "three four"]

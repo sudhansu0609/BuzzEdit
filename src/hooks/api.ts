@@ -812,6 +812,33 @@ export async function getPresentationReport(projectId: string): Promise<any> {
   return api(`/api/presentation/${projectId}/report`);
 }
 
+export interface ScriptStatus {
+  status: 'none' | 'stored' | 'aligned';
+  text?: string;
+  token_count?: number;
+  aligned_words?: number;
+  spelling_fixed?: number;
+  paragraphs?: number;
+  directives?: { kind: string; arg: string; at: number }[];
+}
+
+/** Store the speaker's script and align it to the transcript (fixes caption
+    spelling; its paragraphs and [map:/sfx:/broll:…] directions feed the pass). */
+export async function setProjectScript(projectId: string, text: string): Promise<ScriptStatus> {
+  return api(`/api/projects/${projectId}/script`, {
+    method: 'PUT',
+    body: JSON.stringify({ text }),
+  });
+}
+
+export async function getProjectScript(projectId: string): Promise<ScriptStatus> {
+  return api(`/api/projects/${projectId}/script`);
+}
+
+export async function deleteProjectScript(projectId: string): Promise<{ status: string }> {
+  return api(`/api/projects/${projectId}/script`, { method: 'DELETE' });
+}
+
 export interface ShotPrompt {
   id: string;
   topic: string;

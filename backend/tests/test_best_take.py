@@ -165,3 +165,52 @@ async def test_nothing_is_asked_when_no_attempt_was_cut():
 
     assert await choose_best_takes(words, ask) == 0
     assert not asked
+
+
+@pytest.mark.asyncio
+async def test_the_model_is_shown_what_follows_the_take():
+    """Judged in isolation the longest take wins — a live run swapped in an
+    earlier attempt whose extra words were a dangling 'कि आप किसी'. The prompt
+    now carries the continuation, so the model reads each take into it."""
+    words = _words("dosto aapke saath kabhi aisa hua hai ki aap kisi "
+                   "dosto aapke saath kabhi aisa hua hai "
+                   "aapko lagta hoga ki sab log dekh rahe hain",
+                   cut=range(0, 10))
+    for word in words[17:]:
+        word["start"] += 3.0
+        word["end"] += 3.0
+    seen = {}
+
+    async def ask(_system, user):
+        seen["user"] = user
+        return "1: 2"
+
+    await choose_best_takes(words, ask)
+    assert "then:" in seen.get("user", "")
+    assert "aapko" in seen["user"].split("then:")[1]
+
+
+@pytest.mark.asyncio
+async def test_fillers_inside_a_pile_up_do_not_hide_it_from_best_take():
+    """A flounder is full of "[uh]"s cut as filler_sound. Strict adjacency broke
+    the retake run at each one, so the attempts were never seen whole and no
+    group formed — the garbled final take stood unchallenged."""
+    words = _words("aapko lagta hoga ki sab dekh rahe hain "
+                   "uh "
+                   "aapko lagta hoga ki sab log dekh rahe hain "
+                   "aapko lagta hoga ki sab log dekh rahe honge theek",
+                   cut=range(0, 18))
+    words[8].update({"reason": "filler_sound"})   # the uh splits the run
+
+    seen = {}
+
+    async def ask(_system, user):
+        seen["user"] = user
+        return "1: 1"
+
+    swaps = await choose_best_takes(words, ask)
+    assert "user" in seen, "a group should form across the filler"
+    assert swaps == 1
+    kept = _kept(words)
+    assert kept[:4] == ["aapko", "lagta", "hoga", "ki"]
+    assert "uh" not in kept

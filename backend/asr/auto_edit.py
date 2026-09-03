@@ -61,6 +61,29 @@ async def extract_project_audio(source_video: Optional[str]) -> Optional[str]:
         return None
 
 
+def release_asr_gpu() -> float:
+    """Hand the GPU from the ASR to the language model. Returns MB freed.
+
+    Every path runs the ASR first and the model passes second, in one process,
+    and the ASR was holding its VRAM through all of them. Measured on the
+    reference machine: a 16.3GB card, ~4GB still held by faster-whisper and the
+    MMS aligner, and a language model that could not fit in the rest — so
+    llama-server answered `{"error":"terminated"}` and every model-driven layer
+    (fluency, the verification loop, best-take, the final read) silently did
+    nothing. The edit that shipped was the structural fallback.
+
+    Never fatal: if the release fails the edit still runs, it just runs in the
+    conditions that caused the failure.
+    """
+    try:
+        from .faster_whisper_engine import whisper_engine
+        return whisper_engine.release_gpu()
+    except Exception as e:
+        logger.warning("Could not release the ASR's GPU memory (%s); the model "
+                       "passes will run alongside it.", e)
+        return 0.0
+
+
 async def plan_auto_edit(
     words: List[Dict[str, Any]],
     audio_path: Optional[str],
@@ -69,6 +92,8 @@ async def plan_auto_edit(
     detect_fillers: bool = True,
 ) -> AutoEditPlan:
     """Run the planner over `words` and collect its report."""
+    if use_llm:
+        release_asr_gpu()
     refined = await refine_disfluencies(
         words,
         aggressiveness=aggressiveness,
@@ -153,11 +178,35 @@ def public_report(report: Dict[str, Any]) -> Dict[str, Any]:
         warnings.append(f"{count} sentences still read as broken after repair")
     elif verdict == "not_verified":
         warnings.append("the finished edit could not be verified by the model")
+    # The loudest thing this report can say. Every model-driven layer — the
+    # fluency pass, the verification loop, best-take, the final read — can fail
+    # as a group, and when it does the edit that ships is the structural
+    # fallback: filler vocabulary and repeated runs only, no judgement about
+    # whether what remains is a sentence. That happened for a long time on a
+    # machine whose configured model was larger than its GPU, and the only trace
+    # was `used_llm: False` in a log nobody reads.
+    if not out.get("used_fluency"):
+        warnings.append("the language model never ran, so this is a structural "
+                        "edit only — check that LM Studio is up and its model "
+                        "fits in the GPU")
     fluency_windows = out.get("fluency_windows") or {}
     failed = fluency_windows.get("failed") or 0
     if failed:
         warnings.append(f"{failed} fluency windows got no answer from the model; "
                         "those parts fell back to structural cuts")
+    # The planner asks the model to name the runs to delete; a model that ignores
+    # that and rewrites the transcript instead is handled, but the edit is then
+    # being made by the older, guessier contract and the user should know which
+    # one produced their cut.
+    spans = fluency_windows.get("spans")
+    rewrites = fluency_windows.get("rewrites") or 0
+    if spans == 0 and rewrites:
+        warnings.append("the model would not name the cuts, so all "
+                        f"{rewrites} windows were read as rewrites instead")
+    declined = fluency_windows.get("none_answers") or 0
+    if spans and declined == spans:
+        warnings.append(f"the model found nothing to cut in any of its {spans} "
+                        "windows; the edit is structural only")
     if warnings:
         out["warnings"] = warnings
     return out

@@ -28,6 +28,12 @@ logger = logging.getLogger("presentation.placement")
 
 BROLL_TRACK = "V3"
 BROLL_ORIGIN = "broll"
+# Graphics (icons, diagrams with alpha) ride above the B-roll, never full-frame.
+GRAPHIC_TRACK = "V4"
+# The right half of a split screen sits one track above the left.
+SPLIT_RIGHT_TRACK = "V4"
+GRAPHIC_ORIGIN = "graphic"
+GRAPHIC_SCALE = 0.42
 POPUP_TRACK = "TP"
 POPUP_ORIGIN = "popup"
 
@@ -46,6 +52,50 @@ POPUP_SECONDS = 3.5
 POPUP_POS_Y = -0.55
 MIN_POPUP_GAP_SECONDS = 8.0
 
+# A jump cut is invisible while a full-frame cutaway is over it — the switch to
+# B-roll and back then happens inside one continuous take, and the join
+# underneath is never seen. Each window therefore shifts (within its beat) to
+# straddle the nearest V1 join, with this much cover either side so neither the
+# cutaway's own edge nor the join lands on the same frame.
+CUT_COVER_MARGIN_S = 0.35
+# How far outside its topic span a window may drift to reach a join. The span is
+# the model's estimate of when a topic runs, so half a second of spill keeps the
+# picture on-topic while letting it catch a join sitting right at the boundary.
+CUT_COVER_SLACK_S = 0.5
+
+
+def jump_cut_times(timeline: Timeline) -> List[float]:
+    """Timeline seconds where one V1 clip ends and the next begins.
+
+    Every one of these joins is a visible jump — the auto-edit removed speech
+    between them, so the speaker's head position snaps. They are what the
+    cut-covering shift below hides.
+    """
+    from timeline.schema import frame_to_time
+    v1 = sorted((i for i in timeline.items
+                 if i.track == "V1" and i.enabled and i.kind == "media"),
+                key=lambda i: i.timeline_start_frame)
+    return [frame_to_time(item.timeline_end_frame, timeline.fps_num, timeline.fps_den)
+            for item in v1[:-1]]
+
+
+def _cuts_covered(start_s: float, end_s: float, cuts: List[float],
+                  margin: float = CUT_COVER_MARGIN_S) -> int:
+    # The candidate start is rounded to milliseconds, so a join covered exactly
+    # at the margin can land a fraction of a millisecond outside it; the epsilon
+    # keeps that from reading as uncovered.
+    return sum(1 for cut in cuts
+               if start_s + margin - 0.005 <= cut <= end_s - margin + 0.005)
+
+
+def jump_cut_coverage(timeline: Timeline) -> Dict[str, int]:
+    """How many of the edit's jump cuts a cutaway hides — for the report."""
+    cuts = jump_cut_times(timeline)
+    windows = broll_windows(timeline)
+    covered = sum(1 for cut in cuts
+                  if any(start + 0.1 <= cut <= end - 0.1 for start, end in windows))
+    return {"total": len(cuts), "covered": covered}
+
 
 def place_broll(timeline: Timeline, beats: List[Beat], assets: List[Asset],
                 program: Program, settings: PresentationSettings,
@@ -58,6 +108,8 @@ def place_broll(timeline: Timeline, beats: List[Beat], assets: List[Asset],
     70% coverage plan quietly ships at 20%.
     """
     clear_generated(timeline, BROLL_ORIGIN)
+    clear_generated(timeline, GRAPHIC_ORIGIN)
+    clear_generated(timeline, "split")
     _drop_orphan_sources(timeline)
     if not assets:
         return 0
@@ -66,15 +118,57 @@ def place_broll(timeline: Timeline, beats: List[Beat], assets: List[Asset],
     fps = timeline.fps_num / max(1, timeline.fps_den)
     rng = random.Random(seed)
     placed: List[Tuple[float, float]] = []
+    cuts = jump_cut_times(timeline)
     count = 0
 
+    assets_by_beat = {a.beat_id: a for a in assets}
+    split_pairs: List[Tuple[float, float, Optional[str], Optional[str]]] = []
     for index, asset in enumerate(sorted(assets, key=lambda a: by_id.get(a.beat_id).start_s
                                          if a.beat_id in by_id else 0.0)):
         beat = by_id.get(asset.beat_id)
         if beat is None or not Path(asset.path).exists():
             continue
 
-        start_s, duration_s, reason = _window_for(beat, asset, program, placed, settings)
+        # Split screens: the left half places the pair; the right half rides
+        # along. A half whose partner never generated goes up full-frame.
+        side = beat.data.get("split") if beat.data else None
+        partner = None
+        if side == "right" and by_id.get(f"{beat.data.get('pair')}_l") is not None \
+                and f"{beat.data.get('pair')}_l" in assets_by_beat:
+            continue
+        if side == "left":
+            partner_id = f"{beat.data.get('pair')}_r"
+            partner = assets_by_beat.get(partner_id)
+            if partner is not None and not Path(partner.path).exists():
+                partner = None
+
+        start_s, duration_s, reason = _window_for(beat, asset, program, placed, settings,
+                                                  cuts)
+        if partner is not None and duration_s > 0:
+            from .composite import split_transform
+            frames = max(1, time_to_frame(duration_s, timeline.fps_num, timeline.fps_den))
+            start_frame = time_to_frame(start_s, timeline.fps_num, timeline.fps_den)
+            for half, half_asset, track in (("left", asset, BROLL_TRACK),
+                                            ("right", partner, SPLIT_RIGHT_TRACK)):
+                source_id = f"src_broll_{half_asset.beat_id}_{uuid.uuid4().hex[:4]}"
+                timeline.sources[source_id] = SourceFile(
+                    id=source_id, path=half_asset.path,
+                    duration_seconds=half_asset.duration_s or duration_s,
+                    width=half_asset.width or timeline.width,
+                    height=half_asset.height or timeline.height,
+                    fps_num=timeline.fps_num, fps_den=timeline.fps_den,
+                    has_audio=False, kind="video" if half_asset.kind == "video" else "image")
+                item = clip_ops.add_media_item(timeline, source_id, track, start_frame, 0,
+                                               frames, origin=BROLL_ORIGIN)
+                clip_ops.set_transform(timeline, item.id, split_transform(half))
+                item.label = f"split {half}: {beat.topic[:24]}"
+            labels = beat.data.get("label"), (by_id[partner.beat_id].data.get("label")
+                                              if partner.beat_id in by_id else None)
+            split_pairs.append((start_s, start_s + duration_s, labels[0], labels[1]))
+            placed.append((start_s, start_s + duration_s))
+            count += 1
+            logger.info("Beat %s: split screen at %.1fs for %.1fs", beat.id, start_s, duration_s)
+            continue
         if duration_s <= 0:
             logger.info("Beat %s: not placed (%s)", beat.id, reason)
             if rejected is not None:
@@ -96,6 +190,23 @@ def place_broll(timeline: Timeline, beats: List[Beat], assets: List[Asset],
         )
 
         duration_frames = max(1, time_to_frame(duration_s, timeline.fps_num, timeline.fps_den))
+        if beat.kind == "graphic":
+            # A graphic is an element ON the picture, not a picture: it sits in
+            # a corner at under half size and slides in, keeping its alpha. It
+            # is never zoomed — an animated zoom goes through zoompan, which
+            # pads a transparent PNG with black.
+            item = clip_ops.add_media_item(
+                timeline, source_id, GRAPHIC_TRACK,
+                time_to_frame(start_s, timeline.fps_num, timeline.fps_den),
+                0, duration_frames, origin=GRAPHIC_ORIGIN)
+            side = 1.0 if index % 2 == 0 else -1.0
+            clip_ops.set_transform(timeline, item.id, {
+                "scale": GRAPHIC_SCALE, "pos_x": side * 0.62, "pos_x_end": side * 0.52,
+                "pos_y": -0.42, "pos_y_end": -0.42})
+            count += 1
+            logger.info("Beat %s: graphic at %.1fs for %.1fs", beat.id, start_s, duration_s)
+            continue
+
         item = clip_ops.add_media_item(
             timeline, source_id, BROLL_TRACK,
             time_to_frame(start_s, timeline.fps_num, timeline.fps_den),
@@ -113,12 +224,16 @@ def place_broll(timeline: Timeline, beats: List[Beat], assets: List[Asset],
         logger.info("Beat %s: %s cutaway at %.1fs for %.1fs (%s)",
                     beat.id, asset.kind, start_s, duration_s, beat.topic)
 
+    if split_pairs:
+        from .composite import place_split_labels
+        place_split_labels(timeline, split_pairs, "")
     return count
 
 
 def _window_for(beat: Beat, asset: Asset, program: Program,
                 placed: List[Tuple[float, float]],
-                settings: PresentationSettings) -> Tuple[float, float, str]:
+                settings: PresentationSettings,
+                cuts: Optional[List[float]] = None) -> Tuple[float, float, str]:
     """(start, duration, reason) — duration 0 with the reason when it cannot run."""
     start_s = max(0.0, beat.start_s)
     # Land on a word boundary. Cutting away mid-syllable draws attention to the
@@ -142,6 +257,15 @@ def _window_for(beat: Beat, asset: Asset, program: Program,
             return start_s, 0.0, "no room inside the beat's span"
         duration_s = min(floor, available)
 
+    # Slide the window onto the nearest jump cut. The word-boundary snap above
+    # is a preference; hiding a join is the point of the shot being here at all,
+    # so where a join is reachable the window moves to straddle it — the picture
+    # then switches to B-roll inside one continuous take and back inside the
+    # next, and the join underneath is never seen. (The audio never cuts, so a
+    # start mid-word costs nothing.)
+    start_s = _shift_to_cover_cuts(start_s, duration_s, beat, cuts or [],
+                                   placed, program, settings)
+
     # The planner already spaced the beats; this is a safety net, so it runs
     # 0.2s looser than the planning gap — the word-boundary snap above can move
     # a start slightly, and a hair's drift must not throw a budgeted shot away.
@@ -150,6 +274,50 @@ def _window_for(beat: Beat, asset: Asset, program: Program,
         if start_s < other_end + gap and other_start < start_s + duration_s:
             return start_s, 0.0, "would overlap or crowd the previous cutaway"
     return start_s, duration_s, ""
+
+
+def _shift_to_cover_cuts(start_s: float, duration_s: float, beat: Beat,
+                         cuts: List[float], placed: List[Tuple[float, float]],
+                         program: Program,
+                         settings: PresentationSettings) -> float:
+    """The window start that hides the most V1 joins, nearest the planned start.
+
+    Candidates are the planned start plus, for every reachable join, the start
+    nearest the planned one that still covers that join with the margin. Every
+    candidate must stay inside the beat's span (± a little slack), clear of the
+    cutaways already placed, and the planned start always remains on the table —
+    a shot that can reach no join simply runs where the planner put it.
+    """
+    if not cuts or duration_s <= 2 * CUT_COVER_MARGIN_S:
+        return start_s
+    lo = max(0.0, beat.start_s - CUT_COVER_SLACK_S)
+    hi = min(program.duration_s, beat.end_s + CUT_COVER_SLACK_S) - duration_s
+    if hi <= lo:
+        return start_s
+
+    gap = max(0.0, settings.cutaway_gap_s - 0.2)
+
+    def clear(candidate: float) -> bool:
+        end = candidate + duration_s
+        return all(not (candidate < other_end + gap and other_start < end)
+                   for other_start, other_end in placed)
+
+    candidates = {round(start_s, 3)}
+    for cut in cuts:
+        if cut < lo or cut > hi + duration_s:
+            continue
+        # The start nearest the planned one that covers this join with margin.
+        candidate = min(max(start_s, cut + CUT_COVER_MARGIN_S - duration_s),
+                        cut - CUT_COVER_MARGIN_S)
+        candidates.add(round(min(max(candidate, lo), hi), 3))
+
+    def score(candidate: float) -> Tuple[int, float]:
+        return (_cuts_covered(candidate, candidate + duration_s, cuts),
+                -abs(candidate - start_s))
+
+    viable = [c for c in candidates if clear(c)] or [round(start_s, 3)]
+    best = max(viable, key=score)
+    return best if score(best) > score(round(start_s, 3)) else start_s
 
 
 def _apply_ken_burns(timeline: Timeline, item_id: str, index: int,
@@ -206,16 +374,28 @@ def place_popups(timeline: Timeline, beats: List[Beat], program: Program,
                          max(0.0, program.duration_s - start_s))
         if duration_s < 1.2:
             continue
-        end_s = start_s + duration_s
 
-        # A full-frame cutaway plus floating text is clutter, and the pop-up is
-        # the one of the two that can simply wait.
-        if any(start_s < b_end and b_start < end_s for b_start, b_end in busy):
-            logger.info("Pop-up %r skipped: a cutaway is on screen", beat.popup_text)
-            continue
-        if any(start_s < p_end + MIN_POPUP_GAP_SECONDS and p_start < end_s
-               for p_start, p_end in placed):
-            continue
+        # The pop-up prefers a moment with the speaker on screen, so it slides
+        # forward within its topic's span to the first stretch clear of
+        # cutaways. But at 60-75% coverage the on-camera gaps are shorter than
+        # a pop-up, and "skip on collision" shipped videos with no pop-ups at
+        # all — so when no clear moment exists it draws over the B-roll
+        # instead, which is where YouTube text accents live anyway; only a
+        # collision with another pop-up still skips it.
+        slid = _first_clear_moment(start_s, duration_s, beat, busy, placed,
+                                   program)
+        if slid is not None:
+            start_s = slid
+        else:
+            if any(start_s < p_end + MIN_POPUP_GAP_SECONDS
+                   and p_start < start_s + duration_s
+                   for p_start, p_end in placed):
+                logger.info("Pop-up %r skipped: too close to another pop-up",
+                            beat.popup_text)
+                continue
+            logger.info("Pop-up %r drawn over the B-roll: no clear moment in "
+                        "its span", beat.popup_text)
+        end_s = start_s + duration_s
 
         style = {"pos_y": POPUP_POS_Y, "animation": "pop", "animation_duration": 0.25}
         item = clip_ops.add_text_item(
@@ -232,6 +412,31 @@ def place_popups(timeline: Timeline, beats: List[Beat], program: Program,
         logger.info("Pop-up %r at %.1fs", beat.popup_text, start_s)
 
     return count
+
+
+def _first_clear_moment(start_s: float, duration_s: float, beat: Beat,
+                        busy: List[Tuple[float, float]],
+                        placed: List[Tuple[float, float]],
+                        program: Program,
+                        step: float = 0.5) -> Optional[float]:
+    """The earliest start in the beat's span clear of cutaways and other pop-ups.
+
+    None when the whole span is occupied — a pop-up drifting outside its topic
+    would label the wrong content, so past the span it is dropped, not moved.
+    """
+    limit = min(beat.end_s, program.duration_s) - duration_s
+    candidate = start_s
+    while candidate <= limit + 1e-6:
+        end = candidate + duration_s
+        clear_of_broll = not any(candidate < b_end and b_start < end
+                                 for b_start, b_end in busy)
+        clear_of_popups = not any(candidate < p_end + MIN_POPUP_GAP_SECONDS
+                                  and p_start < end
+                                  for p_start, p_end in placed)
+        if clear_of_broll and clear_of_popups:
+            return candidate
+        candidate += step
+    return None
 
 
 def _windows_of(timeline: Timeline, origin: str) -> List[Tuple[float, float]]:

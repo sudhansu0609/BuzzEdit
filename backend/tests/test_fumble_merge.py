@@ -216,3 +216,44 @@ async def test_without_a_model_structure_decides_alone(model):
 
     assert "uh" in _cut(words), "hard fillers go with or without a model"
     assert "india" in _kept(words)
+
+
+@pytest.mark.asyncio
+async def test_a_partial_model_cut_never_restores_the_rest_of_the_run(model):
+    """A model that named part of a structural run as debris has agreed the
+    region is a flounder and merely drawn a sloppy boundary. Restoring the
+    words it did not name splices a fragment of the abandoned attempt into the
+    edit — measured live as "उन्होंने सारे बच्चों को ए सा जिस पे का photo",
+    a sentence nobody said."""
+    text = PILE_UP + " matlab bahut hi amazing hai"
+    words = _words(text)
+    structural = await refine_disfluencies([dict(w) for w in words], use_llm=False)
+    run = [i for i, w in enumerate(structural)
+           if w.get("disfluency") and w.get("reason") == "retake"]
+    assert len(run) >= 3, "the fixture needs a structural retake run"
+
+    # The model cuts only the FIRST word of that run and stays silent about the
+    # rest — a span answer with a sloppy boundary.
+    model.cleaned = f"DELETE {run[0]} | {words[run[0]]['word']} | retake"
+    result = await refine_disfluencies(words, use_llm=True)
+
+    for index in run:
+        assert result[index].get("disfluency"), (
+            f"word {index} ({result[index]['word']!r}) must stay cut: the model "
+            "cut into this run, so its silence about the rest is not a keep")
+
+
+@pytest.mark.asyncio
+async def test_no_second_opinion_after_a_span_answer(model):
+    """A span answer already stated its removals directly; asking again invites
+    the model to keep improving text it has already approved — a live second
+    pass peppered 43 word-level holes through the small-shapes sieve."""
+    text = PILE_UP + " aur bhi bahut kuch dekhne ko milega is jagah par yahan"
+    words = _words(text)
+    model.cleaned = "DELETE 0-2 | dosto ... ap | retake"
+
+    await refine_disfluencies(words, use_llm=True)
+
+    fluency_asks = [s for s in model.seen
+                    if s.startswith("You are editing a transcript")]
+    assert len(fluency_asks) == 1, "no second fluency pass after a span answer"

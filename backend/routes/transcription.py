@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from models import TranscribeJob, TranscriptionResult, TranscriptSegment
@@ -82,6 +83,29 @@ async def transcribe_video(job: TranscribeJob):
         # the words the planner cut actually absent from what will be rendered?
         record_cut_coverage(tl, edit_report)
 
+        # Report-only cut check: re-transcribe the finished cut and match it
+        # against the plan, so the edit ships with a verdict on whether the video
+        # actually plays what the transcript says. It NEVER modifies the cut —
+        # trimming automatically proved too risky, so this only reports. Costs an
+        # extra re-transcription of the edit; set `auto_verify_cut` false to skip.
+        # Never fatal — a failure here just leaves the report without a verdict.
+        if settings.get("auto_verify_cut", True):
+            try:
+                from asr.cut_verify import verify_cut
+                vr = await verify_cut(tl, source_video, language=detected_language)
+                edit_report.setdefault("quality", {})["cut_verify"] = {
+                    "verdict": vr["verdict"],
+                    "coverage": vr["coverage"],
+                    "leaked_struck_seconds": vr["leaked_struck_seconds"],
+                    "leaked_struck_words": vr["leaked_struck_words"],
+                    "dropped_kept_count": vr["dropped_kept_count"],
+                    "plan_text": vr["expected_text"],
+                    "cut_text": vr["actual_text"],
+                }
+            except Exception as e:
+                logging.getLogger("transcription").warning(
+                    "Auto cut-verify skipped (%s); shipping the cut without a verdict.", e)
+
         # Convert to TranscriptSegment list for legacy UI components
         segments = []
         if ann_words:
@@ -136,3 +160,28 @@ async def get_transcript(project_id: str):
     if not p_data or "transcript" not in p_data:
         raise HTTPException(status_code=404, detail="Transcript not found")
     return p_data["transcript"]
+
+
+@router.post("/{project_id}/verify-cut")
+async def verify_cut_route(project_id: str):
+    """Ground-truth check: re-transcribe the actual cut and diff it against the
+    intended transcript. `verdict` is 'clean', 'leaks_removed_speech' (the video
+    plays fumbles the plan removed — a timing problem) or 'drops_kept_speech'.
+    Heavy: it re-transcribes the edit, so call it deliberately, not on every save.
+    """
+    from timeline.schema import Timeline
+    from asr.cut_verify import verify_cut
+
+    p_data = project_store.get_project(project_id)
+    if not p_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    tl_data = p_data.get("timeline")
+    source = p_data.get("source_video")
+    if not tl_data or not source:
+        raise HTTPException(status_code=400, detail="Project has no timeline or source video")
+    timeline = Timeline.model_validate(tl_data)
+    language = (p_data.get("settings") or {}).get("language")
+    report = await verify_cut(timeline, source, language=language)
+    # The bulky side of the report is the two full transcripts; keep them, they
+    # are exactly what makes a leak legible when the verdict is not 'clean'.
+    return report

@@ -51,6 +51,11 @@ def available() -> List[Dict[str, object]]:
         {"id": "fog", "label": "Fog", "description": "Soft drifting haze"},
         {"id": "wind", "label": "Wind", "description": "Drifting haze with a slow sway"},
         {"id": "grain", "label": "Film Grain", "description": "Fine moving grain"},
+        {"id": "flash", "label": "Flash Frame", "description": "A white (or coloured) hit; window it to a few frames"},
+        {"id": "shake", "label": "Camera Shake", "description": "The frame jolts randomly; window it to a hit"},
+        {"id": "glitch", "label": "Glitch", "description": "Colour planes tear apart on random frames"},
+        {"id": "vhs", "label": "VHS / Found Footage", "description": "Scanlines, chroma smear and grain"},
+        {"id": "flicker", "label": "Light Flicker", "description": "A failing light: brightness wobbles"},
     ]
 
 
@@ -164,6 +169,59 @@ def build_effect(
     if kind == "grain":
         amount = int(round(4 + 26 * intensity))
         return [f"{input_label}noise=alls={amount}:allf=t+u{output_label}"]
+
+    # --- the treatments: no layer, the picture itself is disturbed -----------
+    # These are what a horror edit reaches for at a hit. They are meant to be
+    # windowed by an adjustment clip (a flash is two frames, a shake half a
+    # second); over a whole programme they would be unwatchable.
+    if kind == "flash":
+        colour = (effect.color or "white").replace("0x", "#")[:7] if effect.color else "white"
+        alpha = _f(_clamp(0.5 + 0.5 * intensity, 0.0, 1.0))
+        return [f"{input_label}drawbox=color={colour}@{alpha}:t=fill{output_label}"]
+
+    if kind == "shake":
+        # Crop a window that wanders randomly every frame, scale back up. The
+        # amplitude scales with intensity; `random` is re-seeded per axis so the
+        # two do not move together.
+        amp = max(2, int(round(width * (0.006 + 0.03 * intensity))))
+        return [
+            f"{input_label}crop=w=iw-{2 * amp}:h=ih-{2 * amp}:"
+            f"x='{amp}+{amp}*(random(1)-0.5)*2':y='{amp}+{amp}*(random(2)-0.5)*2',"
+            f"scale={width}:{height}:flags=bilinear,setsar=1{output_label}"
+        ]
+
+    if kind == "glitch":
+        # Red and blue planes torn apart on a random fifth of the frames, with
+        # a burst of noise on the same frames so the tear reads as damage.
+        shift = max(2, int(round(width * (0.003 + 0.012 * intensity))))
+        chance = _f(0.08 + 0.3 * intensity)
+        gate = f"lt(random(3),{chance})"
+        return [
+            f"{input_label}rgbashift=rh=-{shift}:bh={shift}:enable='{gate}',"
+            f"noise=alls={int(round(30 + 40 * intensity))}:allf=t:enable='{gate}'{output_label}"
+        ]
+
+    if kind == "vhs":
+        # Scanlines, softened chroma pushed sideways, grain and a slight
+        # desaturation: found-footage in one chain. geq costs real time at
+        # full resolution, so the scanline pass runs at 1/3 height first.
+        dark = _f(1.0 - (0.18 + 0.2 * intensity))
+        return [
+            f"{input_label}chromashift=cbh=-{2 + int(3 * intensity)}:crh={2 + int(3 * intensity)},"
+            f"eq=saturation={_f(0.85 - 0.2 * intensity)}:contrast={_f(1.0 + 0.08 * intensity)},"
+            f"noise=alls={int(round(10 + 24 * intensity))}:allf=t+u,"
+            f"geq=lum='if(mod(Y\\,3)\\,lum(X\\,Y)\\,lum(X\\,Y)*{dark})':cb='cb(X\\,Y)':cr='cr(X\\,Y)'"
+            f"{output_label}"
+        ]
+
+    if kind == "flicker":
+        # A failing light: brightness wobbles on two incommensurate sines.
+        depth = _f(0.03 + 0.09 * intensity)
+        rate = _f(23.0 * speed)
+        return [
+            f"{input_label}eq=brightness='-{depth}*0.5+{depth}*sin(t*{rate})*sin(t*{_f(7.3 * speed)})':"
+            f"eval=frame{output_label}"
+        ]
 
     # Wind sways the frame as well as hazing it, which is what sells the movement.
     if kind == "wind":

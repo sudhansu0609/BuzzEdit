@@ -74,7 +74,11 @@ class Project(BaseModel):
     # B-roll pass looks like it did nothing.
     output_version: Optional[float] = None
     media_pool: List[Dict[str, Any]] = []
-    status: Literal["draft", "transcribed", "analyzed", "rendered", "error"] = "draft"
+    # "presented" is what the overnight presentation pass writes; leaving it out
+    # of the Literal made Project.model_validate throw on every presented
+    # project, which silently killed the thumbnail stage each night.
+    status: Literal["draft", "transcribed", "analyzed", "presented", "rendered",
+                    "error"] = "draft"
 
     @field_validator("transcript", mode="before")
     @classmethod

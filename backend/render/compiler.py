@@ -15,6 +15,8 @@ from render.effects import (
     build_overlay_transform,
 )
 from render.text import build_drawtext
+from render.ass import build_ass, build_ass_filter, needs_ass, write_ass_asset
+from render.audio import build_ducking, build_loudness_chain, build_voice_chain
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
@@ -333,24 +335,74 @@ class FilterGraphCompiler:
             )
             current_v_label = out_label
 
+        # 5b. Voice treatment on the programme audio, before anything is mixed
+        #     in: a denoiser or compressor running over the music would pump
+        #     with the speech, and a de-esser has no business touching a cymbal.
+        master_a = self.timeline.audio_master
+        voice_chain = build_voice_chain(master_a)
+        if voice_chain and base_a_label != "[anull]":
+            out_label = "[voice_a]"
+            filters.append(f"{base_a_label}" + ",".join(voice_chain) + out_label)
+            base_a_label = out_label
+
         # 6. Mix extra audio tracks (A2, A3, ...) with the A1 program audio.
+        #    Items marked `duck` are pushed down under speech by a sidechain
+        #    compressor keyed off the programme voice, so the music follows the
+        #    speech exactly; the voice is split once per ducked item because a
+        #    filter output can feed only one consumer.
         final_a_label = base_a_label
         if extra_audio_items:
+            ducked = [i for i in extra_audio_items if i.duck > 0.0]
+            sidechain_labels: List[str] = []
+            if ducked and base_a_label != "[anull]":
+                main_label = "[a1_main]"
+                sidechain_labels = [f"[a1_sc_{n}]" for n in range(len(ducked))]
+                filters.append(
+                    f"{base_a_label}asplit={len(ducked) + 1}{main_label}"
+                    f"{''.join(sidechain_labels)}")
+                base_a_label = main_label
             mix_inputs = [base_a_label]
+            sidechain_index = 0
             for idx, item in enumerate(extra_audio_items):
                 src_idx = source_index_map[item.source_id]
+                src = self.timeline.sources[item.source_id]
                 src_start_sec = self._sec(item.source_start_frame)
                 src_end_sec = self._sec(item.source_end_frame)
-                delay_ms = int(self._sec(item.timeline_start_frame) * 1000)
+                tl_start_sec = self._sec(item.timeline_start_frame)
+                span_sec = self._sec(item.duration_frames)
+                delay_ms = int(tl_start_sec * 1000)
                 aout = f"[amix_{idx}]"
-                chain = [
-                    f"atrim=start={src_start_sec:.3f}:end={src_end_sec:.3f}",
-                    "asetpts=PTS-STARTPTS",
-                ]
+                chain: List[str] = []
+                if item.loop and src.duration_seconds > 0:
+                    # Repeat the whole file enough times to cover the span, then
+                    # trim; aloop counts samples, and the sample rate of the
+                    # source is unknown here, so it is resampled first.
+                    loops = int(span_sec // src.duration_seconds) + 1
+                    samples = int(round(src.duration_seconds * 48000))
+                    chain.append("aresample=48000")
+                    chain.append(f"aloop=loop={loops}:size={max(1, samples)}")
+                    chain.append(f"atrim=start={src_start_sec:.3f}:end={src_start_sec + span_sec:.3f}")
+                else:
+                    chain.append(f"atrim=start={src_start_sec:.3f}:end={src_end_sec:.3f}")
+                chain.append("asetpts=PTS-STARTPTS")
                 if item.volume != 1.0:
                     chain.append(f"volume={item.volume:.3f}")
+                if item.audio_fade_in > 0:
+                    chain.append(f"afade=t=in:st=0:d={min(item.audio_fade_in, span_sec):.3f}")
+                if item.audio_fade_out > 0:
+                    fade_out = min(item.audio_fade_out, span_sec)
+                    chain.append(
+                        f"afade=t=out:st={max(0.0, span_sec - fade_out):.3f}:d={fade_out:.3f}")
                 chain.append(f"adelay={delay_ms}:all=1")
-                filters.append(f"[{src_idx}:a]" + ",".join(chain) + aout)
+                if item.duck > 0.0 and sidechain_labels:
+                    pre_label = f"[aduck_in_{idx}]"
+                    filters.append(f"[{src_idx}:a]" + ",".join(chain) + pre_label)
+                    filters.append(
+                        f"{pre_label}{sidechain_labels[sidechain_index]}"
+                        + build_ducking(item.duck) + aout)
+                    sidechain_index += 1
+                else:
+                    filters.append(f"[{src_idx}:a]" + ",".join(chain) + aout)
                 mix_inputs.append(aout)
             mixed_label = "[mix_a]"
             filters.append(
@@ -358,6 +410,13 @@ class FilterGraphCompiler:
                 f"dropout_transition=0{mixed_label}"
             )
             final_a_label = mixed_label
+
+        # 6b. Loudness target on the finished mix — what the platform measures.
+        loudness_chain = build_loudness_chain(master_a)
+        if loudness_chain and final_a_label != "[anull]":
+            out_label = "[master_a]"
+            filters.append(f"{final_a_label}" + ",".join(loudness_chain) + out_label)
+            final_a_label = out_label
 
         # 7. Program-wide colour, after the overlays so B-roll grades with the
         #    program, but before text so captions stay the colour they were set.
@@ -396,9 +455,24 @@ class FilterGraphCompiler:
                 filters.append(bars)
                 current_v_label = out_label
 
-        # 8. Burn text and captions onto the finished picture.
+        # 8. Burn text and captions onto the finished picture. Animated clips
+        #    (karaoke, typewriter, scale-in, glitch, …) go through libass in one
+        #    `ass` filter; the plain ones stay on drawtext.
+        animated = [i for i in text_items if needs_ass(i.text)]
+        if animated:
+            script = build_ass(
+                [(i.text, self._sec(i.timeline_start_frame), self._sec(i.timeline_end_frame))
+                 for i in animated],
+                self.canvas_w, self.canvas_h,
+            )
+            ass_path = write_ass_asset(script, self.assets_dir)
+            out_label = "[ass_v]"
+            filters.append(f"{current_v_label}{build_ass_filter(ass_path)}{out_label}")
+            current_v_label = out_label
         text_filters: List[str] = []
         for item in text_items:
+            if needs_ass(item.text):
+                continue
             built = build_drawtext(
                 item.text,
                 self._sec(item.timeline_start_frame),

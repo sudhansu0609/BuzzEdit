@@ -495,7 +495,9 @@ async def generate_captions(project_id: str, body: CaptionsRequest):
     for geometry_key in ("pos_x", "pos_y"):
         stored.pop(geometry_key, None)
     overrides = {**stored, **(body.style or {})}
-    created = authoring.generate_captions(tl, preset=body.preset, style_overrides=overrides)
+    created = authoring.generate_captions(
+        tl, preset=body.preset, style_overrides=overrides,
+        script=authoring.caption_script_for(p_data.get("settings")))
     _save_timeline(project_id, p_data, tl)
     return {"status": "success", "captions_created": len(created), "timeline": tl}
 

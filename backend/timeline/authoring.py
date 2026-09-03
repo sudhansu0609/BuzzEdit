@@ -46,10 +46,43 @@ def source_to_timeline_frame(segments: List[Tuple[int, int, int]], source_frame:
     out of sync with every cut. Mapping through the surviving V1 cuts is what
     keeps captions locked to speech.
     """
-    for src_start, src_end, tl_start in segments:
+    frame, _segment = _map_source_frame(segments, source_frame)
+    return frame
+
+
+def _map_source_frame(segments: List[Tuple[int, int, int]],
+                      source_frame: int) -> Tuple[Optional[int], int]:
+    """(timeline frame, segment index) for a source frame, or (None, -1) if cut."""
+    for index, (src_start, src_end, tl_start) in enumerate(segments):
         if src_start <= source_frame < src_end:
-            return tl_start + (source_frame - src_start)
-    return None
+            return tl_start + (source_frame - src_start), index
+    return None, -1
+
+
+# Which spelling the caption text uses. "romanized" is the word list's display
+# text (Hinglish); "native" is the script the speaker actually spoke — for a
+# Hindi recording that is Devanagari, which matches the voice exactly where the
+# romanizer writes "lie" for "लिए" and "teeshart" for "टीशर्ट". "auto" picks
+# native for Indic-language projects. Native text needs a font that can shape
+# it; `_NATIVE_FONT` is substituted unless the caller pinned a font file.
+CAPTION_SCRIPTS = ("romanized", "native", "auto")
+_NATIVE_FONT = "Nirmala UI"
+# Languages whose native script the caption can switch to. Mirrors the ASR's
+# Indic set; kept local so the timeline package does not import the ASR stack.
+_INDIC_LANGUAGES = {"hi", "ur", "pa", "bn", "ta", "te", "ml", "kn", "gu", "mr",
+                    "ne", "sd", "si"}
+
+
+def caption_script_for(settings: Optional[Dict[str, Any]],
+                       language: Optional[str] = None) -> str:
+    """Resolve the project's caption script choice to 'romanized' or 'native'."""
+    choice = str((settings or {}).get("caption_script") or "auto").lower()
+    if choice not in CAPTION_SCRIPTS:
+        choice = "auto"
+    if choice == "auto":
+        detected = language or (settings or {}).get("language")
+        return "native" if detected in _INDIC_LANGUAGES else "romanized"
+    return choice
 
 
 def clear_generated(timeline: Timeline, origin: str) -> int:
@@ -68,12 +101,20 @@ def generate_captions(
     track: str = CAPTION_TRACK,
     style_overrides: Optional[Dict[str, Any]] = None,
     min_duration_sec: float = 0.4,
+    script: str = "romanized",
 ) -> List[TimelineItem]:
     """Turn the enabled transcript words into styled caption clips.
 
     Replaces any previous generated captions. Cards break on the preset's word
-    count, on a pause longer than `max_gap_seconds`, or wherever a cut makes the
-    words non-contiguous on the timeline.
+    count, on a pause longer than `max_gap_seconds`, and at every V1 join — a
+    cut ripples the two sides together on the timeline, and a card spanning the
+    join mixes the tail of one sentence with the head of the next while the
+    voice audibly jumps between them.
+
+    `script` — "native" captions in the script the speaker spoke (see
+    `caption_script_for`). The romanizer writes "lie" for "लिए" and "teeshart"
+    for "टीशर्ट"; to a viewer those captions do not match the voice, where the
+    native spelling matches it exactly.
     """
     config = caption_preset(preset)
     words_per_card = int(config.get("words_per_caption", 8))
@@ -87,36 +128,48 @@ def generate_captions(
         timeline.recalculate_duration()
         return []
 
+    use_native = script == "native"
+
     # Project each enabled word onto the cut program, dropping anything the edit
-    # removed.
-    placed: List[Tuple[str, int, int]] = []
+    # removed. Each entry carries the segment it landed in so cards can break at
+    # the joins.
+    placed: List[Tuple[str, int, int, int]] = []
     for word in timeline.words:
-        if not word.enabled or not word.text.strip():
+        text = ((getattr(word, "word_native", None) or word.text)
+                if use_native else word.text).strip()
+        if not word.enabled or not text:
             continue
-        start = source_to_timeline_frame(segments, word.start_frame)
+        start, segment = _map_source_frame(segments, word.start_frame)
         if start is None:
             continue
         end = source_to_timeline_frame(segments, max(word.start_frame, word.end_frame - 1))
         end = (end + 1) if end is not None else start + 1
         if end <= start:
             end = start + 1
-        placed.append((word.text.strip(), start, end))
+        placed.append((text, start, end, segment))
 
     if not placed:
         timeline.recalculate_duration()
         return []
 
-    cards: List[List[Tuple[str, int, int]]] = []
-    current: List[Tuple[str, int, int]] = [placed[0]]
+    cards: List[List[Tuple[str, int, int, int]]] = []
+    current: List[Tuple[str, int, int, int]] = [placed[0]]
     for entry in placed[1:]:
         previous = current[-1]
         gap = entry[1] - previous[2]
-        if len(current) >= words_per_card or gap > max_gap_frames or gap < 0:
+        if (len(current) >= words_per_card or gap > max_gap_frames or gap < 0
+                or entry[3] != previous[3]):
             cards.append(current)
             current = [entry]
         else:
             current.append(entry)
     cards.append(current)
+
+    # Native text needs a font that can shape it; the preset fonts are Latin
+    # faces and would draw boxes. A caller that pinned an explicit font file
+    # keeps it.
+    if use_native and not (style_overrides or {}).get("font_file"):
+        style_overrides = {**(style_overrides or {}), "font_family": _NATIVE_FONT}
 
     min_frames = max(1, int(min_duration_sec * _fps(timeline)))
     created: List[TimelineItem] = []
@@ -147,6 +200,14 @@ def generate_captions(
             label=content[:40],
         )
         item.text.preset = preset
+        # Word timings relative to the card, for the karaoke highlight.
+        fps = _fps(timeline)
+        item.text.words = [
+            {"text": (w[0].upper() if uppercase else w[0]),
+             "start_s": round((w[1] - start) / fps, 3),
+             "end_s": round((w[2] - start) / fps, 3)}
+            for w in card
+        ]
         timeline.items.append(item)
         created.append(item)
 
@@ -166,11 +227,16 @@ def remove_captions(timeline: Timeline) -> int:
 # Intros
 # ---------------------------------------------------------------------------
 
-def _shift_all_items(timeline: Timeline, delta: int) -> None:
-    """Slide every clip along the timeline so an intro can be inserted in front."""
+def _shift_all_items(timeline: Timeline, delta: int, keep_before: int = 0) -> None:
+    """Slide every clip along the timeline so an intro can be inserted in front.
+
+    Items that start before `keep_before` (the cold open) stay where they are.
+    """
     if delta == 0:
         return
     for item in timeline.items:
+        if keep_before and item.timeline_start_frame < keep_before:
+            continue
         item.timeline_start_frame = max(0, item.timeline_start_frame + delta)
         item.timeline_end_frame = max(1, item.timeline_end_frame + delta)
 
@@ -207,11 +273,14 @@ def apply_intro(
 
     clear_generated(timeline, INTRO_ORIGIN)
 
+    # A cold open (see presentation.structure) also lives in the offset and
+    # is not the intro's to move: the card sits after it.
+    cold_open = max(0, timeline.cold_open_frames)
     if background:
-        previous_offset = timeline.program_offset_frames
+        previous_offset = timeline.program_offset_frames - cold_open
         delta = duration_frames - previous_offset
-        _shift_all_items(timeline, delta)
-        timeline.program_offset_frames = duration_frames
+        _shift_all_items(timeline, delta, keep_before=cold_open)
+        timeline.program_offset_frames = cold_open + duration_frames
         timeline.program_offset_color = background
         # Re-cut V1/A1 so the program starts cleanly after the card. Without a
         # transcript there is nothing to rebuild from and the shift above already
@@ -219,7 +288,7 @@ def apply_intro(
         source_id = _primary_source_id(timeline)
         if timeline.words and source_id:
             rebuild_primary_tracks(timeline, source_id)
-    elif timeline.program_offset_frames:
+    elif timeline.program_offset_frames > cold_open:
         # Switching to an overlay-style intro: drop any card left by the last one.
         remove_intro(timeline, keep_text=True)
 
@@ -234,6 +303,8 @@ def apply_intro(
                             timeline.fps_num, timeline.fps_den)
         if end <= start:
             end = start + max(1, int(fps))
+        start += cold_open
+        end += cold_open
 
         style = {**text_preset_style(beat.get("preset")), **(beat.get("style") or {})}
         item = TimelineItem(
@@ -265,10 +336,11 @@ def remove_intro(timeline: Timeline, keep_text: bool = False) -> None:
     if not keep_text:
         clear_generated(timeline, INTRO_ORIGIN)
 
-    offset = timeline.program_offset_frames
-    if offset:
-        _shift_all_items(timeline, -offset)
-        timeline.program_offset_frames = 0
+    cold_open = max(0, timeline.cold_open_frames)
+    offset = timeline.program_offset_frames - cold_open
+    if offset > 0:
+        _shift_all_items(timeline, -offset, keep_before=cold_open)
+        timeline.program_offset_frames = cold_open
         source_id = _primary_source_id(timeline)
         if timeline.words and source_id:
             rebuild_primary_tracks(timeline, source_id)

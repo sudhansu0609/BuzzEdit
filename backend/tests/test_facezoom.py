@@ -68,11 +68,18 @@ def test_the_anchor_can_never_run_off_the_canvas():
 
 # --- planning the moves ----------------------------------------------------
 
-def test_segment_moves_are_spread_and_alternate_direction():
+def test_every_segment_move_pushes_in_so_each_join_resets_wide():
+    """Every clip starts wide and drifts tighter, so every V1 join steps back to
+    wide by the whole depth of the move — a punch-out, the standard disguise for
+    a talking-head jump cut. Alternating directions made the scale CONTINUOUS
+    across every join (a push-in ends exactly where the next pull-back starts)
+    and the head-position jump played bare. Variety comes from jittered depth."""
     segment_zooms, _ = plan_zooms(_program(), PresentationSettings(), [], seed=0)
     assert segment_zooms
-    directions = [z.push_in for z in segment_zooms]
-    assert len(set(directions)) == 2, "consecutive moves must not all go one way"
+    assert all(z.push_in for z in segment_zooms)
+    if len(segment_zooms) > 2:
+        assert len({z.depth for z in segment_zooms}) > 1, "depth should vary"
+    assert all(0.06 <= z.depth <= 0.6 for z in segment_zooms)
 
 
 def test_planning_is_deterministic():

@@ -64,9 +64,14 @@ PUNCH_EDGE_MARGIN = 0.5
 
 # --- the face --------------------------------------------------------------
 
-MODEL_URL = ("https://raw.githubusercontent.com/opencv/opencv_zoo/main/models/"
+# The zoo stores its weights in Git LFS: the raw.githubusercontent URL returns
+# a 131-byte pointer file, which is what sat on disk for weeks and failed to
+# parse on every run. The media endpoint serves the actual bytes.
+MODEL_URL = ("https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
              "face_detection_yunet/face_detection_yunet_2023mar.onnx")
 MODEL_PATH = DATA_DIR / "models" / "face_detection_yunet_2023mar.onnx"
+# The real model is ~230 KB; anything under this is a pointer or an error page.
+MODEL_MIN_BYTES = 100_000
 FACE_SAMPLE_FPS = 2.0
 FACE_SAMPLE_WIDTH = 640
 FACE_SAMPLE_HEIGHT = 360
@@ -80,13 +85,18 @@ MAX_ANCHOR_OFFSET = 0.35
 
 def ensure_model() -> Optional[Path]:
     """The YuNet weights, downloading them once. None if unavailable offline."""
-    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 1000:
+    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size >= MODEL_MIN_BYTES:
         return MODEL_PATH
     try:
         MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
         logger.info("Downloading the face detection model (once)")
         with urllib.request.urlopen(MODEL_URL, timeout=60) as resp:
-            MODEL_PATH.write_bytes(resp.read())
+            payload = resp.read()
+        if len(payload) < MODEL_MIN_BYTES or payload.startswith(b"version https://git-lfs"):
+            logger.warning("Face model download is not a model (%d bytes); zooms will be centred",
+                           len(payload))
+            return None
+        MODEL_PATH.write_bytes(payload)
         return MODEL_PATH
     except Exception as e:
         logger.warning("Face model unavailable (%s); zooms will be centred", e)
@@ -205,16 +215,29 @@ def plan_zooms(program: Program, settings: PresentationSettings,
 
     segment_zooms: List[SegmentZoom] = []
     if eligible:
-        # Cover ~90% of eligible segments throughout the video with alternating zoom in / zoom out
+        # Cover ~90% of eligible segments. Every move pushes IN, deliberately:
+        # each clip then starts wide and drifts tighter, so at every join the
+        # frame steps back to wide by the whole depth of the move — a punch-out,
+        # which is the standard disguise for a talking-head jump cut. The old
+        # alternation (push, pull, push …) made the scale CONTINUOUS across
+        # every join — a push-in ends at 1+d exactly where the following
+        # pull-back starts — so the head-position jump played completely bare.
+        # Verified on real footage: adjacent takes differ by a lean or a hand
+        # move, and an 8-14% scale step across the join reads as an edit where
+        # equal scale reads as a glitch. Depth is jittered per segment (seeded,
+        # so re-runs are stable) to keep the rhythm from feeling mechanical.
+        import random as _random
+        rng = _random.Random(seed)
         wanted = max(1, int(round(len(eligible) * 0.90))) if len(eligible) > 1 else len(eligible)
         if wanted > 0:
             step = len(eligible) / wanted
             for index in range(wanted):
                 segment = eligible[int(index * step)]
+                jitter = 0.7 + 0.6 * rng.random()
                 segment_zooms.append(SegmentZoom(
                     item_id=segment.item_id,
-                    push_in=((index + seed) % 2 == 0),
-                    depth=depth,
+                    push_in=True,
+                    depth=round(min(0.6, max(0.06, depth * jitter)), 3),
                 ))
 
     window_zooms = _plan_punches(program, busy, seed, stats)

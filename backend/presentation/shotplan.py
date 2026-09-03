@@ -21,7 +21,8 @@ import logging
 import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from .models import Beat, Program, PresentationSettings, ShotPlan, Topic
+from . import genre as genre_mod
+from .models import BEAT_KINDS, Beat, Program, PresentationSettings, ShotPlan, Topic
 from .program import transcript_lines
 
 logger = logging.getLogger("presentation.shotplan")
@@ -317,7 +318,7 @@ def sanitize_beats(beats: List[Beat], program: Program,
 
         beat = beat.model_copy(update={"start_s": start, "end_s": end})
 
-        if beat.kind not in ("broll_image", "broll_video", "popup", "graphic"):
+        if beat.kind not in BEAT_KINDS:
             dropped.append({"topic": beat.topic, "reason": f"unknown kind {beat.kind!r}"})
             continue
 
@@ -345,6 +346,18 @@ def sanitize_beats(beats: List[Beat], program: Program,
         if beat.kind == "graphic" and not settings.graphics:
             dropped.append({"topic": beat.topic, "reason": "graphics are switched off"})
             continue
+        if beat.kind == "map" and not beat.place:
+            dropped.append({"topic": beat.topic, "reason": "map with no place"})
+            continue
+        if beat.kind == "split" and not (beat.data.get("left") and beat.data.get("right")):
+            dropped.append({"topic": beat.topic, "reason": "split with one side"})
+            continue
+        if beat.kind == "chart" and not (beat.data.get("values") and beat.data.get("labels")):
+            dropped.append({"topic": beat.topic, "reason": "chart with no data"})
+            continue
+        if beat.is_text and not (beat.text or "").strip():
+            dropped.append({"topic": beat.topic, "reason": f"{beat.kind} with no text"})
+            continue
 
         candidates.append(beat)
 
@@ -361,8 +374,12 @@ def dedup_beats(candidates: List[Beat]) -> Tuple[List[Beat], List[Dict[str, str]
     dropped: List[Dict[str, str]] = []
     unique: List[Beat] = []
     for beat in sorted(candidates, key=lambda b: -b.priority):
+        if beat.origin != "llm" or beat.is_text:
+            unique.append(beat)
+            continue
         clash = next((k for k in unique
-                      if _similar(k.topic, beat.topic) >= TOPIC_DEDUP_JACCARD), None)
+                      if k.origin == "llm" and not k.is_text
+                      and _similar(k.topic, beat.topic) >= TOPIC_DEDUP_JACCARD), None)
         if clash is not None:
             dropped.append({"topic": beat.topic,
                             "reason": f"duplicate of {clash.topic!r}"})
@@ -402,30 +419,96 @@ def budget_beats(unique: List[Beat], program: Program,
         planned = max(settings.broll_seconds_min,
                       min(settings.broll_seconds_max, beat.duration_s - gap))
         planned = min(planned, max(MIN_BEAT_SECONDS, beat.duration_s))
-        if spent + planned > budget + 0.001:
+        # A stage direction is the user asking for this picture here, by name.
+        # It is exempt from the coverage budget and keeps only the minimum
+        # on-camera gap; it still cannot sit on top of another cutaway.
+        requested = beat.origin == "script"
+        if not requested and spent + planned > budget + 0.001:
             dropped.append({"topic": beat.topic, "reason": "over the coverage budget"})
             continue
-        if max_cutaways is not None and len(kept_cutaways) >= max_cutaways:
+        if not requested and max_cutaways is not None and len(kept_cutaways) >= max_cutaways:
             dropped.append({"topic": beat.topic, "reason": "over the cutaway budget"})
             continue
-        if _too_close(beat, planned, kept_cutaways, gap):
+        if _too_close(beat, planned, kept_cutaways,
+                      settings.min_oncamera_gap_s if requested else gap):
             dropped.append({"topic": beat.topic, "reason": "too close to another cutaway"})
             continue
         kept_cutaways.append(beat.model_copy(update={"planned_duration_s": round(planned, 3)}))
         spent += planned
 
     kept_popups: List[Beat] = []
-    for beat in sorted([b for b in unique if not (b.is_cutaway or b.kind == "graphic")],
+    for beat in sorted([b for b in unique if b.kind == "popup"],
                        key=lambda b: -b.priority):
         if _too_close(beat, beat.duration_s, kept_popups, MIN_POPUP_GAP_SECONDS):
             dropped.append({"topic": beat.topic, "reason": "too close to another pop-up"})
             continue
         kept_popups.append(beat)
 
-    kept = sorted(kept_cutaways + kept_popups, key=lambda b: b.start_s)
+    # Text cards (chapter titles, stat call-outs, …) cost no coverage budget and
+    # have their own spacing rules in placement.
+    cards = [b for b in unique if b.is_text]
+
+    kept = sorted(kept_cutaways + kept_popups + cards, key=lambda b: b.start_s)
     for index, beat in enumerate(kept):
         beat.id = f"b{index:02d}"
     return kept, dropped
+
+
+def balance_video_share(beats: List[Beat], settings: PresentationSettings) -> List[Beat]:
+    """Give the most important cutaways motion, at the configured share.
+
+    A generated video clip costs minutes where a still costs seconds, so which
+    beats get one cannot be left to the model's whim: the HIGHEST-priority beats
+    — the parts of the video the planner cared about most — are promoted to
+    `broll_video` until video makes up ~`video_broll_share` of B-roll screen
+    time, and any excess the model proposed is demoted lowest-priority-first.
+    Share is measured in seconds, not beat count; with ~2.5s beats the landing
+    is within one beat of the target, which is as exact as it can be.
+    """
+    share = settings.video_broll_share
+    if not settings.broll_video or share <= 0:
+        return beats
+
+    out = list(beats)
+    cutaway_idx = [i for i, b in enumerate(out) if b.is_cutaway]
+    total = sum(_planned_length(out[i]) for i in cutaway_idx)
+    if total <= 0:
+        return beats
+    video_secs = sum(_planned_length(out[i]) for i in cutaway_idx
+                     if out[i].kind == "broll_video")
+
+    # Demote the model's excess, least-important first. The tolerance keeps a
+    # plan that is already roughly right from churning.
+    ceiling = min(0.5, share + 0.05)
+    # Stage directions name their kind ([broll:] is a still, [video:] a clip)
+    # and are neither promoted nor demoted; maps and charts are drawn locally
+    # and have no video form.
+    movable = [i for i in cutaway_idx if out[i].origin == "llm" and out[i].is_generated]
+    for i in sorted((i for i in movable if out[i].kind == "broll_video"),
+                    key=lambda i: out[i].priority):
+        if video_secs / total <= ceiling:
+            break
+        out[i] = out[i].model_copy(update={"kind": "broll_image"})
+        video_secs -= _planned_length(out[i])
+
+    # Promote the most important stills up to the share.
+    for i in sorted((i for i in movable if out[i].kind == "broll_image"),
+                    key=lambda i: -out[i].priority):
+        if video_secs / total >= share:
+            break
+        beat = out[i]
+        if not beat.image_prompt:
+            continue
+        out[i] = beat.model_copy(update={
+            "kind": "broll_video",
+            # The scene prompt doubles as the motion prompt: the video stage
+            # only needs to know what world it is moving through.
+            "video_prompt": beat.video_prompt or _clean_prompt(
+                f"{beat.image_prompt}, gentle cinematic camera movement, "
+                f"natural motion in the scene"),
+        })
+        video_secs += _planned_length(out[i])
+    return out
 
 
 def _planned_length(beat: Beat) -> float:
@@ -449,18 +532,20 @@ def _too_close(beat: Beat, planned: float, placed: List[Beat], gap: float) -> bo
 
 # --- the model calls -------------------------------------------------------
 
-async def find_topics(program: Program, ask: AskJson) -> List[Topic]:
+async def find_topics(program: Program, ask: AskJson,
+                      genre: str = "general") -> List[Topic]:
     """Ask the model what the video is about, one window at a time."""
     lines = transcript_lines(program).splitlines()
     if not lines:
         return []
 
+    system = TOPIC_SYSTEM + genre_mod.genre_block(genre)
     topics: List[Topic] = []
     start = 0
     while start < len(lines):
         end = min(len(lines), start + WINDOW_LINES)
         window = "\n".join(lines[start:end])
-        answer = await _ask(ask, TOPIC_SYSTEM, f"Transcript:\n{window}\n\nTopics:",
+        answer = await _ask(ask, system, f"Transcript:\n{window}\n\nTopics:",
                             TOPIC_SCHEMA)
         parsed = first_json_object(answer or "")
         if not parsed:
@@ -488,17 +573,101 @@ async def find_topics(program: Program, ask: AskJson) -> List[Topic]:
     return topics
 
 
-async def write_beats(topics: List[Topic], ask: AskJson) -> List[Beat]:
+PARAGRAPH_SYSTEM = (
+    "You are the researcher for a YouTube video. You are given the paragraphs of "
+    "the speaker's own SCRIPT, numbered. The paragraphs are the topics; do not "
+    "merge or split them. The script may be in Hindi (Devanagari or Latin letters) "
+    "mixed with English.\n\n"
+    "For each paragraph give:\n"
+    "  index    - its number, unchanged\n"
+    "  topic    - three to six words naming it, IN ENGLISH\n"
+    "  summary  - one sentence in ENGLISH saying what the speaker says\n"
+    "  visual   - one sentence in ENGLISH describing a single SCENE a camera could "
+    "photograph that illustrates it\n"
+    "  priority - 0.0 to 1.0, how much it would benefit from a picture\n\n"
+    "Answer with JSON only:\n"
+    '{"topics": [{"index": 0, "topic": "", "summary": "", "visual": "", "priority": 0.0}]}'
+)
+
+PARAGRAPH_SCHEMA = {
+    "name": "paragraph_topics",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "topics": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "topic": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "visual": {"type": "string"},
+                        "priority": {"type": "number"},
+                    },
+                    "required": ["index", "topic", "summary", "visual", "priority"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["topics"],
+        "additionalProperties": False,
+    },
+}
+
+
+async def describe_paragraphs(topics: List[Topic], ask: AskJson,
+                              genre: str = "general") -> List[Topic]:
+    """Name and illustrate script-derived topics; the boundaries are the
+    script's and are never moved. A topic the model skips keeps its
+    provisional name."""
+    if not topics:
+        return topics
+    system = PARAGRAPH_SYSTEM + genre_mod.genre_block(genre)
+    out = [t.model_copy() for t in topics]
+    for start in range(0, len(out), TOPIC_BATCH):
+        batch = out[start:start + TOPIC_BATCH]
+        listing = "\n".join(
+            f"{start + i}. {t.summary[:500]}" for i, t in enumerate(batch))
+        answer = await _ask(ask, system, f"Paragraphs:\n{listing}\n\nTopics:",
+                            PARAGRAPH_SCHEMA)
+        parsed = first_json_object(answer or "")
+        if not parsed:
+            continue
+        for raw in parsed.get("topics", []) or []:
+            try:
+                index = int(raw.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= index < len(out)):
+                continue
+            topic = out[index]
+            name = str(raw.get("topic", "")).strip()
+            if name and not topic.heading:
+                topic.topic = name[:80]
+            topic.summary = str(raw.get("summary") or topic.summary).strip()[:600]
+            topic.visual = str(raw.get("visual") or "").strip()
+            try:
+                topic.priority = max(0.0, min(1.0, float(raw.get("priority", topic.priority))))
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+async def write_beats(topics: List[Topic], ask: AskJson,
+                      genre: str = "general") -> List[Beat]:
     """Turn topics into on-screen beats with generation prompts."""
     beats: List[Beat] = []
     by_topic = {t.topic.lower(): t for t in topics}
 
+    system = BEAT_SYSTEM + genre_mod.genre_block(genre)
     for start in range(0, len(topics), TOPIC_BATCH):
         batch = topics[start:start + TOPIC_BATCH]
         listing = "\n".join(
             f"{i + 1}. {t.topic} | {t.summary} | suggested visual: {t.visual}"
             for i, t in enumerate(batch))
-        answer = await _ask(ask, BEAT_SYSTEM, f"Topics:\n{listing}\n\nBeats:",
+        answer = await _ask(ask, system, f"Topics:\n{listing}\n\nBeats:",
                             BEAT_SCHEMA)
         parsed = first_json_object(answer or "")
         if not parsed:
@@ -528,11 +697,16 @@ async def write_beats(topics: List[Topic], ask: AskJson) -> List[Beat]:
                 kind=kind if kind in ("broll_image", "broll_video", "popup", "graphic")
                      else "broll_image",
                 priority=topic.priority,
-                image_prompt=raw.get("image_prompt") or topic.visual or None,
-                video_prompt=raw.get("video_prompt"),
+                # Stamp the genre's look on deterministically: the system prompt
+                # asked for it, but a local model forgets, and one off-mood
+                # picture in a horror edit reads as a mistake.
+                image_prompt=genre_mod.apply_look(
+                    raw.get("image_prompt") or topic.visual or None, genre),
+                video_prompt=genre_mod.apply_look(raw.get("video_prompt"), genre),
                 popup_text=raw.get("popup_text"),
-                negative_prompt=str(raw.get("negative_prompt")
-                                    or "text, watermark, logo, deformed hands, blurry"),
+                negative_prompt=genre_mod.apply_negative(
+                    str(raw.get("negative_prompt")
+                        or "text, watermark, logo, deformed hands, blurry"), genre),
                 style_hint=(str(raw.get("style_hint", "photoreal")).strip().lower()
                             if str(raw.get("style_hint", "")).strip().lower()
                             in ("photoreal", "illustration", "diagram", "abstract")
@@ -579,7 +753,8 @@ VARIATION_SCHEMA = {
 
 
 async def multiply_beats(beats: List[Beat], settings: PresentationSettings,
-                         ask: Optional[AskJson]) -> List[Beat]:
+                         ask: Optional[AskJson],
+                         genre: str = "general") -> List[Beat]:
     """Split each long cutaway topic into several distinct shots.
 
     One beat per topic is a hard ceiling near two cutaways a minute — a 60s
@@ -607,11 +782,14 @@ async def multiply_beats(beats: List[Beat], settings: PresentationSettings,
         if ask is not None:
             try:
                 answer = await _ask(
-                    ask, VARIATION_SYSTEM,
+                    ask, VARIATION_SYSTEM + genre_mod.genre_block(genre),
                     f"Scene: {beat.image_prompt}\nN: {count}\n\nPrompts:",
                     VARIATION_SCHEMA)
                 parsed = first_json_object(answer or "") or {}
-                prompts = [_clean_prompt(p) for p in parsed.get("prompts", []) or []]
+                # Re-stamp the look: the model rewrites the scene and routinely
+                # drops the mood suffix the base prompt carried.
+                prompts = [_clean_prompt(genre_mod.apply_look(p, genre))
+                           for p in parsed.get("prompts", []) or []]
                 prompts = [p for p in prompts if p][:count]
             except Exception as e:
                 logger.warning("Shot variation call failed (%s); using suffixes", e)
@@ -637,6 +815,40 @@ async def multiply_beats(beats: List[Beat], settings: PresentationSettings,
     return out
 
 
+# --- guaranteed pop-in labels ------------------------------------------------
+
+# The opening title owns the first seconds of the video; a pop-up under it is
+# clutter.
+TITLE_ZONE_SECONDS = 3.0
+
+
+def topic_popups(topics: List[Topic], settings: PresentationSettings) -> List[Beat]:
+    """A pop-in label per topic, for when the model planned no pop-ups at all.
+
+    The model is asked for pop-ups but routinely plans every beat as a cutaway
+    (a real run planned 18 beats, zero pop-ups), and then the video has no text
+    accents whatever the user asked for. The topics themselves are the reliable
+    fallback: each one's name pops in as the speaker reaches it, which is the
+    standard section-label treatment. Placement still owns spacing and keeps
+    them off the B-roll."""
+    popups: List[Beat] = []
+    for topic in topics:
+        text = _clean_popup(topic.topic)
+        if not text or topic.start_s < TITLE_ZONE_SECONDS:
+            continue
+        popups.append(Beat(
+            start_s=topic.start_s,
+            end_s=max(topic.start_s + 4.0, min(topic.end_s, topic.start_s + 12.0)),
+            topic=topic.topic,
+            summary=topic.summary,
+            kind="popup",
+            priority=topic.priority,
+            popup_text=text,
+            negative_prompt="",
+        ))
+    return popups
+
+
 # --- the deterministic fallback --------------------------------------------
 
 STOP_WORDS = {
@@ -647,7 +859,63 @@ STOP_WORDS = {
 }
 
 
-def fallback_plan(program: Program, settings: PresentationSettings) -> List[Beat]:
+# Without a model, topics are cut at the longest pauses so each runs roughly
+# this long — the length a spoken subject tends to take.
+FALLBACK_TOPIC_TARGET_S = 40.0
+FALLBACK_TOPIC_MIN_S = 15.0
+
+
+def fallback_topics(program: Program) -> List[Topic]:
+    """Topics from the speech rhythm alone: windows of ~40s split at the
+    longest pauses, named by their most emphatic words."""
+    if not program.words or program.duration_s < FALLBACK_TOPIC_MIN_S:
+        return []
+    wanted = max(1, int(round(program.duration_s / FALLBACK_TOPIC_TARGET_S)))
+    if wanted == 1:
+        return [Topic(start_s=0.0, end_s=program.duration_s,
+                      topic=_keywords(program.words) or "the video", origin="fallback")]
+    # Candidate boundaries: the gaps between words, biggest first.
+    gaps = []
+    for previous, word in zip(program.words, program.words[1:]):
+        gaps.append((word.tl_start_s - previous.tl_end_s, word.tl_start_s))
+    gaps.sort(reverse=True)
+    boundaries: List[float] = []
+    for _, at in gaps:
+        if len(boundaries) >= wanted - 1:
+            break
+        if at < FALLBACK_TOPIC_MIN_S or at > program.duration_s - FALLBACK_TOPIC_MIN_S:
+            continue
+        if all(abs(at - b) >= FALLBACK_TOPIC_MIN_S for b in boundaries):
+            boundaries.append(at)
+    edges = [0.0] + sorted(boundaries) + [program.duration_s]
+    topics: List[Topic] = []
+    for start, end in zip(edges, edges[1:]):
+        words = program.words_between(start, end)
+        name = _keywords(words) or f"part {len(topics) + 1}"
+        topics.append(Topic(start_s=start, end_s=end, topic=name,
+                            summary=" ".join(w.text for w in words[:40]),
+                            priority=0.5, origin="fallback"))
+    return topics
+
+
+def _keywords(words) -> str:
+    """Two or three of the most emphatic content words, as a topic name."""
+    ranked = sorted(
+        (w for w in words if len(w.text.strip(".,!?")) > 3
+         and w.text.strip(".,!?").lower() not in STOP_WORDS),
+        key=lambda w: -w.emphasis_z)
+    picked: List[str] = []
+    for word in ranked:
+        token = word.text.strip(".,!?").lower()
+        if token not in picked:
+            picked.append(token)
+        if len(picked) == 3:
+            break
+    return " ".join(picked)
+
+
+def fallback_plan(program: Program, settings: PresentationSettings,
+                  genre: str = "general") -> List[Beat]:
     """Beats without a language model: the loudest phrase in each window.
 
     Deliberately worse than the planned version and deliberately still
@@ -687,47 +955,121 @@ def fallback_plan(program: Program, settings: PresentationSettings) -> List[Beat
             summary="",
             kind="broll_image",
             priority=0.5,
-            image_prompt=(f"Cinematic documentary photograph representing {subject}, "
-                          f"natural lighting, 35mm film still, shallow depth of field"),
+            image_prompt=genre_mod.apply_look(
+                f"Cinematic documentary photograph representing {subject}, "
+                f"natural lighting, 35mm film still, shallow depth of field", genre),
+            negative_prompt=genre_mod.apply_negative(
+                "text, watermark, logo, deformed hands, blurry", genre),
         ))
     return beats
 
 
 async def plan_shots(program: Program, settings: PresentationSettings,
-                     ask: Optional[AskJson]) -> ShotPlan:
-    """The whole of stage B: topics, beats, validation — or the fallback."""
+                     ask: Optional[AskJson],
+                     genre: Optional[str] = None,
+                     script_topics: Optional[List[Topic]] = None,
+                     extra_beats: Optional[List[Beat]] = None,
+                     enrich: Optional[Callable[[List[Topic]], Awaitable[None]]] = None) -> ShotPlan:
+    """The whole of stage B: topics, beats, validation — or the fallback.
+
+    `genre` styles every prompt to the kind of video this is (a horror video
+    gets horror imagery). None means detect it from the transcript here.
+    `script_topics` are the user's script paragraphs: when given, they ARE the
+    topics (the model only names and illustrates them). `extra_beats` are
+    beats other planners insist on (stage directions, extracted entities);
+    they are validated like everything else but never deduplicated away.
+    """
+    if genre is None:
+        genre = await genre_mod.detect_genre(program, ask)
+    genre = genre_mod.normalise(genre)
+
     beats: List[Beat] = []
+    topics: List[Topic] = list(script_topics or [])
     source = "llm"
 
     if ask is not None:
         try:
-            topics = await find_topics(program, ask)
             if topics:
-                beats = await write_beats(topics, ask)
+                topics = await describe_paragraphs(topics, ask, genre)
+            else:
+                topics = await find_topics(program, ask, genre)
+            if topics and enrich is not None:
+                # Story structure tags the topics (acts) before the beats are
+                # weighed: an act's density multiplier scales its beats'
+                # priority, so the budget favours the parts that want pictures.
+                try:
+                    await enrich(topics)
+                except Exception as e:
+                    logger.warning("Topic enrichment failed (%s); acts unweighted", e)
+            if topics:
+                beats = await write_beats(topics, ask, genre)
+                beats = _weigh_by_act(beats, topics)
         except Exception as e:
             logger.warning("Shot planning failed (%s); falling back to keywords", e)
             beats = []
 
     if not beats:
         source = "fallback"
-        beats = fallback_plan(program, settings)
+        beats = fallback_plan(program, settings, genre)
+        if not topics:
+            # Everything topic-based — chapters, moods, cards, transitions —
+            # needs topics, and a night without the model used to get none.
+            topics = fallback_topics(program)
+            if topics and enrich is not None:
+                try:
+                    await enrich(topics)
+                except Exception as e:
+                    logger.warning("Topic enrichment failed (%s)", e)
 
+    beats = list(beats) + list(extra_beats or [])
     candidates, dropped = sanitize_beats(beats, program, settings)
     unique, dup_dropped = dedup_beats(candidates)
     if source == "llm":
         # The fallback already proposes one beat per shot slot; only topic-sized
         # LLM beats need splitting into a sequence of shots.
-        unique = await multiply_beats(unique, settings, ask)
+        planned = [b for b in unique if b.origin == "llm"]
+        others = [b for b in unique if b.origin != "llm"]
+        unique = await multiply_beats(planned, settings, ask, genre) + others
     kept, budget_dropped = budget_beats(unique, program, settings)
     dropped = dropped + dup_dropped + budget_dropped
+    kept = balance_video_share(kept, settings)
+
+    # The model plans pop-ups so rarely that a run with none is the normal case;
+    # the topics themselves then supply one label each. Added after budgeting —
+    # pop-ups cost no screen-time budget — and validated the same way.
+    # When chapter titles are on they carry each topic's name; a pop-up saying
+    # the same thing a second later would be a stutter.
+    if (settings.popups and topics and not any(b.kind == "popup" for b in kept)
+            and not (settings.cards and settings.chapter_titles)):
+        labels, _ = sanitize_beats(topic_popups(topics, settings), program, settings)
+        for index, beat in enumerate(labels):
+            beat.id = f"p{index:02d}"
+        kept = sorted(kept + labels, key=lambda b: b.start_s)
+        if labels:
+            logger.info("Shot plan: %d topic labels added as pop-ups", len(labels))
 
     if not settings.popups:
         kept = [b for b in kept if b.kind != "popup"]
     if not settings.broll:
         kept = [b for b in kept if not b.is_cutaway]
 
-    logger.info("Shot plan (%s): %d beats kept, %d dropped", source, len(kept), len(dropped))
-    return ShotPlan(beats=kept, dropped=dropped, source=source)
+    logger.info("Shot plan (%s, genre=%s): %d beats kept, %d dropped",
+                source, genre, len(kept), len(dropped))
+    return ShotPlan(beats=kept, dropped=dropped, source=source, genre=genre,
+                    topics=topics)
+
+
+def _weigh_by_act(beats: List[Beat], topics: List[Topic]) -> List[Beat]:
+    """Scale each cutaway's priority by its topic's act density."""
+    from .structure import act_weight
+    weights = {t.topic.lower(): act_weight(t.act) for t in topics}
+    out: List[Beat] = []
+    for beat in beats:
+        weight = weights.get(beat.topic.lower(), 1.0)
+        if beat.is_cutaway and weight != 1.0:
+            beat = beat.model_copy(update={"priority": max(0.0, min(1.0, beat.priority * weight))})
+        out.append(beat)
+    return out
 
 
 def seed_for(project_id: str, extra: str = "") -> int:

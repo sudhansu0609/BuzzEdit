@@ -187,8 +187,16 @@ async def _plan_cut_and_render(p_data: dict, tl: Timeline, project_id: str, phas
     phase(0.18, "Extracting audio…")
     audio_path = await extract_project_audio(p_data.get("source_video"))
 
+    # Hand the planner BOTH scripts. `word`/`hinglish` is the romanization the
+    # timeline stores and the aligner matches on; `word_native` is what the
+    # fluency and grammar passes judge. Re-cutting used to pass the romanization
+    # alone, so on this path — the "Auto Edit" button, i.e. exactly what a user
+    # presses when the first cut disappointed them — every prompt claiming to
+    # receive Devanagari received Hinglish instead.
     word_dicts = [{
         "word": w.text,
+        "hinglish": w.text,
+        "word_native": w.word_native or w.text,
         "start": frame_to_time(w.start_frame, tl.fps_num, tl.fps_den),
         "end": frame_to_time(w.end_frame, tl.fps_num, tl.fps_den),
         "probability": 1.0,
@@ -216,6 +224,8 @@ async def _plan_cut_and_render(p_data: dict, tl: Timeline, project_id: str, phas
             disfluency=bool(rd.get("disfluency", False)),
             reason=rd.get("reason") or None,
             candidate=bool(rd.get("candidate", False)),
+            word_native=(str(rd.get("word_native")).strip() or None)
+            if rd.get("word_native") else None,
         )
         for i, rd in enumerate(plan.words)
     ]

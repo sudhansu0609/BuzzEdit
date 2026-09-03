@@ -258,6 +258,146 @@ def test_the_fallback_needs_no_model_and_no_energy():
     assert beats
 
 
+# --- Stage B: genre --------------------------------------------------------
+
+def test_a_horror_transcript_is_detected_from_its_own_words():
+    from presentation.genre import keyword_genre
+    assert keyword_genre(
+        "aaj hum ek haunted jagah gaye jahan bhoot dikha, "
+        "paranormal cheezein hui aur sab darr gaye") == "horror"
+    assert keyword_genre("aaj mausam accha tha aur hum ghar par rahe") == "general"
+
+
+def test_unknown_genre_names_style_nothing_rather_than_erroring():
+    from presentation.genre import apply_look, normalise
+    assert normalise("scary") == "horror"
+    assert normalise("Horror") == "horror"
+    assert normalise("cats-knitting-asmr") == "general"
+    assert normalise(None) == "general"
+    prompt = "a quiet village street at dusk"
+    assert apply_look(prompt, "unknown") == prompt, "an unknown genre must cost nothing"
+
+
+def test_the_genre_look_is_stamped_once_not_twice():
+    from presentation.genre import apply_look, style_for
+    look = style_for("horror").look
+    once = apply_look("an abandoned house", "horror")
+    assert look in once
+    assert apply_look(once, "horror") == once
+
+
+@pytest.mark.asyncio
+async def test_a_horror_video_gets_horror_prompts():
+    """The whole point of genre awareness: whatever scene the model writes, the
+    generated picture must carry the video's mood."""
+    from presentation.genre import style_for
+    program = _program()
+
+    async def ask(system, _user, _schema=None):
+        if "classify" in system.lower():
+            return json.dumps({"genre": "horror"})
+        if "researcher" in system:
+            return json.dumps({"topics": [{
+                "start_s": 0.0, "end_s": 20.0, "topic": "the haunted house",
+                "summary": "A story about a haunted house.",
+                "visual": "an abandoned house at night", "priority": 0.9}]})
+        if "list of topics" in system:
+            return json.dumps({"beats": [{
+                "topic": "the haunted house", "kind": "broll_image",
+                "image_prompt": "an abandoned house on a hill at night",
+                "video_prompt": None, "popup_text": None,
+                "negative_prompt": "text, watermark, logo",
+                "style_hint": "photoreal"}]})
+        return "no"
+
+    plan = await plan_shots(program, PresentationSettings(), ask)
+    assert plan.genre == "horror"
+    cutaways = [b for b in plan.beats if b.is_cutaway]
+    assert cutaways
+    look = style_for("horror").look
+    for beat in cutaways:
+        assert look in beat.image_prompt
+        assert "bright cheerful colors" in beat.negative_prompt
+
+
+def test_the_fallback_prompts_carry_the_genre_too():
+    from presentation.genre import style_for
+    program = _program(count=200)
+    beats = fallback_plan(program, PresentationSettings(), genre="horror")
+    assert beats
+    assert all(style_for("horror").look in b.image_prompt for b in beats)
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_genre_setting_wins_without_asking_the_model():
+    program = _program()
+    plan = await plan_shots(program, PresentationSettings(), None, genre="comedy")
+    assert plan.genre == "comedy"
+
+
+# --- Stage B: the video share ----------------------------------------------
+
+def _kept_beats(n=10, video=()):
+    """n budgeted 2.5s cutaways with descending priority, some already video."""
+    beats = []
+    for i in range(n):
+        beats.append(_beat(
+            start_s=i * 4.0, end_s=i * 4.0 + 2.5,
+            topic=f"topic {i}", priority=1.0 - i * 0.05,
+            kind="broll_video" if i in video else "broll_image",
+            planned_duration_s=2.5,
+            image_prompt=f"a photograph of topic {i}"))
+    return beats
+
+
+def test_the_most_important_beats_get_video_at_the_asked_share():
+    from presentation.shotplan import balance_video_share
+    out = balance_video_share(_kept_beats(10), PresentationSettings())
+    videos = [b for b in out if b.kind == "broll_video"]
+    # 18% of 25s is 4.5s: exactly the two highest-priority beats at 2.5s each.
+    assert [b.topic for b in videos] == ["topic 0", "topic 1"]
+    assert all(b.video_prompt for b in videos), "a promoted beat needs a motion prompt"
+
+
+def test_video_share_is_seconds_of_screen_time_within_one_beat():
+    from presentation.shotplan import balance_video_share
+    out = balance_video_share(_kept_beats(20), PresentationSettings())
+    secs = sum(b.planned_duration_s for b in out if b.kind == "broll_video")
+    total = sum(b.planned_duration_s for b in out if b.is_cutaway)
+    assert 0.15 <= secs / total <= 0.25, "the target is 15-20%, one beat of slack"
+
+
+def test_a_model_that_wants_everything_as_video_is_reined_in():
+    from presentation.shotplan import balance_video_share
+    out = balance_video_share(_kept_beats(10, video=range(10)), PresentationSettings())
+    secs = sum(b.planned_duration_s for b in out if b.kind == "broll_video")
+    total = sum(b.planned_duration_s for b in out if b.is_cutaway)
+    assert secs / total <= 0.25, "excess video is demoted, lowest priority first"
+    # What survives as video is the beats the planner cared most about.
+    kept_videos = [b.topic for b in out if b.kind == "broll_video"]
+    assert "topic 0" in kept_videos
+
+
+def test_no_video_promotion_when_video_is_off():
+    from presentation.shotplan import balance_video_share
+    out = balance_video_share(
+        _kept_beats(10), PresentationSettings(broll_video=False))
+    assert all(b.kind == "broll_image" for b in out)
+    out = balance_video_share(
+        _kept_beats(10), PresentationSettings(video_broll_share=0.0))
+    assert all(b.kind == "broll_image" for b in out)
+
+
+def test_video_generation_size_is_capped_but_keeps_the_aspect():
+    from presentation.assets import _video_canvas_default
+    w, h = _video_canvas_default((1920, 1080))
+    assert w * h <= 832 * 480 * 1.1, "a 1080p canvas must not generate at 1080p"
+    assert abs(w / h - 16 / 9) < 0.1
+    w, h = _video_canvas_default((1080, 1920))
+    assert h > w, "a vertical short stays vertical"
+    assert w % 16 == 0 and h % 16 == 0
+
+
 # --- Stage C: the workflow registry ---------------------------------------
 
 def test_bindings_are_detected_on_the_bundled_workflows():
@@ -306,6 +446,53 @@ def test_values_are_written_at_the_bound_paths():
     assert built["3"]["inputs"]["seed"] == 7
     # The original must be untouched, or the second generation inherits the first.
     assert graph["6"]["inputs"]["text"] != "a cat"
+
+
+def test_a_binding_may_write_one_value_into_several_nodes():
+    """A two-stage workflow (image model feeding a video model) needs the same
+    prompt and size in both stages; a manifest binding that is a LIST of paths
+    writes them all, and an empty list means 'never write this here'."""
+    graph = {
+        "a": {"class_type": "CLIPTextEncode", "inputs": {"text": "old"}},
+        "b": {"class_type": "CLIPTextEncode", "inputs": {"text": "old"}},
+        "s": {"class_type": "KSampler", "inputs": {"steps": 8}},
+    }
+    bindings = {
+        "positive": [["a", "inputs", "text"], ["b", "inputs", "text"]],
+        "steps": [],
+    }
+    built = workflows.apply_bindings(graph, bindings, {"positive": "new", "steps": 30})
+    assert built["a"]["inputs"]["text"] == "new"
+    assert built["b"]["inputs"]["text"] == "new"
+    assert built["s"]["inputs"]["steps"] == 8, "an empty binding protects the value"
+
+
+def test_the_bundled_video_workflow_is_recognised_and_configured():
+    """The two-stage Z-Image -> Wan I2V workflow ships with the app and the
+    manifest routes the broll_video role to it; a video beat must resolve to a
+    workflow that really makes video."""
+    detail = workflows.describe("zimage_wan22_i2v.json")
+    assert detail["valid"], detail.get("error")
+    assert detail["output_kind"] == "video"
+    assert detail["roles_ok"]["broll_video"]
+    resolved = workflows.resolve("broll_video")
+    assert resolved is not None
+    assert resolved.output_kind == "video"
+    built = resolved.build(positive="a foggy street", negative="text",
+                           width=832, height=480, seed=7, length=81, fps=16,
+                           prefix="beat_b01")
+    # The prompt must reach BOTH stages: the still generator and the animator.
+    assert built["z_pos"]["inputs"]["text"] == "a foggy street"
+    assert built["w_pos"]["inputs"]["text"] == "a foggy street"
+    assert built["w_i2v"]["inputs"]["length"] == 81
+    assert built["z_sample"]["inputs"]["seed"] == 7
+    assert built["w_sample_high"]["inputs"]["noise_seed"] == 7
+    assert built["v_save"]["inputs"]["filename_prefix"] == "beat_b01"
+    # Global single-model overrides must not corrupt the tuned two-stage graph.
+    built = resolved.build(positive="p", steps=30, cfg=7.5, model="foo.safetensors")
+    assert built["z_sample"]["inputs"]["steps"] == 8
+    assert built["z_sample"]["inputs"]["cfg"] == 1
+    assert built["z_unet"]["inputs"]["unet_name"] == "z_image_turbo_bf16.safetensors"
 
 
 def test_an_unresolvable_binding_is_skipped_rather_than_raising():
@@ -381,9 +568,11 @@ def test_a_second_run_replaces_the_first_rather_than_stacking(tmp_path):
     assert len([s for s in timeline.sources if s.startswith("src_broll_")]) == 1
 
 
-def test_a_popup_is_never_shown_over_a_cutaway(tmp_path):
-    """A full-frame picture plus floating text is clutter, and the pop-up is the
-    one of the two that can simply wait."""
+def test_a_popup_with_no_clear_moment_draws_over_the_broll(tmp_path):
+    """The pop-up prefers a moment with the speaker on screen, but when its
+    whole span sits under cutaways it draws over them rather than vanishing —
+    at 60-75% coverage the on-camera gaps are shorter than a pop-up, and
+    skip-on-collision shipped videos with no pop-ups at all."""
     timeline = _timeline(count=200)
     program = build_program(timeline)
     cutaway = _beat(start_s=10.0, end_s=16.0)
@@ -396,7 +585,9 @@ def test_a_popup_is_never_shown_over_a_cutaway(tmp_path):
                 PresentationSettings())
     placed = place_popups(timeline, [popup], program, PresentationSettings(),
                           broll_windows(timeline))
-    assert placed == 0
+    assert placed == 1
+    item = next(i for i in timeline.items if i.origin == POPUP_ORIGIN)
+    assert item.timeline_start_frame / 30.0 == pytest.approx(11.0, abs=0.1)
 
 
 def test_a_cutaway_is_snapped_to_a_word_boundary(tmp_path):
@@ -598,3 +789,152 @@ async def _none():
 
 async def _empty_assets(*args, **kwargs):
     return [], [{"beat_id": "b00", "reason": "ComfyUI offline"}]
+
+
+# --- hiding the jump cuts ---------------------------------------------------
+#
+# A jump cut is invisible while a full-frame cutaway is over it. Placement
+# therefore slides each window (within its beat) to straddle the nearest V1
+# join; a shot that can reach no join runs exactly where the planner put it,
+# which test_a_cutaway_is_snapped_to_a_word_boundary already locks in.
+
+
+def _timeline_with_a_join():
+    """A timeline whose auto-edit removed a stretch, leaving one V1 join."""
+    from timeline.ops import rebuild_primary_tracks
+    timeline = _timeline(count=200)
+    source_id = next(iter(timeline.sources))
+    for word in timeline.words[60:75]:
+        word.enabled = False
+    rebuild_primary_tracks(timeline, source_id)
+    return timeline
+
+
+def test_a_cutaway_slides_to_straddle_the_nearest_jump_cut(tmp_path):
+    from presentation.placement import (CUT_COVER_MARGIN_S, jump_cut_coverage,
+                                        jump_cut_times)
+    timeline = _timeline_with_a_join()
+    cuts = jump_cut_times(timeline)
+    assert len(cuts) == 1
+    cut = cuts[0]
+
+    program = build_program(timeline)
+    beat = _beat(start_s=cut - 4.0, end_s=cut + 4.0)
+    beat.id = "b00"
+    assert place_broll(timeline, [beat], [_asset("b00", tmp_path)], program,
+                       PresentationSettings()) == 1
+    item = next(i for i in timeline.items if i.origin == BROLL_ORIGIN)
+    start_s = item.timeline_start_frame / 30.0
+    end_s = item.timeline_end_frame / 30.0
+    assert start_s + CUT_COVER_MARGIN_S - 0.05 <= cut <= end_s - CUT_COVER_MARGIN_S + 0.05
+    assert jump_cut_coverage(timeline) == {"total": 1, "covered": 1}
+
+
+def test_a_window_never_leaves_its_beat_to_chase_a_far_join(tmp_path):
+    """The picture must stay on-topic: a join well outside the beat's span is
+    another beat's business."""
+    from presentation.placement import jump_cut_times
+    timeline = _timeline_with_a_join()
+    cut = jump_cut_times(timeline)[0]
+
+    program = build_program(timeline)
+    beat = _beat(start_s=cut + 8.0, end_s=cut + 14.0)
+    beat.id = "b00"
+    place_broll(timeline, [beat], [_asset("b00", tmp_path)], program,
+                PresentationSettings())
+    item = next(i for i in timeline.items if i.origin == BROLL_ORIGIN)
+    start_s = item.timeline_start_frame / 30.0
+    assert start_s >= cut + 8.0 - 0.6
+
+
+# --- pop-in labels, the title, and the atmosphere ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_topics_become_popups_when_the_model_plans_none():
+    """The model routinely plans every beat as a cutaway — a real run planned
+    18 beats and zero pop-ups — and the video then has no text accents at all.
+    The topics themselves supply one label each."""
+    from presentation.shotplan import plan_shots
+
+    program = _program(count=200)
+
+    async def ask(system, user, schema=None):
+        if "researcher" in system:
+            return json.dumps({"topics": [
+                {"start_s": 1.0, "end_s": 30.0, "topic": "The Spotlight Effect",
+                 "summary": "s", "visual": "a street", "priority": 0.9},
+                {"start_s": 30.0, "end_s": 70.0, "topic": "Cornell Experiment",
+                 "summary": "s", "visual": "a lab", "priority": 0.8},
+            ]})
+        if "art director" in system and "ONE scene" not in system:
+            return json.dumps({"beats": [
+                {"topic": "The Spotlight Effect", "kind": "broll_image",
+                 "image_prompt": "a busy street, documentary photo",
+                 "video_prompt": None, "popup_text": None,
+                 "negative_prompt": "text", "style_hint": "photoreal"},
+            ]})
+        return None
+
+    # Chapter titles carry the topic names when cards are on; this checks the
+    # pop-up fallback itself, so cards are off here.
+    plan = await plan_shots(program, PresentationSettings(cards=False), ask, genre="general")
+    popups = [b for b in plan.beats if b.kind == "popup"]
+    assert popups, "topic labels should fill in for the model's missing pop-ups"
+    # The first topic starts inside the title zone and stays clear of it.
+    assert all(b.start_s >= 3.0 for b in popups)
+    assert any("Cornell" in (b.popup_text or "") for b in popups)
+
+
+def test_a_popup_slides_off_a_cutaway_instead_of_dying(tmp_path):
+    """At 60-75%% B-roll coverage a fixed start lands on a cutaway more often
+    than not, and skip-on-collision shipped videos with no pop-ups at all."""
+    timeline = _timeline(count=200)
+    program = build_program(timeline)
+    cutaway = _beat(start_s=10.0, end_s=16.0)
+    cutaway.id = "b00"
+    place_broll(timeline, [cutaway], [_asset("b00", tmp_path)], program,
+                PresentationSettings())
+    popup = _beat(start_s=10.0, end_s=25.0, kind="popup", popup_text="An idea",
+                  image_prompt=None)
+    popup.id = "p00"
+    placed = place_popups(timeline, [popup], program, PresentationSettings(),
+                          broll_windows(timeline))
+    assert placed == 1
+    from presentation.placement import POPUP_ORIGIN as _PO
+    item = next(i for i in timeline.items if i.origin == _PO)
+    start_s = item.timeline_start_frame / 30.0
+    broll_end = max(end for _s, end in broll_windows(timeline))
+    assert start_s >= broll_end - 0.01, "the pop-up must wait out the cutaway"
+
+
+def test_the_atmosphere_layer_is_replaced_not_stacked():
+    from presentation.director import _apply_atmosphere
+    from timeline.schema import AtmosphereEffect
+    timeline = _timeline(count=60)
+    timeline.effects.append(AtmosphereEffect(type="rain", intensity=0.9))  # user's
+
+    first = _apply_atmosphere(timeline, PresentationSettings(), "horror")
+    second = _apply_atmosphere(timeline, PresentationSettings(), "science_education")
+
+    assert first == "fog" and second == "grain"
+    ours = [e for e in timeline.effects if e.origin == "presentation"]
+    assert len(ours) == 1 and ours[0].type == "grain"
+    assert any(e.type == "rain" for e in timeline.effects), "user effects stay"
+
+
+def test_atmosphere_respects_genres_that_want_none():
+    from presentation.director import _apply_atmosphere
+    timeline = _timeline(count=60)
+    assert _apply_atmosphere(timeline, PresentationSettings(), "finance") == ""
+    assert not timeline.effects
+
+
+def test_the_title_overlay_draws_the_thumbnail_title():
+    from presentation.director import _apply_title
+    timeline = _timeline(count=60)
+    assert _apply_title(timeline, PresentationSettings(), "SPOTLIGHT EFFECT")
+    intros = [i for i in timeline.items if i.origin == "intro"]
+    assert intros and "SPOTLIGHT EFFECT" in intros[0].text.content
+    # The default preset is an overlay: nothing shifted, no card in front.
+    assert timeline.program_offset_frames == 0

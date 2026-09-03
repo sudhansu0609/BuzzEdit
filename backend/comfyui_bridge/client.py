@@ -33,11 +33,20 @@ logger = logging.getLogger(__name__)
 
 # Every key a ComfyUI save node may publish its results under. `images` is
 # SaveImage/PreviewImage; the rest come from the video nodes (VHS_VideoCombine,
-# SaveAnimatedWEBP, SaveAnimatedPNG).
-OUTPUT_KEYS = ("images", "gifs", "videos", "animated")
+# SaveVideo). `animated` is deliberately NOT here: in history it is a list of
+# booleans (`"animated": [true]`) marking sibling `images` entries as animated,
+# not a list of files — reading it as one crashed every Wan video generation
+# with "'bool' object has no attribute 'get'".
+OUTPUT_KEYS = ("images", "gifs", "videos")
 
 
 class ComfyUIClient:
+    # The machine typically has two ComfyUI installs: the portable one on 8188
+    # and the Comfy Desktop app on 8000. Both see the same model folders (the
+    # Desktop maps the portable's models via extra_models_config.yaml), so
+    # whichever one the user actually opened is the right one to talk to.
+    _PORT_ALTERNATES = {":8188": ":8000", ":8000": ":8188"}
+
     def __init__(self, server_url: str = COMFYUI_URL):
         self.server_url = server_url.rstrip('/')
         self.client_id = "buzzedit_client"
@@ -45,30 +54,48 @@ class ComfyUIClient:
     def is_connected(self, timeout: float = 10.0) -> bool:
         return self.connection_status(timeout)[0]
 
+    def _probe(self, url: str, timeout: float) -> tuple[bool, str]:
+        try:
+            req = urllib.request.Request(f"{url}/system_stats")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    return True, ""
+                return False, f"ComfyUI answered {resp.status} at {url}"
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", e)
+            # ConnectionRefused = nothing is listening (not started / wrong port);
+            # a timeout usually means it is up but still loading a model.
+            return False, (f"ComfyUI is not reachable at {url} ({reason}). "
+                           "Start ComfyUI (START_APP.bat launches it) and confirm the port.")
+        except Exception as e:
+            return False, f"ComfyUI status check failed: {e}"
+
     def connection_status(self, timeout: float = 10.0) -> tuple[bool, str]:
         """(reachable, reason). The reason is empty when up, otherwise a short
         human explanation so "B-roll didn't work" can become "ComfyUI is not
         running at 127.0.0.1:8188 (connection refused)". `is_connected` collapsed
         connection-refused, a slow model load and a crash into a bare False, which
         is exactly the ambiguity that makes an offline ComfyUI hard to diagnose.
+
+        When the configured server is down, the well-known alternate port is
+        probed and adopted if it answers — so opening the Desktop app instead of
+        the portable install just works, without touching COMFYUI_URL.
         """
-        try:
-            req = urllib.request.Request(f"{self.server_url}/system_stats")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                if resp.status == 200:
+        ok, reason = self._probe(self.server_url, timeout)
+        if ok:
+            return True, ""
+        for suffix, alternate_suffix in self._PORT_ALTERNATES.items():
+            if self.server_url.endswith(suffix):
+                alternate = self.server_url[:-len(suffix)] + alternate_suffix
+                alt_ok, _ = self._probe(alternate, min(timeout, 5.0))
+                if alt_ok:
+                    logger.info("ComfyUI found at %s (configured %s is down); switching",
+                                alternate, self.server_url)
+                    self.server_url = alternate
                     return True, ""
-                return False, f"ComfyUI answered {resp.status} at {self.server_url}"
-        except urllib.error.URLError as e:
-            reason = getattr(e, "reason", e)
-            # ConnectionRefused = nothing is listening (not started / wrong port);
-            # a timeout usually means it is up but still loading a model.
-            msg = (f"ComfyUI is not reachable at {self.server_url} ({reason}). "
-                   "Start ComfyUI (START_APP.bat launches it) and confirm the port.")
-            logger.warning(msg)
-            return False, msg
-        except Exception as e:
-            logger.warning("ComfyUI status check failed: %s", e)
-            return False, f"ComfyUI status check failed: {e}"
+                break
+        logger.warning(reason)
+        return False, reason
 
     def queue_prompt(self, prompt_dict: Dict[str, Any]) -> str:
         payload = {
@@ -177,6 +204,10 @@ class ComfyUIClient:
                 for node_output in outputs.values():
                     for key in OUTPUT_KEYS:
                         for entry in node_output.get(key, []) or []:
+                            # A node may publish flags (booleans) alongside its
+                            # file entries; only dicts describe files.
+                            if not isinstance(entry, dict):
+                                continue
                             path = self._resolve_output(entry)
                             if path:
                                 files.append(path)

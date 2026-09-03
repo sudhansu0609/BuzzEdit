@@ -18,6 +18,7 @@ import re
 from typing import List, Dict, Any
 
 from .retakes import apply_retakes
+from .tokens import romanized, spoken
 
 # Non-lexical vocalizations — these are (almost) never real words, safe to cut.
 HARD_FILLERS = {
@@ -47,13 +48,48 @@ SOFT_FILLER_PHRASES = {
 
 _PUNCT_RE = re.compile(r"[^\w]", re.UNICODE)
 
+# Hindi doubles words on purpose: "अपने-अपने काम" (each to their own work),
+# "धीरे धीरे", "बार बार", "अलग अलग". A doubled word from this set is grammar,
+# not a stutter — the sweep once cut "अपने -अपने" down to nothing and the
+# sentence lost its meaning ("वो सब अपने-अपने काम पर हैं" became "वो सब काम
+# हो"). Deliberately generous, by the asymmetry rule: a missed stutter is a
+# blemish, a deleted reduplication reverses what the speaker said.
+REDUPLICATION_OK = {
+    # Devanagari
+    "अपने", "अपनी", "अपना", "अलग", "धीरे", "बार", "कभी", "बहुत", "ठीक",
+    "जल्दी", "साथ", "एक", "दो", "खुद", "आगे", "पीछे", "ऊपर", "नीचे",
+    "थोड़ा", "थोड़ी", "छोटे", "छोटी", "बड़े", "नए", "सच", "चलते", "करते",
+    "होते", "देखते", "हंसते", "रोते",
+    # the same words romanized
+    "apne", "apni", "apna", "alag", "dheere", "dhire", "baar", "bar",
+    "kabhi", "kabhee", "bahut", "theek", "thik", "jaldi", "jaldee", "saath",
+    "sath", "ek", "do", "khud", "aage", "peeche", "upar", "neeche", "thoda",
+    "thodi", "sach", "chalte", "karte", "hote", "dekhte",
+}
+
+
+def is_reduplication(previous_raw: str, current_raw: str, norm: str) -> bool:
+    """Whether a doubled word is deliberate Hindi reduplication, not a stutter.
+
+    Two signals: the ASR's own hyphen ("अपने -अपने" — it heard a compound), and
+    a vocabulary of words Hindi routinely doubles. `norm` is the shared
+    normalised token of the pair.
+    """
+    if str(current_raw or "").strip().startswith("-"):
+        return True
+    if str(previous_raw or "").strip().endswith("-"):
+        return True
+    return norm in REDUPLICATION_OK
+
 
 def _norm(text: str) -> str:
     return _PUNCT_RE.sub("", str(text or "")).lower()
 
 
 def _word_text(w: Dict[str, Any]) -> str:
-    return str(w.get("word", w.get("text", "")))
+    """The ROMANIZED form — the vocabularies above are written in Latin letters,
+    so the filler rules have to read the spelling they were written against."""
+    return romanized(w)
 
 
 def analyze_disfluencies(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -62,6 +98,10 @@ def analyze_disfluencies(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return words
 
     norms = [_norm(_word_text(w)) for w in words]
+    # The stutter rule is repeat detection, not vocabulary matching, so it reads
+    # the SPOKEN script: the romanization spells one repeated word two ways often
+    # enough ("jaj"/"jaz") that comparing it misses the stutters that matter.
+    spoken_norms = [_norm(spoken(w)) for w in words]
     out: List[Dict[str, Any]] = []
 
     for i, w in enumerate(words):
@@ -83,7 +123,9 @@ def analyze_disfluencies(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         #    and comparing against the raw previous token misses every one of them.
         else:
             previous = next((p for p in reversed(out) if not p.get("disfluency")), None)
-            if clean and previous is not None and _norm(_word_text(previous)) == clean:
+            said = spoken_norms[i]
+            if (said and previous is not None and _norm(spoken(previous)) == said
+                    and not is_reduplication(spoken(previous), spoken(w), said)):
                 # cut the EARLIER duplicate(s); keep the last clean utterance.
                 previous["disfluency"] = True
                 previous["reason"] = "stutter"

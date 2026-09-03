@@ -316,3 +316,116 @@ def test_a_long_flounder_between_take_and_retry_stays_in_range():
     kept = _kept_full(f"{take} {flounder} {take} ki ye kaisaa hai")
     assert kept.count("jaz kar rahe hain") == 1, "the doubled sentence survived"
     assert kept.endswith("ki ye kaisaa hai")
+
+
+# ---------------------------------------------------------------------------
+# The spoken script, not its romanization
+#
+# Whisper decodes Hindi as Devanagari and a lossy post-process romanizes it. The
+# romanization drifts between two takes of the SAME sentence — the reference
+# recording has "jaj"/"jaz" and "dil"/"deel"/"reel" — which is exactly the case
+# the matcher exists to catch, so it read the one spelling it could not rely on.
+# ---------------------------------------------------------------------------
+
+
+def _bilingual(pairs, spacing: float = 0.35):
+    """Words carrying both spellings, as the ASR emits them."""
+    words = []
+    clock = 0.0
+    for native, roman in pairs:
+        words.append({"word": roman, "hinglish": roman, "word_native": native,
+                      "start": round(clock, 3),
+                      "end": round(clock + spacing * 0.85, 3), "probability": 0.9})
+        clock += spacing
+    return words
+
+
+def test_two_unrelated_hindi_words_are_not_a_match():
+    """The romanization-repair folds must not run on native script.
+
+    `phonetic()` keeps only ASCII, so on two Devanagari tokens it compares "" to
+    "" — which scored every pair of unrelated Hindi words 0.85, above the run
+    threshold. Reading the native script without this guard would have made the
+    matcher cut on nothing at all.
+    """
+    from backend.asr.retakes import normalise
+    assert token_similarity(normalise("दोस्तों"), normalise("कमरे")) == 0.0
+    assert token_similarity(normalise("नहीं"), normalise("नहीं")) == 1.0
+
+
+def test_a_matra_is_not_stripped_from_a_hindi_token():
+    r"""`\w` excludes combining marks, so the old normaliser turned नहीं into नह
+    — merging a negation with unrelated words the matcher must keep apart."""
+    from backend.asr.retakes import normalise
+    assert normalise("नहीं") == "नहीं"
+
+
+def test_a_repeat_the_romanization_spells_two_ways_is_still_caught():
+    """One sentence said twice, romanized inconsistently the second time.
+
+    Reading `word`, the two takes share too few tokens to match and the repeat
+    plays twice in the finished edit. Reading `word_native`, they are identical.
+    """
+    said = [("सब", "sab"), ("आपको", "aapako"), ("जज", "jaj"), ("कर", "kar"),
+            ("रहे", "rahe"), ("हैं", "hain")]
+    # the retry: same words, a romanizer that spelled three of them differently
+    retry = [("सब", "sub"), ("आपको", "apko"), ("जज", "jaz"), ("कर", "karr"),
+             ("रहे", "rahen"), ("हैं", "hai")]
+    planned = apply_retakes(_bilingual(said + retry))
+    cut = [w for w in planned if w.get("disfluency")]
+    assert len(cut) == len(said), "the first take should have been cut whole"
+    assert all(w.get("reason") in ("retake", "false_start") for w in cut)
+
+
+def test_the_filler_vocabulary_still_reads_the_romanization():
+    """HARD_FILLERS is written in Latin letters, so the filler rule must keep
+    reading the romanized spelling even though the repeat rules do not."""
+    words = _bilingual([("उम", "um"), ("दोस्तों", "dosto")])
+    out = analyze_disfluencies(words)
+    assert out[0]["disfluency"] and out[0]["reason"] == "filler"
+    assert not out[1]["disfluency"]
+
+
+def test_a_repeated_grammatical_frame_is_not_a_retake():
+    """Hindi lists repeat their frame — "…गया हो या फिर…" after every item. A
+    short match made only of such frame words is grammar recurring, not the
+    speaker restarting: cutting one copy tore "gaya ho ya phir" out of the
+    middle of a list and left "daag lag joota fat"."""
+    words = _words("shirt pe kuch daag lag gaya ho ya phir joota fat gaya ho "
+                   "ya phir baal kharab ho ya phir aisa kuch bhi")
+    apply_retakes(words)
+    assert not any(w.get("disfluency") for w in words)
+    assert not any(w.get("candidate") for w in words)
+
+
+def test_a_short_match_with_a_content_word_is_still_a_retake():
+    """One content word is what separates a restart from a recurring frame."""
+    words = _words("dosto kya ap dosto kya apko pata hai india me ek jagah hai")
+    apply_retakes(words)
+    assert any(w.get("disfluency") or w.get("candidate") for w in words[:3])
+
+
+def test_a_retake_is_seen_across_a_script_flip():
+    """Whisper writes the same name in Devanagari in one take and Latin in the
+    next ("थॉमल गिल्गोविच" / "Thommel Gilgovich"); on native spellings those
+    score zero and the doubled telling survived every structural pass. When the
+    scripts differ, the romanized forms are the common ground."""
+    words = []
+    clock = 0.0
+    for token, hinglish in [
+        ("उनका", "unka"), ("नाम", "naam"), ("था", "tha"),
+        ("थॉमल", "thomal"), ("गिल्गोविच", "gilgovich"),
+        ("उनका", "unka"), ("नाम", "naam"), ("था", "tha"),
+        ("Thommel", "Thommel"), ("Gilgovich", "Gilgovich"),
+        ("Kenneth", "Kenneth"), ("Savitsky", "Savitsky"),
+    ]:
+        words.append({"word": hinglish, "word_native": token, "hinglish": hinglish,
+                      "start": round(clock, 3), "end": round(clock + 0.3, 3),
+                      "probability": 0.99})
+        clock += 0.35
+    # "उनका नाम था थॉमल गिल्गोविच" should match its Latin retry "Thommel naam
+    # tha Thommel Gilgovich ..." well enough that the earlier copy is at least
+    # a candidate.
+    retakes = find_retakes(words)
+    assert retakes, "the cross-script doubled naming must be seen"
+    assert retakes[0].start == 0

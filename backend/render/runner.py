@@ -109,6 +109,24 @@ async def render_timeline_async(
 
         pattern_time = re.compile(r"out_time_ms=(\d+)")
 
+        # stderr has to be drained WHILE stdout is read. A chatty filter (libass
+        # warning about every font it scans, a decoder complaining per frame)
+        # fills the 64KB pipe long before the render ends, and FFmpeg then
+        # blocks on its next write — at frame 0, for ever, with no error.
+        stderr_chunks: list = []
+
+        async def drain_stderr() -> None:
+            while True:
+                chunk = await proc.stderr.read(65536)
+                if not chunk:
+                    break
+                stderr_chunks.append(chunk)
+                # Keep the tail only; a failure message is what matters.
+                if len(stderr_chunks) > 64:
+                    del stderr_chunks[:32]
+
+        drain = asyncio.create_task(drain_stderr())
+
         while True:
             line = await proc.stdout.readline()
             if not line:
@@ -124,7 +142,9 @@ async def render_timeline_async(
                 except Exception as e:
                     logger.warning(f"Progress callback error: {e}")
 
-        stdout, stderr = await proc.communicate()
+        await drain
+        await proc.wait()
+        stderr = b"".join(stderr_chunks)
     finally:
         if script_path:
             try:

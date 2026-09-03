@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Set
 from .align import find_unvoiced_speech, repair_word_timings
 from .disfluency import analyze_disfluencies
 from .retakes import apply_retakes
+from .tokens import spoken
 from .vad import SpeechMap, analyse_speech
 
 logger = logging.getLogger("fumble_engine")
@@ -122,7 +123,9 @@ async def _second_fluency_pass(words: List[Dict[str, Any]]) -> Set[int]:
         return set()
     try:
         decided = await plan_fluent_cuts([words[i] for i in live],
-                                         lm_studio_client.clean_transcript)
+                                         lm_studio_client.clean_transcript,
+                                         ask_json=getattr(lm_studio_client,
+                                                          "ask_with_schema", None))
     except Exception as e:
         logger.warning(f"Second fluency pass failed ({e}); keeping the first answer.")
         return set()
@@ -140,8 +143,36 @@ async def _second_fluency_pass(words: List[Dict[str, Any]]) -> Set[int]:
     return {live[position] for position in admissible_repair_cuts(tokens, proposed)}
 
 
+def _span_planner_enabled() -> bool:
+    """Whether the fluency pass asks the model to name the runs to delete.
+
+    On by default. The alternative is the older contract, where the model
+    rewrites the transcript and the removals are recovered by diffing — kept
+    reachable because it is what every existing measurement was taken against,
+    so turning this off is how the two are compared on the same footage. Set the
+    `span_planner` app setting to false to do that.
+    """
+    try:
+        from store.app_settings import AppSettings
+        value = AppSettings().get("span_planner")
+        return True if value is None else bool(value)
+    except Exception:
+        return True
+
+
 def _norm_token(w: Dict[str, Any]) -> str:
-    return re.sub(r"[^\w]", "", str(w.get("word", w.get("text", ""))), flags=re.UNICODE).lower()
+    r"""The comparison key for the repeat rules — the SPOKEN script, normalised.
+
+    `_long_repeats` matches verbatim and `_sweep_stutters` matches exactly, so
+    both are only as good as the spelling they read. On the romanization they
+    were reading a spelling that drifts between two takes of the same sentence
+    ("jaj"/"jaz", "notice"/"notis", "dil"/"deel"/"reel"), which is precisely the
+    case they exist to catch, so the repeat played twice in the finished edit.
+    The native script does not drift. `fluency.normalise` is used rather than a
+    local `\w` strip because `\w` drops Devanagari combining vowel signs.
+    """
+    from .fluency import normalise
+    return normalise(spoken(w))
 
 
 def _sweep_stutters(words: List[Dict[str, Any]]) -> None:
@@ -152,12 +183,15 @@ def _sweep_stutters(words: List[Dict[str, Any]]) -> None:
     removes words has to be followed by this, because the stutter rule that ran
     earlier could not see a repetition the edit had not made yet.
     """
+    from .disfluency import is_reduplication
+
     previous: Optional[Dict[str, Any]] = None
     for word in words:
         if word.get("disfluency"):
             continue
         text = _norm_token(word)
-        if text and previous is not None and _norm_token(previous) == text:
+        if (text and previous is not None and _norm_token(previous) == text
+                and not is_reduplication(spoken(previous), spoken(word), text)):
             previous["disfluency"] = True
             previous["reason"] = "stutter"
         previous = word
@@ -329,18 +363,47 @@ async def refine_disfluencies(
     # surviving take and left a stitched-together fragment nobody said. So the
     # model is asked directly, and where it answers, it wins.
     fluent_cuts = None
+    # The model's own reason per cut index, which only the span contract can
+    # supply — a rewritten transcript says what to remove but never why.
+    fluent_reasons: Dict[int, str] = {}
     if use_llm:
         try:
             from llm.client import lm_studio_client
             from .fluency import plan_fluent_cuts
             fluent_cuts = await plan_fluent_cuts(words, lm_studio_client.clean_transcript,
-                                                 stats=report.fluency_windows)
+                                                 stats=report.fluency_windows,
+                                                 reasons=fluent_reasons,
+                                                 use_spans=_span_planner_enabled(),
+                                                 ask_json=getattr(lm_studio_client,
+                                                                  "ask_with_schema", None))
         except Exception as e:
             logger.warning(f"Fluency pass unavailable ({e}); structure decides alone.")
             fluent_cuts = None
 
     if fluent_cuts is not None:
         report.used_fluency = True
+        # The structural cuts grouped into attempt runs — cut words with any
+        # other cut word transparent, since a flounder is full of "[uh]"s. A
+        # model verdict may only RESTORE words in a run it cut nothing of: a
+        # model that named part of a run as debris has agreed the region is a
+        # flounder and merely drawn a sloppy boundary, and restoring the words
+        # it did not name splices a fragment of the abandoned attempt into the
+        # edit — measured on the real recording as "उन्होंने सारे बच्चों को ए
+        # सा जिस पे का photo", a sentence nobody said.
+        run_of: Dict[int, int] = {}
+        run_count = -1
+        run_open = False
+        for index, word in enumerate(words):
+            if word.get("disfluency") and word.get("reason") in ("retake", "false_start"):
+                if not run_open:
+                    run_count += 1
+                    run_open = True
+                run_of[index] = run_count
+            elif not word.get("disfluency"):
+                run_open = False
+        runs_the_model_cut = {run_of[index] for index, cut in fluent_cuts.items()
+                              if cut and index in run_of}
+
         restored = 0
         for index, word in enumerate(words):
             # Absent from the map = the model never ruled on this word (its
@@ -355,10 +418,17 @@ async def refine_disfluencies(
                 word["disfluency"] = True
                 word["candidate"] = False
                 if word.get("reason") not in ("retake", "false_start"):
-                    word["reason"] = "not_fluent"
-            elif word.get("disfluency") and word.get("reason") in ("retake", "false_start"):
+                    # The model's own reason when it gave one, which is both more
+                    # specific than "not_fluent" and the thing the transcript
+                    # panel shows the user when they judge whether to put the
+                    # word back. Under the rewrite contract there is none.
+                    word["reason"] = fluent_reasons.get(index) or "not_fluent"
+            elif (word.get("disfluency")
+                  and word.get("reason") in ("retake", "false_start")
+                  and run_of.get(index) not in runs_the_model_cut):
                 # Structure wanted this gone; the model read the sentence and
-                # kept it. The model is the one that can see meaning.
+                # kept it — all of it, not a leftover slice of it. The model is
+                # the one that can see meaning.
                 word["disfluency"] = False
                 word["candidate"] = False
                 # And the reason goes with it. A kept word carrying "retake"
@@ -369,11 +439,17 @@ async def refine_disfluencies(
         logger.info("Fluency: ruled on %d words, %d cut, %d structural cuts overruled",
                     len(fluent_cuts), sum(1 for v in fluent_cuts.values() if v), restored)
 
-        # Second pass over what survived. The first pass reads a transcript full
-        # of abandoned attempts and filler; with those gone the remaining text is
-        # clean enough that a repetition still sitting in it stands out. Cuts
-        # only — a second opinion may tighten the edit, never reopen it.
-        extra = await _second_fluency_pass(words)
+        # Second pass over what survived — but only under the rewrite contract,
+        # where the first pass judged a transcript still full of debris and a
+        # cleaner read genuinely finds more. A span answer already stated its
+        # removals directly; asking again invites the model to keep "improving"
+        # text it has already approved, and the small-shapes sieve is porous to
+        # that: measured on the real recording, a second span-mode pass peppered
+        # 43 word-level holes into sentences the first pass had settled. The
+        # final read still tightens the finished edit, under narrower guards.
+        extra = set()
+        if not report.fluency_windows.get("spans"):
+            extra = await _second_fluency_pass(words)
         if extra:
             for index in extra:
                 words[index]["disfluency"] = True

@@ -113,3 +113,42 @@ def test_language_choice_keeps_a_clear_english_or_other_win():
     assert choose_language({"de": 0.7, "en": 0.2}) == "de"
     assert choose_language({"hi": 0.8, "en": 0.15}) == "hi"
     assert choose_language({}) == "en"
+
+
+def test_hindi_reduplication_is_not_a_stutter():
+    """"अपने-अपने काम" doubles the word on purpose — cutting one copy turned
+    "वो सब अपने-अपने काम पर हैं" into "वो सब काम हो". The ASR's own hyphen and
+    a vocabulary of words Hindi routinely doubles both protect the pair."""
+    from asr.disfluency import analyze_disfluencies
+    words = [
+        {"word": "sab", "word_native": "सब", "start": 0.0, "end": 0.3, "probability": 0.99},
+        {"word": "apne", "word_native": "अपने", "start": 0.35, "end": 0.6, "probability": 0.99},
+        {"word": "-apne", "word_native": "-अपने", "start": 0.62, "end": 0.9, "probability": 0.99},
+        {"word": "kaam", "word_native": "काम", "start": 0.95, "end": 1.2, "probability": 0.99},
+        {"word": "par", "word_native": "पर", "start": 1.25, "end": 1.5, "probability": 0.99},
+    ]
+    out = analyze_disfluencies(words)
+    assert not any(w.get("disfluency") for w in out)
+
+
+def test_a_plain_doubled_word_is_still_a_stutter():
+    from asr.disfluency import analyze_disfluencies
+    words = [
+        {"word": "dosto", "word_native": "दोस्तो", "start": 0.0, "end": 0.3, "probability": 0.99},
+        {"word": "dosto", "word_native": "दोस्तो", "start": 0.35, "end": 0.6, "probability": 0.99},
+        {"word": "kya", "word_native": "क्या", "start": 0.65, "end": 0.9, "probability": 0.99},
+    ]
+    out = analyze_disfluencies(words)
+    assert out[0].get("disfluency") and out[0].get("reason") == "stutter"
+    assert not out[1].get("disfluency")
+
+
+def test_the_sweep_leaves_reduplication_alone_too():
+    from asr.fumble_engine import _sweep_stutters
+    words = [
+        {"word": "dheere", "word_native": "धीरे", "start": 0.0, "end": 0.3},
+        {"word": "dheere", "word_native": "धीरे", "start": 0.35, "end": 0.6},
+        {"word": "chalo", "word_native": "चलो", "start": 0.65, "end": 0.9},
+    ]
+    _sweep_stutters(words)
+    assert not any(w.get("disfluency") for w in words)

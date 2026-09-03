@@ -4,8 +4,43 @@ import {
   getComfyUIStatus, triggerThumbnail, triggerCaptions,
   startPresentationPass, getPresentationStatus, getProject, getTimeline,
   listGenerationWorkflows, updateAppSettings, WorkflowInfo,
-  getShotPlan, ShotPrompt,
+  getShotPlan, ShotPrompt, setProjectScript, getProjectScript, ScriptStatus,
+  listStyleProfiles, StyleProfile,
 } from '../hooks/api';
+
+/** The dressing layers the pass adds on top of the cut (presentation/models.py
+    PresentationSettings). Each is one switch sent as-is to the backend. */
+const DRESSING_OPTIONS: [string, string, string][] = [
+  ['music', 'Music bed + ambience', 'A bed from data/music/<genre>/ (or a synthesised drone for horror), ducked under the voice; wind/room tone under it'],
+  ['sfx', 'Sound effects', 'Whooshes on cutaways, pops on text, stingers/thunder/risers at the story\'s hits'],
+  ['cards', 'Text cards', 'Chapter titles, stat call-outs, location/date, character, source, definition and quote cards read from what the speaker says'],
+  ['maps', 'Maps', 'A map cutaway for each place named (offline Natural Earth data)'],
+  ['moods', 'Moods + hits', 'Per-topic grade shifts and pushes; flash/shake/thunder at the key moment in horror and true crime'],
+  ['structure', 'Story structure', 'Acts weigh the B-roll density; the cold open plays the most gripping line first; chapters and listing are written'],
+  ['grade', 'Genre grade + transitions', 'A master grade for the genre and a transition at each chapter boundary'],
+  ['verify', 'Verify the result', 'Text off the face, cards not stacked, bed ducked, loudness on target'],
+];
+
+/** Video genres the backend can style prompts for (presentation/genre.py).
+    '' means "detect it from the transcript". */
+const GENRE_OPTIONS: [string, string][] = [
+  ['', 'Auto-detect from transcript'],
+  ['horror', 'Horror'],
+  ['true_crime', 'True crime'],
+  ['comedy', 'Comedy'],
+  ['gaming', 'Gaming'],
+  ['tech', 'Tech'],
+  ['science_education', 'Science / Education'],
+  ['finance', 'Finance / Business'],
+  ['motivational', 'Motivational'],
+  ['health_fitness', 'Health / Fitness'],
+  ['cooking', 'Cooking / Food'],
+  ['travel', 'Travel'],
+  ['devotional', 'Devotional'],
+  ['news', 'News'],
+  ['vlog', 'Vlog / Lifestyle'],
+  ['general', 'General (no styling)'],
+];
 
 /** The generation jobs a workflow can be assigned to. */
 const ROLE_LABELS: [string, string, string][] = [
@@ -27,6 +62,22 @@ export default function AgentPanel() {
   // gap and budget from this one knob; it hard-caps at 80% server-side too.
   const [coverage, setCoverage] = useState(75);
   const [zoomDepth, setZoomDepth] = useState(10);
+  // The video's category. Styles every generated prompt (B-roll + thumbnail)
+  // to match — horror imagery for a horror video. '' lets the backend detect it.
+  const [genre, setGenre] = useState('');
+  const [dressing, setDressing] = useState<Record<string, boolean>>(
+    () => Object.fromEntries(DRESSING_OPTIONS.map(([key]) => [key, true])));
+  const [voicePreset, setVoicePreset] = useState('clean');
+  const [pip, setPip] = useState('auto');
+  const [bilingual, setBilingual] = useState('auto');
+  const [styleProfile, setStyleProfile] = useState('');
+  const [styleProfiles, setStyleProfiles] = useState<StyleProfile[]>([]);
+  useEffect(() => {
+    listStyleProfiles().then((res) => setStyleProfiles(res.profiles || [])).catch(() => {});
+  }, []);
+  const [scriptText, setScriptText] = useState('');
+  const [scriptStatus, setScriptStatus] = useState<ScriptStatus | null>(null);
+  const [scriptBusy, setScriptBusy] = useState(false);
   const [lastReport, setLastReport] = useState<any>(null);
   // The "Prompts used" tab: the text that produced each generated shot.
   const [showPrompts, setShowPrompts] = useState(false);
@@ -103,9 +154,28 @@ export default function AgentPanel() {
     setProgress(0, startMsg);
     setLastReport(null);
     try {
+      // `grade` covers the master grade and the chapter transitions; `structure`
+      // covers acts, the cold open and the listing; `cards` and `maps` share
+      // the entity pass. Everything else is one switch each.
+      const dressingSettings = {
+        music: dressing.music, ambience: dressing.music,
+        sfx: dressing.sfx,
+        cards: dressing.cards,
+        maps: dressing.maps,
+        moods: dressing.moods,
+        structure: dressing.structure, cold_open: dressing.structure, metadata: dressing.structure,
+        grade: dressing.grade ? 'auto' : 'off', topic_transitions: dressing.grade,
+        verify: dressing.verify,
+        voice_preset: voicePreset,
+        pip,
+        captions_bilingual: bilingual,
+        style_profile: styleProfile || null,
+      };
       const start = await startPresentationPass(project.id, {
         target_coverage: coverage / 100,
         zoom_depth: zoomDepth / 100,
+        genre: genre || null,
+        ...dressingSettings,
         ...settings,
       });
       const jobId = start?.job_id;
@@ -138,7 +208,32 @@ export default function AgentPanel() {
     } finally {
       setProcessing(false);
     }
-  }, [project, updateProject, setProcessing, setProgress, setError, coverage, zoomDepth]);
+  }, [project, updateProject, setProcessing, setProgress, setError, coverage, zoomDepth, genre,
+      dressing, voicePreset, pip, bilingual, styleProfile]);
+
+  // The speaker's script: shown when the project has one, aligned on demand.
+  useEffect(() => {
+    if (!project) { setScriptStatus(null); setScriptText(''); return; }
+    getProjectScript(project.id)
+      .then((status) => { setScriptStatus(status); if (status.text) setScriptText(status.text); })
+      .catch(() => setScriptStatus(null));
+  }, [project?.id]);
+
+  const handleAlignScript = async () => {
+    if (!project || !scriptText.trim()) return;
+    setScriptBusy(true);
+    try {
+      const status = await setProjectScript(project.id, scriptText);
+      setScriptStatus(status);
+      // The words' spelling changed; pull the timeline so the transcript panel shows it.
+      const tl = await getTimeline(project.id);
+      updateProject({ timeline: tl } as any);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setScriptBusy(false);
+    }
+  };
 
   const handleFullAgentEdit = () => {
     // The backend refuses (503) a pass that wants pictures nothing can make;
@@ -277,6 +372,16 @@ export default function AgentPanel() {
           Burn-in Styled Captions
         </label>
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 12 }}
+          title="Styles every generated image and the thumbnail to the kind of video this is — a horror video gets horror imagery. Auto-detect reads it from the transcript.">
+          <span style={{ minWidth: 100, color: '#bac2de' }}>Video genre</span>
+          <select value={genre} onChange={(e) => setGenre(e.target.value)}
+            style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
+            {GENRE_OPTIONS.map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+        </label>
+        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 12 }}
           title="How much of the video is covered by generated B-roll. Gaps and budgets are derived from this one number.">
           <span style={{ minWidth: 100, color: '#bac2de' }}>B-roll coverage</span>
           <input type="range" min={0} max={80} step={5} value={coverage}
@@ -290,6 +395,79 @@ export default function AgentPanel() {
             onChange={(e) => setZoomDepth(Number(e.target.value))} style={{ flex: 1 }} />
           <span style={{ minWidth: 34, textAlign: 'right' }}>{zoomDepth}%</span>
         </label>
+        <div style={{ borderTop: '1px solid #313244', paddingTop: '10px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          <span style={{ fontSize: 12, color: '#a6adc8' }}>Dressing (added on top of the cut, all editable afterwards)</span>
+          {DRESSING_OPTIONS.map(([key, label, hint]) => (
+            <label key={key} title={hint}
+              style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: 12 }}>
+              <input type="checkbox" checked={dressing[key]}
+                onChange={(e) => setDressing({ ...dressing, [key]: e.target.checked })} />
+              {label}
+            </label>
+          ))}
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 12 }}
+            title="Denoise, de-ess and compress the voice, then normalise the mix to -14 LUFS (YouTube's level).">
+            <span style={{ minWidth: 100, color: '#bac2de' }}>Voice</span>
+            <select value={voicePreset} onChange={(e) => setVoicePreset(e.target.value)}
+              style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
+              <option value="clean">Clean (denoise + light compression)</option>
+              <option value="podcast">Podcast (fuller compression)</option>
+              <option value="horror_intimate">Horror intimate (close, compressed)</option>
+              <option value="light">Light touch</option>
+              <option value="off">Off (leave the audio alone)</option>
+            </select>
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 12 }}
+            title="The speaker in the top-right corner over cutaways longer than 4 s. Auto: explainer genres only (horror keeps its pictures alone).">
+            <span style={{ minWidth: 100, color: '#bac2de' }}>Speaker corner</span>
+            <select value={pip} onChange={(e) => setPip(e.target.value)}
+              style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
+              <option value="auto">Auto (explainers)</option>
+              <option value="on">Always</option>
+              <option value="off">Never</option>
+            </select>
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 12 }}
+            title="A smaller English line under each caption. Auto: Hindi and other Indic projects when a model can translate.">
+            <span style={{ minWidth: 100, color: '#bac2de' }}>English line</span>
+            <select value={bilingual} onChange={(e) => setBilingual(e.target.value)}
+              style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
+              <option value="auto">Auto (Indic projects)</option>
+              <option value="on">Always</option>
+              <option value="off">Never</option>
+            </select>
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 12 }}
+            title="Edit like this channel: a reference video analysed in the Style panel. Its look and transitions win over the genre's; its motion only when auto zoom is off.">
+            <span style={{ minWidth: 100, color: '#bac2de' }}>Style profile</span>
+            <select value={styleProfile} onChange={(e) => setStyleProfile(e.target.value)}
+              style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
+              <option value="">None (genre look)</option>
+              {styleProfiles.map((p) => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div style={{ borderTop: '1px solid #313244', paddingTop: '10px' }}>
+          <label style={{ fontSize: '12px', color: '#bac2de', display: 'block', marginBottom: '4px' }}
+            title="Paste the script you read from. Its spelling replaces Whisper's in the captions, its paragraphs become the chapters, and bracketed directions become beats: [map: Jaipur] [sfx: thunder] [broll: an old haveli at night] [text: 40% of students] [stat: 25%] [chapter: The Knock] [quote: … | who] [mood: tense] [title: …]. A line starting with # is a chapter heading.">
+            Script (optional)
+            {scriptStatus?.status === 'aligned' && (
+              <span style={{ color: '#a6e3a1', marginLeft: 8 }}>
+                aligned {scriptStatus.aligned_words}/{scriptStatus.token_count} words · {scriptStatus.spelling_fixed} spellings fixed · {scriptStatus.directives?.length ?? 0} directions
+              </span>
+            )}
+          </label>
+          <textarea value={scriptText} onChange={(e) => setScriptText(e.target.value)}
+            placeholder={'# The Haveli\nRaat ke do baje the... [map: Jaipur]\n\nAchanak darwaza khula. [sfx: thunder]'}
+            rows={5}
+            style={{ width: '100%', padding: '8px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px', fontFamily: 'inherit', fontSize: 12, resize: 'vertical' }} />
+          <button className="btn btn-sm" onClick={handleAlignScript} disabled={scriptBusy || !scriptText.trim()}
+            style={{ marginTop: 4 }}>
+            {scriptBusy ? 'Aligning…' : 'Align script to transcript'}
+          </button>
+        </div>
         <div style={{ marginTop: '8px' }}>
           <label style={{ fontSize: '12px', color: '#bac2de', display: 'block', marginBottom: '4px' }}>Thumbnail Custom Title:</label>
           <input
@@ -390,6 +568,7 @@ function PassReport({ report }: { report: any }) {
   // at less than half of what was asked for.
   const bad = failed > 0 || (target > 0 && achieved < 0.5 * target);
   const rows: [string, string][] = [
+    ['Video genre', report.genre || 'general'],
     ['Beats planned', String(report.beats_planned ?? 0)],
     ['B-roll placed', String(report.broll_placed ?? 0)],
     ['Placement rejected', String(rejected)],
@@ -401,7 +580,24 @@ function PassReport({ report }: { report: any }) {
       + (report.zooms_suppressed_by_broll ? ` (${report.zooms_suppressed_by_broll} under B-roll)` : '')],
     ['Pop-ups', String(report.popups_placed ?? 0)],
     ['Captions', String(report.captions ?? 0)],
+    ['Cards', Object.entries(report.cards_placed || {}).map(([k, v]) => `${k.replace(/_/g, ' ')} ${v}`).join(', ') || 'none'],
+    ['Maps', String(report.maps_placed ?? 0)],
+    ['Sound', [report.music_used ? `bed ${report.music_used}` : 'no bed',
+      `${report.sfx_placed ?? 0} effects`,
+      report.ambience_used ? `ambience ${report.ambience_used}` : null,
+      report.voice_preset ? `voice ${report.voice_preset}` : null].filter(Boolean).join(' · ')],
+    ['Look', [report.grade_applied ? `grade ${report.grade_applied}` : null,
+      report.atmosphere_applied ? `atmosphere ${report.atmosphere_applied}` : null,
+      `${report.topic_transitions ?? 0} chapter transitions`].filter(Boolean).join(' · ')],
+    ['Story', [(report.acts || []).length ? `acts ${report.acts.join(' → ')}` : null,
+      (report.moods || []).length ? `moods ${report.moods.join(', ')}` : null,
+      report.cold_open ? `cold open "${String(report.cold_open.text || '').slice(0, 40)}" (${report.cold_open.seconds}s)` : 'no cold open',
+      `${report.mood_hits ?? 0} hits`].filter(Boolean).join(' · ')],
+    ['Script', report.script_aligned_words
+      ? `${report.script_aligned_words} words aligned, ${report.script_spelling_fixed} spellings fixed, ${report.script_directives} directions`
+      : 'none'],
   ];
+  const failedChecks = (report.verification || []).filter((c: any) => !c.ok);
   return (
     <div style={{ background: '#181825', padding: '14px', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
       <h4 style={{ margin: 0, color: '#a6adc8' }}>Last Pass</h4>
@@ -439,6 +635,19 @@ function PassReport({ report }: { report: any }) {
             <div key={i}>· {f.beat_id}: {f.reason}</div>
           ))}
         </details>
+      )}
+      {failedChecks.length > 0 && (
+        <div style={{ background: '#78350f', color: '#fde68a', padding: '8px 10px', borderRadius: '6px', fontSize: 12 }}>
+          {failedChecks.map((c: any) => (
+            <div key={c.name}>⚠ {c.name.replace(/_/g, ' ')}: {c.detail}</div>
+          ))}
+        </div>
+      )}
+      {(report.verification?.length ?? 0) > 0 && failedChecks.length === 0 && (
+        <span style={{ fontSize: 11, color: '#a6e3a1' }}>
+          All {report.verification.length} checks passed
+          {(() => { const l = report.verification.find((c: any) => c.name === 'loudness'); return l?.value != null ? ` · ${l.value} LUFS` : ''; })()}
+        </span>
       )}
       {(report.degraded?.length ?? 0) > 0 && (
         <span style={{ fontSize: 11, color: '#f59e0b' }}>

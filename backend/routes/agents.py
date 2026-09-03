@@ -19,6 +19,28 @@ class AgentJobRequest(BaseModel):
     generate_thumbnail: bool = True
     burn_captions: bool = True
     title: Optional[str] = None
+    genre: Optional[str] = None
+
+
+def _project_genre(req: AgentJobRequest, project: Project, project_dir) -> str:
+    """The genre to style a standalone thumbnail with: the caller's choice,
+    else what the last presentation pass detected, else the transcript's own
+    words. Never raises — an unknown genre just styles nothing."""
+    from presentation.genre import keyword_genre, normalise
+    if req.genre:
+        return normalise(req.genre)
+    try:
+        import json
+        plan = json.loads((project_dir / "shot_plan.json").read_text(encoding="utf-8"))
+        if plan.get("genre"):
+            return normalise(plan["genre"])
+    except Exception:
+        pass
+    try:
+        segments = project.transcript.segments if project.transcript else []
+        return keyword_genre(" ".join(s.text for s in segments))
+    except Exception:
+        return "general"
 
 @router.post("/full_edit")
 async def full_auto_edit(req: AgentJobRequest):
@@ -48,7 +70,9 @@ async def generate_thumbnail(req: AgentJobRequest):
     project_dir = PROJECTS_DIR / req.project_id
 
     try:
-        thumb_path = await thumbnail_agent.generate_thumbnail(project, project_dir, title=req.title)
+        thumb_path = await thumbnail_agent.generate_thumbnail(
+            project, project_dir, title=req.title,
+            genre=_project_genre(req, project, project_dir))
         return {"status": "completed", "thumbnail_path": thumb_path}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

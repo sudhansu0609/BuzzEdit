@@ -13,7 +13,9 @@ class ThumbnailAgent:
     def __init__(self, queue_manager: Optional[ComfyUIQueueManager] = None):
         self.queue_manager = queue_manager or ComfyUIQueueManager()
 
-    async def generate_thumbnail(self, project: Project, project_dir: Path, title: Optional[str] = None) -> str:
+    async def generate_thumbnail(self, project: Project, project_dir: Path,
+                                 title: Optional[str] = None,
+                                 genre: Optional[str] = None) -> str:
         thumbnail_path = project_dir / "thumbnail.jpg"
         keyframe_path = project_dir / "keyframe.jpg"
 
@@ -32,7 +34,11 @@ class ThumbnailAgent:
         ])
 
         display_title = title or project.name.split('.')[0].replace('_', ' ').replace('-', ' ').title()
-        prompt = f"Eye-catching YouTube thumbnail, title '{display_title}', dramatic high contrast lighting, 4k"
+        # Style the thumbnail to the video's genre — a horror video gets a
+        # horror thumbnail, not the generic "dramatic lighting" one.
+        from presentation.genre import style_for
+        style = style_for(genre).thumbnail
+        prompt = f"Eye-catching YouTube thumbnail, title '{display_title}', {style}, 4k"
 
         try:
             workflow = prepare_thumbnail_workflow(prompt=prompt, output_prefix=f"thumb_{project.id}")

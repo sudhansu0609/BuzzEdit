@@ -1,6 +1,57 @@
 # The Presentation Pass ("Director") — Architecture & Implementation Plan
 
-**Status: NOT STARTED.** Written 2026-08-14 against the working tree at that date.
+**Status: IMPLEMENTED** (`backend/presentation/`, covered by `test_presentation.py` /
+`test_facezoom.py`). Written 2026-08-14 against the working tree at that date; the
+sections below are the original design and remain the reference for intent.
+
+**Addendum 2026-08-25 — hiding the jump cuts.** The auto-edit's V1 joins are visible
+jumps (verified frame-by-frame on real footage: adjacent takes differ by a lean or a
+hand move), and two changes make the pass hide them:
+
+1. **Cutaways slide onto the joins** (`placement.jump_cut_times`,
+   `_shift_to_cover_cuts`). Each B-roll window shifts, within its beat (±0.5s slack),
+   to straddle the nearest V1 join with ≥0.35s cover either side — the switch to
+   B-roll and back then happens inside continuous takes and the join underneath is
+   never seen. The word-boundary snap stays as the fallback when no join is in reach.
+   `placement.jump_cut_coverage` reports `jump_cuts_total` / `jump_cuts_covered` into
+   `PresentationReport`.
+2. **Every segment zoom pushes IN** (`facezoom.plan_zooms`, and the same change in
+   `timeline.ops.apply_auto_zoom`). Each clip starts wide and drifts tighter, so every
+   join steps back to wide by the whole depth — a punch-out, the standard disguise for
+   a talking-head jump cut. The old alternation made scale CONTINUOUS across every join
+   (a push-in ends at 1+d exactly where the next pull-back starts) and the jump played
+   bare. Depth is jittered per segment (seeded) so the rhythm is not mechanical, and
+   since every move resets to wide nothing ratchets.
+
+**Addendum 2026-08-25 (later) — captions that match the voice, and text accents.**
+
+- **Native-script captions** (`timeline.authoring.generate_captions(script=...)`,
+  resolved by `caption_script_for`): the romanizer writes "lie" for "लिए" and
+  "teeshart" for "टीशर्ट", so romanized captions read as *not what the voice said*.
+  For Indic-language projects the captions now default to the spoken script
+  (`caption_script` project setting: auto/native/romanized). Native text swaps in
+  Nirmala UI — the preset Latin faces would draw boxes — and this machine's ffmpeg
+  (8.1 full build) shapes Devanagari correctly in drawtext. Caption timing was
+  measured against a re-transcription of the render: ±0.08s, no drift; the perceived
+  mismatch was spelling, not sync.
+- **Caption cards break at every V1 join** — the ripple glues the two sides of a cut
+  together on the timeline, so by gap alone a card mixed the tail of one sentence
+  with the head of the next while the voice audibly jumped.
+- **Opening title** (`PresentationSettings.title` / `title_preset`, default
+  `overlay_hook`): the thumbnail title pops in over the opening footage via the
+  existing intro system. Card presets (title_card, bold_slam, …) also work and push
+  the programme behind a card.
+- **Guaranteed pop-ups** (`shotplan.topic_popups`): the model plans pop-ups so rarely
+  that zero was the normal case; when it plans none, each topic's name becomes a
+  pop-in label (outside the 3s title zone). Placement prefers a moment with the
+  speaker on screen but draws over the B-roll when the topic's whole span is covered
+  (`placement._first_clear_moment`) — skip-on-collision shipped videos with no
+  pop-ups at 60-75% coverage.
+- **Genre atmosphere** (`PresentationSettings.atmosphere`, default `auto` →
+  `genre.atmosphere_for`): one subtle full-length layer (grain for documentary
+  genres, fog for horror, sunlight for travel/motivational; several genres get
+  none), tagged `origin="presentation"` on `AtmosphereEffect` so re-runs replace it
+  and user-added effects stay.
 
 This document is **self-contained**. A model implementing it needs nothing else: every file
 path, function signature, JSON schema, LLM prompt and tunable constant it depends on is

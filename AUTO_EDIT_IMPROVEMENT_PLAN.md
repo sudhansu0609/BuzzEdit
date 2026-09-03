@@ -1,8 +1,14 @@
 # Auto-Edit: "One Fluent Shot" — Architecture & Improvement Plan
 
-**Status: implemented 2026-08-14.** Everything in §3 is in the working tree and covered
-by tests (`357 passed`). §6 lists what is *not* done — the parts that need a real
-recording and a loaded language model to validate.
+**Status: implemented 2026-08-14; §2.0, §2.1a and §2.3a added 2026-08-21; §2.1b (the
+constrained span contract and its guards) added 2026-08-25 after the first live
+validation runs.** Everything in §3 is in the working tree and covered by tests
+(`543 passed`). §6 records what the live runs measured.
+
+**Start here if the edit looks weak.** Read `warnings` in the report first. A weak edit is
+usually not a threshold that needs tuning: for a long time it was the language model
+silently never running at all (§2.3a), and before that it was every comparison being made
+against a romanization that respells the same word between takes (§2.0).
 
 This document is self-contained. A model reading only this file should be able to work on
 the auto-edit without any other context.
@@ -98,13 +104,52 @@ and finally `enabled = not disfluency`.
 | 3 | Missing fillers | `align.find_unvoiced_speech` + `fumble_engine._filler_word` | Speech regions no word claims = the fillers Whisper deleted. Inserted as `"[uh]"` **words** (`reason="filler_sound"`), so they flow through the timeline rebuild *and* appear in the transcript panel where the user can overrule them. Bounded 0.18–1.2s: anything longer is speech the ASR missed, and cutting it destroys content. |
 | 4 | Text rules | `disfluency.analyze_disfluencies` | Hard fillers (um/uh/hmm + Hindi `aa`, `oo`) → cut. Immediate stutter → cut the earlier copy. Soft fillers / low-confidence micro-tokens → `candidate`. Adjacency is judged on the words that will **survive**, not the raw list. |
 | 5 | Retakes | `retakes.find_retakes` / `apply_retakes` | Speech-repair model: `reparandum → interregnum → repair`. Detects a "rough copy" — an approximate repetition — with fuzzy token matching. ≥0.72 confidence → cut as `retake`; below → `candidate` as `false_start`. Structural, so it is language-independent. |
-| 6 | **Fluency (the model writes the edit)** | `fluency.plan_fluent_cuts` | The authoritative cut layer. See §2.1. |
+| 6 | **Fluency (the model names the cuts)** | `fluency.plan_fluent_cuts` | The authoritative cut layer. Asks the model for the runs to delete, with reasons; falls back per window to the older rewrite-and-diff contract. See §2.1 and §2.1a. |
 | 7 | Adjudication *(fallback only)* | `llm.client.adjudicate_disfluencies` | Runs **only** when fluency returned `None`. Otherwise a deterministic aggressiveness table decides the candidates. |
 | 8 | Stutter sweep | `fumble_engine._sweep_stutters` | Cuts *create* stutters: "kamare men [hol] men gae" reads fine until the cut removes "hol" and leaves "men men". Run after **every** pass that removes words. |
 | 9 | **Best-take selection** | `retakes.choose_best_takes` | Reconsiders "keep the last take". See §3.3. |
 | 10 | **Verification loop** | `verify.verify_until_clean` | Reads the edit back sentence by sentence, repairs, drops abandoned fragments, repeats. See §3.2. |
 | 11 | **The last read** | `fluency.final_read` | One narrow read of the finished edit end to end. See §3.4. |
 | 12 | Timeline rebuild | `timeline.ops.rebuild_primary_tracks` | Turns enabled words into V1/A1 segments. See §2.2. |
+
+### 2.0 Which spelling each pass reads — `backend/asr/tokens.py`
+
+**Every word carries two spellings, and reading the wrong one is what let repeats
+survive.** Whisper decodes Hindi as Devanagari; `transliterate.to_hinglish` then makes a
+romanized copy for the captions, the timeline and the UI.
+
+The romanization is **not stable**. Re-transcribing the reference project's own unchanged
+cut audio and diffing it against the plan scored **0.55 coverage** — not because anything
+was missing, but because the same sounds came back spelled differently: `gayaa` for `gae`,
+`hai` for `hain`, `par` for `pe`, `doston` for `dosto`. Within one transcript it is no
+better: the recording's `jaj` and `jaz` are one word said twice, and `dil`/`deel`/`reel`
+are one word said three times.
+
+Every pass that decides a cut by *comparing* tokens was comparing those. So a sentence the
+speaker plainly said twice read as two different sentences and played twice in the edit.
+
+- **`spoken(word)`** — the native script. What every pass that JUDGES or COMPARES reads:
+  fluency, the grammar audit, the retake matcher, the stutter sweep, `_long_repeats`,
+  `cut_verify`.
+- **`romanized(word)`** — the Latin form. Captions, the timeline's `text`, the forced
+  aligner (MMS aligns on romanization), and the romanized filler vocabularies in
+  `disfluency.py`, which are written in Latin letters and must keep reading Latin.
+
+Two traps, both guarded and both locked in by tests:
+
+1. **`retakes.phonetic` and `retakes.skeleton` are Latin-only by construction.** They exist
+   to repair romanization drift — digraph folds, vowel stripping. `phonetic` keeps only
+   ASCII, so on two Devanagari tokens it compares `""` with `""` and scores **every pair of
+   unrelated Hindi words 0.85**, above the run threshold. `tokens.is_latin` gates both.
+2. **`\w` drops Devanagari combining vowel signs**, so `नहीं` normalised to `नह` — merging a
+   negation with words the matcher must keep apart. Every normaliser now keeps Unicode
+   marks.
+
+**`WordItem.word_native` persists the spoken script through the timeline.** It was being
+dropped at every dict→WordItem conversion, so the "Auto Edit" button — the path a user
+takes when the first cut disappointed them — re-planned from romanized text against prompts
+that state their input is Devanagari, and the Devanagari negations in
+`verify.PROTECTED_WORDS` could never match.
 
 ### 2.1 The fluency pass — `backend/asr/fluency.py`
 
@@ -133,6 +178,113 @@ discarded window once resurrected 81 structural cuts — absence and "keep" are 
   words); a 26B-A4B removed 101 and collapsed a five-attempt pile-up.
   `DEFAULT_MODEL = "gemma-4-26b-a4b-it-ultra-uncensored-heretic"`, overridable via
   `AppSettings["llm_model"]`.
+
+### 2.1a The span contract — `backend/asr/spans.py`
+
+Everything in the four bullets above exists to reconstruct a decision the model already
+made and was never asked to state. The rewrite contract asks for the cleaned *text* and
+recovers the removals by diffing; right-anchored alignment, run snapping and
+`admissible_repair_cuts` are all repairs to that guess.
+
+So the planner now asks for the removals directly. Tokens are numbered, and the answer is a
+list of runs to delete, each with a reason and **the words at its ends quoted back**:
+
+```
+DELETE 12-27 | दोस्तों ... आप | retake
+DELETE 44    | उम              | filler
+NONE
+```
+
+- **The quoted ends are what make an index trustworthy.** The standard objection to
+  index-based output is that models miscount — and here a miscount is *detectable*: the
+  quoted words do not match the tokens the numbers point at. The span is then relocated by
+  searching for the quoted pair at the same length (a miscounted offset is a slip; a
+  floating length would turn it into an arbitrary cut), or refused outright when those words
+  are nowhere in the window. A model describing a transcript it was not given deletes
+  nothing. An index scheme without this check is a guess wearing a number.
+- **Still delete-only.** The model can name a run to remove and nothing else, so a model
+  that paraphrases, translates or hallucinates can only fail to cut.
+- **Reasons come from the model.** `retake` / `filler` / `stutter` / `repeat` land on
+  `WordItem.reason`, which is what the transcript panel shows the user when they judge
+  whether to put a word back. A rewrite says what to remove but never why. Reasons are read
+  off the spans **before** merging: a filler abutting a retake merges into one run, and
+  reading the reason off the merged span would label the "um" a retake.
+- **Trust limits carry over** (`judge_spans`): ≤0.75 of the window deleted, longest run ≤
+  `max(60, 40%)`. `MIN_MATCH_RATIO` does not — there is no rewritten text to have echoed,
+  and every survivor is an original token by construction.
+- **Fallback per window.** Asking for spans does not guarantee getting them.
+  `looks_like_spans` tells a span answer (including a bare `NONE`) from a model that ignored
+  the format and rewrote the transcript; a rewrite is read by the old path rather than
+  mistaken for "nothing to cut here". Both counts ride in `report.fluency_windows`, and
+  `public_report` warns when every window fell back.
+- **`NONE` does not overrule structure — deliberately.** It is a real statement, unlike an
+  echo, so the window is trusted and cuts nothing. Letting it restore that window's
+  structural retakes is the safe direction for the asymmetry rule but the wrong direction
+  for the fault being fixed: one lazy `NONE` puts a whole pile-up of attempts back into the
+  edit. `fluency_windows["none_answers"]` counts how often the model declines, so this is
+  decided on a measurement rather than on the strength of the argument.
+
+`AppSettings["span_planner"] = false` reverts to the rewrite contract, which is how the two
+are compared on the same footage.
+
+### 2.1b What the live runs taught the span contract (2026-08-25)
+
+The first end-to-end runs with a real model (gemma-4-12b, the largest that fits the
+16.3GB card) found that **asking for DELETE lines in prose does not work on a 12B**: it
+ignored the format on every window and rewrote — paraphrased, 6-11% verbatim — so every
+window was discarded and the edit shipped structural-only. The fix and its guards:
+
+- **The span answer is now requested as JSON under LM Studio's `json_schema` response
+  format** (`fluency.SPAN_SCHEMA` + `JSON_SPAN_SYSTEM_PROMPT`, via
+  `client.ask_with_schema`). Constrained decoding is what makes a small model answer in
+  span form at all; the same quoted-ends verification still applies, so the answer is no
+  more *trusted*, just reliably parseable. The prose path remains as the per-window
+  fallback, and `looks_like_spans` needed `re.MULTILINE` — without it a multi-line DELETE
+  answer matched nothing and was misread as a rewrite.
+- **Selective refusal.** Under the rewrite contract one enormous removal discarded the
+  whole window, losing the good cuts with the bad. A span verified its own quoted ends,
+  so an oversized merged run now refuses *that run alone* (`oversized_runs` in the
+  window stats); the rest of the window stands. Refused regions land in
+  `WindowPlan.no_opinion` — never written as keeps, so structure decides there.
+- **End-stretch relocation** (`spans._stretch`): the dominant real miscount is one end
+  verified in place and the other a token or two off; the bad end moves to its quoted
+  word within ±3 tokens. Full relocation at fixed length remains for both-ends-wrong.
+- **The orphan-retake guard** (`fluency._copy_survives`): a span whose reason is
+  `retake` claims a surviving copy exists — and the model once named BOTH attempts at
+  the t-shirt story as retakes, deleting the story from the video entirely, with spans
+  that verified and sizes that were legal. A retake span (≥4 words) whose tail has no
+  rough copy (ratio ≥0.55) in what the window's own plan lets survive is refused into
+  `no_opinion`; the structural decision — which always keeps the last copy — stands.
+- **Partial keeps never restore** (`fumble_engine`): under the span contract "keep" is
+  merely "not named in any deletion". A model that cut *into* a structural retake run
+  has agreed the region is a flounder and drawn a sloppy boundary; restoring the words
+  it did not name spliced fragments like "उन्होंने सारे बच्चों को ए सा जिस पे का photo"
+  into the edit. Restores now apply only in runs the model cut nothing of.
+- **No second fluency pass after a span answer.** A span answer already stated its
+  removals; asking again invites the model to keep improving text it approved — a live
+  second pass peppered 43 word-level holes through the small-shapes sieve. It still
+  runs under the rewrite contract, where the first pass judged debris-laden text.
+- **Data tokens are not debris** (`fluency._data_token`, and the same rule in
+  `verify.repair_deletions`): "%" reads as punctuation but the audio says "percent",
+  and "50" is data — live passes deleted both. Digit-carrying and symbol-only tokens
+  are lifted out of repair deletions and barred from the short-run repair shape.
+- **Hindi reduplication is not a stutter** (`disfluency.is_reduplication`): the sweep
+  cut "अपने -अपने" down to one word and "वो सब अपने-अपने काम पर हैं" lost its meaning.
+  The ASR's own hyphen and a vocabulary of words Hindi routinely doubles protect the
+  pair, in both the first stutter rule and every later sweep.
+- **A repeated grammatical frame is not a retake** (`retakes.FUNCTION_WORDS`): Hindi
+  lists repeat their frame — "…गया हो या फिर…" after every item — and a ≤4-word
+  structural match made only of frame words tore the frame out of the middle of a
+  list. Such matches are skipped; one content word is enough to count as a restart.
+- **Best-take sees the continuation** (`retakes._continuation`): judged in isolation
+  the longest take wins, and a live run swapped in an earlier attempt whose extra words
+  were a dangling "कि आप किसी". The prompt now carries a `then:` line — what the video
+  says immediately after the take — and the chosen take must flow into it. Cut runs are
+  also assembled *through* interleaved filler cuts (`_cut_runs`), which used to break
+  every pile-up at each "[uh]" so no group ever formed.
+- **The final read never cuts the sign-off**: it deleted the speaker's "बाय बाय" as
+  debris. A cut touching the last two words stands only when the word recurs nearby
+  (the remains of a doubled phrase).
 
 ### 2.2 The timeline rebuild — `backend/timeline/ops.py`
 
@@ -169,6 +321,52 @@ The compiler declicks every A1 segment with 8ms `afade` edges.
   check — believing it is why the whole LLM layer silently never ran for weeks.
 - This LM Studio build **rejects `response_format: {"type": "json_object"}`**. Requests ask
   for `json_schema` and fall back to plain text. Every non-200 is logged with its body.
+
+### 2.3a A model that loads is not a model that can serve
+
+The lesson in the bullet above needed one more step, and not taking it cost the same weeks
+a second time. `/api/v0/models` reported `state: loaded`, and it was telling the truth —
+but the model was **larger than the GPU**, so llama.cpp had loaded it partly offloaded and
+it died on the first real prompt:
+
+```
+LM Studio 400 during the fluency pass: {"error":"terminated"}
+Fluency: no answer for words 160-341
+Audit: no answer from the model; edit not verified
+fluency_windows: {'answered': 2, 'failed': 1, 'untrusted': 0}
+```
+
+Measured on the reference machine: `qwen/qwen3.8-27b` is **17.7GB of weights on a 16.3GB
+card**. Every model-driven layer — the fluency pass, the verification loop, best-take, the
+final read — was silently doing nothing, and the edit that shipped was the structural
+fallback. `reasons: {retake: 105, filler_sound: 33, stutter: 2, not_fluent: 1}` on a
+195-second recording: that lone `not_fluent` was the whole contribution of the model.
+
+Two causes, two fixes.
+
+1. **The ASR never let go of the GPU.** Every path runs the ASR and then the model, in one
+   process, and ~3GB of faster-whisper plus ~1.2GB of the MMS aligner stayed resident
+   through all of it. `auto_edit.release_asr_gpu()` — via `whisper_engine.release_gpu()` and
+   `forced_align.release_model()` — is called from `plan_auto_edit` before the model passes.
+   The next transcription reloads in seconds, against model passes that cost minutes.
+
+2. **`lms load` reports success for a model that does not fit.** `lm_launcher.model_sizes()`
+   reads `sizeBytes` from `lms ls --json` (`/api/v0/models` carries state, type, arch and
+   context length, but no size). `_fits` requires `weights × 1.15 + 1GB` — the KV cache and
+   compute buffers are allocated on top of the weights, so fitting the weights alone is not
+   fitting. Checked in two places, because they answer different questions:
+   - **step 2, against TOTAL VRAM** — *can this card ever run this?* A resident model bigger
+     than the card is rejected rather than accepted for being resident;
+   - **step 3, against FREE VRAM** — *can it load right now?*
+
+   Then the largest model that *does* fit is chosen, because capability on this task scales
+   hard with size.
+
+3. **The failure is now reported.** `public_report` says *"the language model never ran, so
+   this is a structural edit only"*. `used_llm: False` in a log is how this hid.
+
+> **When an edit looks weak, check `warnings` in the report before touching a threshold.**
+> A structural-only edit is not a tuning problem.
 
 ---
 
@@ -345,7 +543,9 @@ backend/asr/
   align.py          word-timing repair; unclaimed-speech (missing filler) detection
   disfluency.py     filler vocabulary, stutters, low-confidence candidates
   retakes.py        rough-copy retake detection; phonetic/skeleton folds; choose_best_takes
-  fluency.py        the model writes the edit; align_deletions; admissible_repair_cuts; final_read
+  tokens.py         which spelling each pass reads: spoken() vs romanized() (§2.0)
+  spans.py          the span contract: parse, verify against quoted ends, merge (§2.1a)
+  fluency.py        the model names the edit; span + rewrite contracts; final_read
   verify.py         sentence audit, repair, fragment dropping, verify_until_clean
   fumble_engine.py  runs the stages in order and merges their verdicts (§5)
   transliterate.py  Devanagari → ITRANS → Hinglish (used during transcription, not planning)
@@ -372,6 +572,7 @@ Tunables worth knowing, all with comments explaining the measurement behind them
 | `WINDOW_WORDS`, `OVERLAP_WORDS` | fluency.py | 200, 40 |
 | `MIN_MATCH_RATIO`, `MAX_DELETED_FRACTION`, `MAX_DELETED_RUN_FRACTION` | fluency.py | 0.35, 0.75, 0.40 |
 | `MAX_STUMBLE_WORDS`, `REPEAT_WINDOW` | fluency.py | 4, 15 |
+| `span_planner`, `forced_alignment`, `auto_verify_cut` | AppSettings | on, on, on |
 | `SENTENCE_PAUSE_SECONDS`, `MIN_JUDGED_WORDS` | verify.py | 2.5s, 4 |
 | `MAX_REPAIR_FRACTION`, `MIN_REPAIR_MATCH_RATIO` | verify.py | 0.5, 0.5 |
 | `MAX_FRAGMENT_WORDS`, `MAX_FRAGMENT_FRACTION`, `MAX_VERIFY_ROUNDS` | verify.py | 12, 0.15, 3 |
@@ -415,7 +616,7 @@ bottom:
 
 ## 6. Testing, and what is still open
 
-### Tests (`backend/tests/`, 357 passing)
+### Tests (`backend/tests/`, 497 passing)
 
 | File | Locks in |
 |---|---|
@@ -427,14 +628,54 @@ bottom:
 | `test_verify_loop.py` | **new** — loop convergence, the no-progress stop, fragment-drop guards |
 | `test_fumble_merge.py` | **new** — the §5 precedence with a stand-in model |
 | `test_best_take.py` | **new** — the garbled-final-take swap, and every case it must refuse |
-| `test_cut_coverage.py` | **new** — render-truth check, `admissible_repair_cuts` shapes |
+| `test_cut_coverage.py` | render-truth check, `admissible_repair_cuts` shapes |
+| `test_cut_verify.py` | the cut re-transcribed and diffed against the plan; leak mapping back to source frames |
+| `test_spans.py` | **new** — the span contract: parsing, the quoted-ends check, relocation at fixed length, refusal of invented words, `NONE` as a trusted answer that does not overrule structure |
+| `test_model_fit.py` | **new** — a model larger than the card does not fit; a structural-only edit says so in the report |
 | `test_timeline.py` | the rebuild against Whisper's swallowed silence |
 
 Run: `./.venv/Scripts/python.exe -m pytest backend/tests -q` — **only `.venv` works**;
 neither system Python has `faster_whisper`, so any other interpreter dies importing
 `backend/asr/__init__.py`.
 
-### Not done — needs a real recording and a loaded model
+### Measured 2026-08-25 — six live runs on the real recording
+
+The acceptance runs finally happened, against `B:\youtubeProjects\life3Baje\IMG_E2043.MOV`
+(195.6s — the old `data/projects/7322a87c` was deleted; this is its source video), with
+gemma-4-12b live, using `backend/tools/e2e_auto_edit.py`. Run artifacts are under
+`data/projects/e2e_ref*_e2e/`; `edit_marked.txt` in each is the fastest way to audit a
+cut by reading. What the runs measured, in order:
+
+1. **Run 1 (before the fixes):** `used_fluency: false` — the 12B ignored the DELETE-line
+   format on all 3 windows and paraphrased (6-11% verbatim), so the shipped edit was
+   structural-only with 4 spliced sentences. This is the failure mode the user reported
+   as "the cuts are terrible".
+2. **Run 2 (JSON spans):** all 3 windows answered and trusted — and exposed the partial-
+   restore Swiss-cheese and the second-pass over-cutting (§2.1b), plus "%"-deletion and
+   the "अपने-अपने" stutter false positive.
+3. **Runs 3-4:** exposed the model deleting both copies of the t-shirt story (→ orphan
+   guard), the "गया हो या फिर" frame false-retake (→ FUNCTION_WORDS), and an 8-word
+   "repair" that deleted the researchers' names (→ MAX_REPAIR_RUN).
+4. **Runs 5-6 (all guards):** all content beats present, each told once. Run 6:
+   67.4s programme from 195.6s, 26 V1 segments, `cut_verify: clean`,
+   `cut_words_still_audible: 2` (breath-level), all three fluency windows trusted as
+   spans, 17 orphan refusals reining in model over-cuts, and the doubled tellings gone
+   (the cross-script `pair()` matcher sees "थॉमल गिल्गोविच" ≈ "Thommel Gilgovich").
+   Residual `still_broken` counts are ASR-garble-level complaints, not edit damage.
+
+**Whisper large-v3 transcribes this footage differently on every run** (407-539 words,
+different content coverage, different romanizations, script flips). Judge any pipeline
+change across several runs, never one.
+
+The presentation pass was also validated live the same night (`tools/e2e_presentation.py`):
+18/18 assets (3 Wan videos — after the `animated: [true]` history-flag fix in
+`comfyui_bridge/client.py`), 15 cutaways placed, **60.3% coverage, 18 of 25 jump cuts
+hidden under B-roll**, the rest disguised by the all-push-in punch-outs, 95 captions,
+render clean. Two more bugs found live: `Project.status` lacked "presented" (killed the
+thumbnail stage every night), and `ensure_ready` measured free VRAM without first asking
+a warm ComfyUI to let go (killed the LLM planner on every second pass of a night).
+
+### Previously not done — needs a real recording and a loaded model
 
 The new LLM passes (verification loop, best-take, final read) are tested against **stand-in
 models**. What a real model does with those prompts has not been measured. Before trusting

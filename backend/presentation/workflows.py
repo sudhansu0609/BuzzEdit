@@ -252,22 +252,33 @@ def apply_bindings(graph: Dict[str, Any], bindings: Dict[str, Any],
     A value whose binding is missing or does not resolve is skipped rather than
     raising: a workflow with no `steps` input simply keeps its own step count,
     which is a working generation, not an error.
+
+    A binding may be one path (`["6", "inputs", "text"]`) or a LIST of paths —
+    a two-stage workflow (image model feeding a video model) needs the same
+    prompt, size and seed written into both stages. An empty list is a valid
+    manifest entry meaning "never write this value here": it protects a
+    multi-stage graph from global overrides (steps/cfg/model) that only make
+    sense for a single-model workflow.
     """
     result = copy.deepcopy(graph)
     for name, value in values.items():
-        path = bindings.get(name)
-        if not isinstance(path, list) or len(path) < 2:
+        binding = bindings.get(name)
+        if not isinstance(binding, list):
             continue
-        node = result.get(str(path[0]))
-        if not isinstance(node, dict):
-            continue
-        target = node
-        for key in path[1:-1]:
-            target = target.get(key) if isinstance(target, dict) else None
-            if target is None:
-                break
-        if isinstance(target, dict) and path[-1] in target:
-            target[path[-1]] = value
+        paths = binding if (binding and isinstance(binding[0], list)) else [binding]
+        for path in paths:
+            if not isinstance(path, list) or len(path) < 2:
+                continue
+            node = result.get(str(path[0]))
+            if not isinstance(node, dict):
+                continue
+            target = node
+            for key in path[1:-1]:
+                target = target.get(key) if isinstance(target, dict) else None
+                if target is None:
+                    break
+            if isinstance(target, dict) and path[-1] in target:
+                target[path[-1]] = value
     return result
 
 

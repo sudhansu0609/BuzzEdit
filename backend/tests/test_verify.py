@@ -275,3 +275,42 @@ async def test_a_continuing_line_is_marked_for_the_auditor():
 
     await audit(words, ask)
     assert asked["user"].rstrip().endswith("...")
+
+
+def test_a_repair_never_deletes_numbers_or_bare_symbols():
+    """"%" reads as punctuation on the page but the audio says "percent", and
+    "50" is data — a live repair deleted both and the cut dropped the spoken
+    words. They are lifted out of the deletion set; the rest of the repair
+    stands, because unlike a negation their removal cannot invert the sentence
+    the model approved."""
+    from asr.verify import Sentence, repair_deletions
+    tokens = "sab ne kaha ki 50 % log the".split()
+    sentence = Sentence(0, list(range(len(tokens))), " ".join(tokens),
+                        hard_boundary=True)
+    positions = repair_deletions(sentence, "sab ne kaha log the", tokens)
+    assert positions == [3]
+
+
+def test_a_fragment_carrying_a_number_is_never_dropped():
+    """A number is data; a "fragment" with one in it is a thought with content."""
+    from asr.verify import AuditResult, Issue, Sentence, _fragment_candidates
+    words = [{"word": t, "start": i * 0.4, "end": i * 0.4 + 0.3}
+             for i, t in enumerate("more den 50 log the aur baki sab".split())]
+    result = AuditResult(total=2, broken=1,
+                         issues=[Issue(0, "more den 50 log the", "broken")])
+    sentences = {0: Sentence(0, [0, 1, 2, 3, 4], "more den 50 log the"),
+                 1: Sentence(1, [5, 6, 7], "aur baki sab")}
+    assert _fragment_candidates(words, result, sentences) == []
+
+
+def test_a_repair_never_removes_a_long_consecutive_run():
+    """A live repair deleted eight consecutive words — the researchers' names —
+    as "debris". Debris is short; a long single removal is the model re-cutting
+    the sentence, and the whole repair is refused."""
+    from asr.verify import Sentence, repair_deletions
+    tokens = ("unka naam tha thommel gilgovich kenneth savitsky aur victoria "
+              "medvec unhone bahut sare bachon ko pucha").split()
+    sentence = Sentence(0, list(range(len(tokens))), " ".join(tokens),
+                        hard_boundary=True)
+    repaired = "unka naam unhone bahut sare bachon ko pucha"
+    assert repair_deletions(sentence, repaired, tokens) is None

@@ -199,7 +199,12 @@ async def test_an_untrustworthy_answer_yields_none():
 async def test_a_discarded_window_leaves_no_verdict_behind():
     """A window the model fumbled must be *absent* from the result, not reported
     as "keep everything" — otherwise it silently un-cuts the fumbles structure
-    found there. Measured: 81 structural cuts were being resurrected this way."""
+    found there. Measured: 81 structural cuts were being resurrected this way.
+
+    Pinned to the rewrite contract: this is the ambiguity that contract has, where
+    a fumbled answer and a deliberate "nothing to cut" look alike. The span
+    contract states the difference outright, which is the point of it.
+    """
     words = _words(" ".join("w%d" % i for i in range(400)))
 
     async def ask(_system, user):
@@ -210,7 +215,7 @@ async def test_a_discarded_window_leaves_no_verdict_behind():
         text = user.split("Transcript:")[1].split("Cleaned")[0]
         return text.replace("w1 ", "").replace("w2 ", "")
 
-    decided = await plan_fluent_cuts(words, ask)
+    decided = await plan_fluent_cuts(words, ask, use_spans=False)
     assert decided is not None
     assert 0 in decided                    # first window ruled on
     assert 350 not in decided              # later window discarded, not "kept"

@@ -36,6 +36,50 @@ def write_text_asset(content: str, assets_dir: Path) -> Path:
     return path
 
 
+def escape_expansion(text: str) -> str:
+    """Protect literal text from drawtext's `%{...}` expansion.
+
+    Expansion is on by default and a bare "%" (in "25%") is a parse error
+    that draws nothing; the escape is a backslash, which this build honours."""
+    return text.replace("\\", "\\\\").replace("%", "\\%")
+
+
+def _number_expression(counter: dict, start_sec: float) -> str:
+    """The value of the count at time t: from → to over `seconds`, then held."""
+    target = float(counter.get("to", 0.0))
+    origin = float(counter.get("from", 0.0))
+    seconds = max(0.1, float(counter.get("seconds", 1.2)))
+    progress = f"clip((t-{_f(start_sec)})/{_f(seconds)}\\,0\\,1)"
+    # Ease out: fast at first, settling on the final value.
+    eased = f"(1-pow(1-{progress}\\,3))"
+    return f"({_f(origin)}+({_f(target - origin)})*{eased})"
+
+
+def counter_text(counter: dict, start_sec: float) -> str:
+    """drawtext expansion text for an animated number.
+
+    Integers use `expr_int_format`; a decimal is drawn as two integer parts so
+    the fraction never prints as a float's trailing zeros.
+    """
+    value = _number_expression(counter, start_sec)
+    decimals = max(0, min(2, int(counter.get("decimals", 0) or 0)))
+    prefix = escape_expansion(str(counter.get("prefix") or ""))
+    suffix = escape_expansion(str(counter.get("suffix") or ""))
+    negative = float(counter.get("to", 0.0)) < 0
+    magnitude = f"abs({value})" if negative else value
+    sign = "-" if negative else ""
+    if decimals == 0:
+        body = f"%{{expr_int_format:round({magnitude}):d}}"
+    else:
+        scale = 10 ** decimals
+        whole = f"%{{expr_int_format:trunc({magnitude}):d}}"
+        fraction = (f"%{{expr_int_format:mod(trunc({magnitude}*{scale})\\,{scale}):d:"
+                    f"{decimals}}}")
+        body = f"{whole}.{fraction}"
+    spacer = " " if suffix and suffix[0].isalpha() else ""
+    return f"{prefix}{sign}{body}{spacer}{suffix}"
+
+
 def _color_with_alpha(color: str, opacity: float) -> str:
     if opacity >= 1.0 or "@" in color:
         return color
@@ -102,6 +146,18 @@ def _animation_parts(style: TextStyle, start: float, end: float) -> tuple:
         offset = f"{_f(style.font_size * 0.9)}*(1-clip((t-{_f(start)})/{_f(duration)},0,1))"
         return fade, offset
 
+    # The animated-text engine (render/ass.py) draws these properly; when a
+    # clip falls back to drawtext they get the nearest thing it can do.
+    if animation == "scale_in":
+        offset = f"-{_f(style.font_size * 0.2)}*(1-clip((t-{_f(start)})/{_f(duration)},0,1))"
+        return fade, offset
+    if animation == "flicker":
+        # A candle-ish alpha: two incommensurate sines, never fully out.
+        flicker = f"(0.62+0.38*abs(sin(t*23.0)*cos(t*7.3)))"
+        return f"({fade})*{flicker}", ""
+    if animation in ("typewriter", "blur_in", "glitch", "shake", "karaoke"):
+        return fade, ""
+
     return fade, ""
 
 
@@ -113,6 +169,10 @@ def build_drawtext(
 ) -> Optional[str]:
     """One drawtext filter for a text clip, or None if there is nothing to draw."""
     content = (clip.content or "").strip("\n")
+    if clip.counter:
+        content = counter_text(clip.counter, start_sec)
+    elif content.strip():
+        content = escape_expansion(content)
     if not content.strip():
         return None
 

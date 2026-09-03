@@ -1,0 +1,20 @@
+{
+  "roles": {
+    "broll_video": {
+      "file": "zimage_wan22_i2v.json",
+      "bindings": {
+        "positive": [["z_pos", "inputs", "text"], ["w_pos", "inputs", "text"]],
+        "negative": ["w_neg", "inputs", "text"],
+        "width": [["z_latent", "inputs", "width"], ["w_i2v", "inputs", "width"]],
+        "height": [["z_latent", "inputs", "height"], ["w_i2v", "inputs", "height"]],
+        "seed": [["z_sample", "inputs", "seed"], ["w_sample_high", "inputs", "noise_seed"], ["w_sample_low", "inputs", "noise_seed"]],
+        "length": ["w_i2v", "inputs", "length"],
+        "fps": ["v_create", "inputs", "fps"],
+        "prefix": ["v_save", "inputs", "filename_prefix"],
+        "steps": [],
+        "cfg": [],
+        "model": []
+      }
+    }
+  }
+}

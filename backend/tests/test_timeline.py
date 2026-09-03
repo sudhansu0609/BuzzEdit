@@ -332,3 +332,38 @@ def test_a_short_segment_at_the_edges_is_kept():
     tl = build_timeline_from_transcript("v.mp4", 5.0, words, 30, 1,
                                         pause_padding_seconds=0.0)
     assert len([i for i in tl.items if i.track == "V1"]) == 2
+
+
+def test_the_spoken_script_survives_the_timeline_round_trip():
+    """`word_native` must reach the timeline and come back out again.
+
+    Every grammar and fluency prompt states that its input is Devanagari, and
+    verify.PROTECTED_WORDS lists the Hindi negations in that script. The native
+    form was being dropped at each dict-to-WordItem conversion, so a re-cut of an
+    existing timeline judged romanized Hinglish against those prompts — the
+    negations could not match and good Hindi read as broken English.
+    """
+    tl = build_timeline_from_transcript(
+        source_path="video.mp4",
+        duration_seconds=5.0,
+        transcript_words=[
+            {"word": "dosto", "word_native": "दोस्तों", "start": 0.0, "end": 0.5},
+            {"word": "naheen", "word_native": "नहीं", "start": 0.5, "end": 1.0},
+            {"word": "amazing", "start": 1.0, "end": 1.5},
+        ],
+        fps_num=30, fps_den=1,
+    )
+    assert [w.text for w in tl.words] == ["dosto", "naheen", "amazing"]
+    assert [w.word_native for w in tl.words] == ["दोस्तों", "नहीं", None]
+
+
+def test_the_planner_judges_the_native_script_not_its_romanization():
+    """The token every text pass reads is the spoken script when there is one."""
+    from backend.asr.fluency import _token as fluency_token
+    from backend.asr.verify import _token as verify_token
+
+    hindi = {"word": "naheen", "word_native": "नहीं"}
+    english = {"word": "amazing"}
+    for token_of in (fluency_token, verify_token):
+        assert token_of(hindi) == "नहीं"
+        assert token_of(english) == "amazing"
