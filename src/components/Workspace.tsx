@@ -9,6 +9,8 @@ import TranscriptEditor from './TranscriptEditor';
 import ExportSettings from './ExportSettings';
 import MediaPool from './MediaPool';
 import InspectorPanel from './InspectorPanel';
+import EffectsPanel from './EffectsPanel';
+import TransitionsPanel from './TransitionsPanel';
 import LlmIndicator from './LlmIndicator';
 import RenderCompleteModal, { RenderResult } from './RenderCompleteModal';
 import DockLayout from './DockLayout';
@@ -242,6 +244,8 @@ export default function Workspace() {
         media: <div className="side-panel docked"><div className="panel-content"><MediaPool /></div></div>,
         transcript: <div className="side-panel docked"><div className="panel-content"><TranscriptEditor /></div></div>,
         inspector: <div className="side-panel docked"><div className="panel-content"><InspectorPanel /></div></div>,
+        effects: <div className="side-panel docked"><div className="panel-content"><EffectsPanel /></div></div>,
+        transitions: <div className="side-panel docked"><div className="panel-content"><TransitionsPanel /></div></div>,
         agents: <div className="side-panel docked"><div className="panel-content"><AgentPanel /></div></div>,
         queue: <div className="side-panel docked"><div className="panel-content"><JobQueue /></div></div>,
         export: <div className="side-panel docked"><div className="panel-content"><ExportSettings /></div></div>,

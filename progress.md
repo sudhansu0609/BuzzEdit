@@ -1,5 +1,96 @@
 # BuzzEdit - Implementation Progress
 
+## 2026-09-10 — P3: nothing in this app knows a port any more
+
+Cross-repo context: `Buzzcaf_Media/GUARDIAN_PLAN.md` §11 ("Ports — nothing
+hardcoded, step forward, publish, discover"). Before this, 8099 was written down
+in five places (`main.cjs`, `main.py`, `src/hooks/api.ts`, `PreviewPlayer.tsx`,
+`useAutoSave.ts`) and 8188 in four, and when 8099 was busy the launcher's answer
+was `freePort()` — find whoever holds it with `netstat` and `taskkill /T /F` it.
+That is exactly what the plan's rule 2 abolishes: *step forward, never evict.*
+
+### `scripts/buzzcaf-ports.mjs` (new, and canonical)
+
+The Node third of the shared helper — the copy every other Node/Tauri app in the
+family takes byte-identical (BuzzViolin has it today). No dependencies beyond
+`node:` builtins, because a launcher has to work before `npm install` ever ran.
+It matches `dexter/backend/buzzcaf_ports.py` function for function:
+`ledgerPath` · `pickPort` · `publish` · `withdraw` · `entries`/`entry` ·
+`discover`, over `%LOCALAPPDATA%\Buzzcaf\ports.json` (override
+`BUZZCAF_PORTS_FILE`), read-merge-write under `ports.json.lock`, temp + rename.
+
+### `electron/port-plan.cjs` (new)
+
+The launcher's two decisions — *where is the backend / where shall we put it*,
+and the same for ComfyUI — split out of `main.cjs` so they can be unit-tested
+without launching Electron, and therefore without launching ComfyUI and the GPU
+with it. It is also the one place the three preferred numbers live
+(`BUZZEDIT_PORT` 8099, `COMFYUI_PORT` 8188, `BUZZEDIT_VITE_PORT` 5173).
+
+### The rest
+
+- `main.cjs`: `freePort()` and `findPidsOnPort()` are **gone**. Both ports are
+  settled before the window is created; the backend is spawned with
+  `--port <n>` and `COMFYUI_URL`, ComfyUI with `--listen 127.0.0.1 --port <n>`;
+  the health poll waits for `app: "buzzedit"` rather than for a bare 200; then
+  `publish('buzzedit', port, health, { comfyui })`. `before-quit` defers the
+  quit once so `withdraw()` — a file write under a lock — can finish. An
+  already-running backend or ComfyUI is adopted, not fought.
+- `electron/preload.cjs`: the two real URLs arrive as `additionalArguments`
+  switches and are exposed **synchronously**. `api.ts` resolves its base at
+  module scope, so an async `getApiUrl()` round trip would leave the first
+  fetch pointing nowhere.
+- `src/hooks/api.ts`: exports `API_BASE` = the preload's URL → `VITE_BUZZEDIT_API`
+  → `''` (relative, i.e. `window.location.origin`, which is right both when the
+  bundle is served by the backend and behind the Vite proxy). `COMFY_BASE` and
+  `hostPort()` feed the two places the UI used to print `127.0.0.1:8188`.
+- `backend/main.py`: `--port` when the launcher chose (Electron publishes,
+  because only it knows which ComfyUI belongs to this backend), otherwise
+  `pick_port()` + publish + `atexit` withdraw of its own. `/api/health` answers
+  `{app, status, port, pid, version, …}`.
+- `backend/buzzcaf_ports.py`: byte-identical copy of the canonical
+  `dexter/backend/buzzcaf_ports.py` (sha256 `51649b81…`).
+- `backend/comfyui_bridge/client.py`: the hardcoded `{8188 ↔ 8000}` alternate
+  became a scan of the preferred range plus `COMFYUI_ALT_URL`.
+- `vite.config.ts` proxies `/api` and `/output` to the backend port it is given;
+  `scripts/dev.mjs` (new) picks both ports for `npm run dev`; `backend/test_e2e.py`
+  discovers the backend instead of assuming 8099.
+
+### Evidence
+
+- `node --test scripts/buzzcaf-ports.test.mjs scripts/port-plan.test.mjs` —
+  **40 passed, 0 failed**. Ledger tests all run against a throwaway file.
+  Notable ones: a squatter is stepped over *and is still listening afterwards*;
+  a live JSON `/api/health` belonging to `caliberai` on the port we wanted is
+  **not** adopted (rule 4, in miniature — this is the CaliberAI-mistaken-for-the-
+  Studio bug); a `/system_stats` that is not ComfyUI's is not mistaken for it;
+  concurrent publishes all survive; a corrupt ledger is rebuilt; a stale lock is
+  broken after 5 s. One test greps `main.cjs`, `preload.cjs` and the four
+  renderer files for `8099|8188|8000|5173` outside comments and fails on any hit.
+- `npx tsc --noEmit` clean; `npx vite build` clean (343.31 kB bundle).
+- Live, backend only — `LM_STUDIO_AUTOSTART=0`, ComfyUI never started, a
+  throwaway ledger:
+  - preferred port free → bound 8399, `/api/health` →
+    `{"app":"buzzedit","status":"ok","port":8399,"pid":23948,"version":"0.2.0",…}`,
+    ledger entry written with `extra.comfyui`.
+  - preferred port held by a dummy listener → log line
+    `Port 8399 was busy; taking 8400 instead.`, served on 8400, published 8400,
+    **and the squatter was still listening on 8399 afterwards.**
+  - The Node helper read that Python-written ledger and answered
+    `discover('buzzedit', …) -> http://127.0.0.1:8400`, while
+    `discover('dexter', …)` on the same file answered `null`.
+  - A clean exit empties the entry (`atexit` withdraw, checked directly).
+  Both backends were stopped afterwards; nothing is left on 8399/8400.
+
+**Not verified:** the Electron launcher itself, end to end. Running it starts
+ComfyUI, which takes the GPU VrDeep is rendering on, so `main.cjs` and
+`preload.cjs` were checked with `node --check` and their decision logic covered
+by `port-plan.test.mjs` instead. What rests on review is the glue: the
+`additionalArguments` → preload → `API_BASE` hand-off, the `before-quit`
+deferral, and the `--listen/--port` flags passed to ComfyUI's own `main.py`.
+
+---
+
 ## PHASE 1: Core Video Pipeline (Week 1-2)
 **Goal: Upload video → Auto-remove fumbles/silence → Export clean cut**
 

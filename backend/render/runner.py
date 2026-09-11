@@ -8,6 +8,7 @@ from timeline.schema import Timeline, frame_to_time
 from render.compiler import FilterGraphCompiler
 from render.encoder import get_encoder_flags
 from config import TEMP_DIR
+from utils.proc import NO_WINDOW
 
 logger = logging.getLogger("render_runner")
 
@@ -104,7 +105,8 @@ async def render_timeline_async(
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=NO_WINDOW
         )
 
         pattern_time = re.compile(r"out_time_ms=(\d+)")

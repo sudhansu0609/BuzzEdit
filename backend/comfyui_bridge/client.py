@@ -20,14 +20,22 @@ a generation that "worked" and returned nothing:
 
 import json
 import logging
+import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
-from config import COMFYUI_OUTPUT_DIR, COMFYUI_URL, TEMP_DIR
+from config import (
+    COMFYUI_OUTPUT_DIR,
+    COMFYUI_PREFERRED_PORT,
+    COMFYUI_URL,
+    PORT_SPAN,
+    TEMP_DIR,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +49,15 @@ OUTPUT_KEYS = ("images", "gifs", "videos")
 
 
 class ComfyUIClient:
-    # The machine typically has two ComfyUI installs: the portable one on 8188
-    # and the Comfy Desktop app on 8000. Both see the same model folders (the
-    # Desktop maps the portable's models via extra_models_config.yaml), so
-    # whichever one the user actually opened is the right one to talk to.
-    _PORT_ALTERNATES = {":8188": ":8000", ":8000": ":8188"}
+    """Talks to whichever ComfyUI is actually up.
+
+    The machine typically has more than one install — the portable one and the
+    Comfy Desktop app — and since GUARDIAN_PLAN.md section 11 either of them may
+    have stepped forward off its preferred port. Both see the same model folders
+    (the Desktop maps the portable's models via extra_models_config.yaml), so
+    whichever one the user actually opened is the right one to talk to; the
+    configured URL is tried first and a short scan finds the other.
+    """
 
     def __init__(self, server_url: str = COMFYUI_URL):
         self.server_url = server_url.rstrip('/')
@@ -77,25 +89,52 @@ class ComfyUIClient:
         connection-refused, a slow model load and a crash into a bare False, which
         is exactly the ambiguity that makes an offline ComfyUI hard to diagnose.
 
-        When the configured server is down, the well-known alternate port is
-        probed and adopted if it answers — so opening the Desktop app instead of
-        the portable install just works, without touching COMFYUI_URL.
+        When the configured server is down, the preferred range is scanned and
+        the first ComfyUI that answers is adopted — so opening the Desktop app
+        instead of the portable install, or a ComfyUI that stepped forward off
+        8188 because something else held it, both just work without touching
+        COMFYUI_URL.
         """
         ok, reason = self._probe(self.server_url, timeout)
         if ok:
             return True, ""
-        for suffix, alternate_suffix in self._PORT_ALTERNATES.items():
-            if self.server_url.endswith(suffix):
-                alternate = self.server_url[:-len(suffix)] + alternate_suffix
-                alt_ok, _ = self._probe(alternate, min(timeout, 5.0))
-                if alt_ok:
-                    logger.info("ComfyUI found at %s (configured %s is down); switching",
-                                alternate, self.server_url)
-                    self.server_url = alternate
-                    return True, ""
-                break
+        alternate = self._find_elsewhere(min(timeout, 5.0))
+        if alternate:
+            logger.info("ComfyUI found at %s (configured %s is down); switching",
+                        alternate, self.server_url)
+            self.server_url = alternate
+            return True, ""
         logger.warning(reason)
         return False, reason
+
+    def _candidates(self) -> list[str]:
+        """Every address worth trying, in order, minus the one that just failed.
+
+        No literal port: the preferred number and the span come from config,
+        which reads them from the environment (rule 1), and COMFYUI_ALT_URL is
+        there for an install that is nowhere near the usual range.
+        """
+        seen = {self.server_url}
+        found: list[str] = []
+        for url in (os.environ.get("COMFYUI_ALT_URL", "").strip(),):
+            url = url.rstrip("/")
+            if url and url not in seen:
+                seen.add(url)
+                found.append(url)
+        host = urlparse(self.server_url).hostname or "127.0.0.1"
+        for port in range(COMFYUI_PREFERRED_PORT, COMFYUI_PREFERRED_PORT + PORT_SPAN + 1):
+            url = f"http://{host}:{port}"
+            if url not in seen:
+                seen.add(url)
+                found.append(url)
+        return found
+
+    def _find_elsewhere(self, timeout: float) -> Optional[str]:
+        for url in self._candidates():
+            ok, _ = self._probe(url, timeout)
+            if ok:
+                return url
+        return None
 
     def queue_prompt(self, prompt_dict: Dict[str, Any]) -> str:
         payload = {

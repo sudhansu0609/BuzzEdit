@@ -46,6 +46,7 @@ def flatten_items(items: List[TimelineItem]) -> List[TimelineItem]:
             flat.append(item)
             continue
 
+        flat_for_this_group = False
         for child in item.children:
             if not child.enabled:
                 continue
@@ -69,6 +70,15 @@ def flatten_items(items: List[TimelineItem]) -> List[TimelineItem]:
             if item.mute:
                 resolved.mute = True
             resolved.volume = resolved.volume * item.volume
+            # A transition on the group belongs to the group's *leading edge* —
+            # the one junction the timeline actually shows — and to no interior
+            # cut, which is why this cannot be inherited like the grade above.
+            # Without it a transition set on a compound was stored, drawn on the
+            # lane, and then dropped here: the flattened children carried only
+            # their own, and the parent stopped existing.
+            if not flat_for_this_group and resolved.transition is None:
+                resolved.transition = item.transition
+            flat_for_this_group = True
             flat.append(resolved)
     return flat
 

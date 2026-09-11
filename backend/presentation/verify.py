@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from pydantic import BaseModel
 
 from config import FFMPEG_BIN
+from utils.proc import NO_WINDOW
 from timeline.schema import Timeline, TimelineItem, frame_to_time
 
 from .models import PresentationSettings, Program
@@ -192,7 +193,8 @@ def measure_loudness(path: str) -> Optional[Dict[str, float]]:
         result = subprocess.run(
             [FFMPEG_BIN, "-hide_banner", "-nostats", "-i", path,
              "-af", "ebur128=peak=true", "-f", "null", "-"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=600)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=600,
+            creationflags=NO_WINDOW)
     except Exception as e:
         logger.warning("Loudness measurement failed: %s", e)
         return None
@@ -213,7 +215,8 @@ def _stream_seconds(path: str, stream: str) -> Optional[float]:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", stream, "-show_entries",
              "stream=duration", "-of", "csv=p=0", path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60,
+            creationflags=NO_WINDOW)
         return float(result.stdout.strip().splitlines()[0])
     except Exception:
         return None

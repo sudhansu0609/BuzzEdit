@@ -1,5 +1,6 @@
 import subprocess
 from typing import List
+from utils.proc import NO_WINDOW
 
 def get_nvenc_available() -> bool:
     """Check if h264_nvenc encoder is available in FFmpeg."""
@@ -9,7 +10,8 @@ def get_nvenc_available() -> bool:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=5
+            timeout=5,
+            creationflags=NO_WINDOW,
         )
         return "h264_nvenc" in res.stdout
     except Exception:

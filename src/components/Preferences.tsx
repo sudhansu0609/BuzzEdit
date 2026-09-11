@@ -3,10 +3,10 @@ import {
   getAppSettings, updateAppSettings,
   getLlmStatus, ensureLlm, getLlmModels, LlmModelList, LlmStatus,
   getComfyUIStatus, listGenerationWorkflows, getComfyUIModels, ComfyModelList,
-  getGpuStatus, getSystemPaths, clearVram,
+  getGpuStatus, getSystemPaths, clearVram, COMFY_BASE, hostPort,
 } from '../hooks/api';
 import {
-  useAppearanceStore, ACCENT_SWATCHES, ThemeId, DensityId,
+  useAppearanceStore, ACCENT_SWATCHES, THEMES, DensityId,
 } from '../hooks/appearance';
 import { COMMANDS, COMMAND_GROUPS, useCommandStore } from '../hooks/commands';
 import { eventToChord, chordLabel } from '../hooks/shortcuts';
@@ -390,39 +390,59 @@ function ShortcutsTab() {
 // --- Appearance --------------------------------------------------------------
 
 function AppearanceTab() {
-  const { accent, theme, density, set, reset } = useAppearanceStore();
+  const { accent, theme, density, accentFollowsTheme, set, reset } = useAppearanceStore();
 
-  const themes: { id: ThemeId; label: string }[] = [
-    { id: 'dark', label: 'Dark' },
-    { id: 'midnight', label: 'Midnight' },
-    { id: 'light', label: 'Light' },
-  ];
   const densities: { id: DensityId; label: string }[] = [
     { id: 'comfortable', label: 'Comfortable' },
     { id: 'compact', label: 'Compact' },
   ];
+  const dark = THEMES.filter((t) => t.mode === 'dark');
+  const light = THEMES.filter((t) => t.mode === 'light');
+
+  // The card is a miniature of the real thing — page, panel and a line of text —
+  // rather than three abstract dots, because what you are choosing between is
+  // how much contrast the editor has, and that is only legible as a layout.
+  const card = (t: typeof THEMES[number]) => (
+    <button key={t.id} title={t.note}
+      className={`theme-card ${theme === t.id ? 'active' : ''}`}
+      onClick={() => set({ theme: t.id })}>
+      <span className="theme-swatch" style={{ background: t.preview[0] }}>
+        <span className="theme-swatch-panel" style={{ background: t.preview[1] }}>
+          <span className="theme-swatch-line" style={{ background: t.preview[2] }} />
+          <span className="theme-swatch-line short" style={{ background: t.preview[2] }} />
+        </span>
+        <span className="theme-swatch-dot" style={{ background: t.accent }} />
+      </span>
+      <span className="theme-card-name">{t.label}</span>
+      <span className="theme-card-note">{t.note}</span>
+    </button>
+  );
 
   return (
     <div className="pref-section">
-      <h4>Accent colour</h4>
+      <h4>Theme</h4>
+      <div className="theme-group-label">Dark</div>
+      <div className="theme-grid">{dark.map(card)}</div>
+      <div className="theme-group-label" style={{ marginTop: 12 }}>Light</div>
+      <div className="theme-grid">{light.map(card)}</div>
+
+      <h4 style={{ marginTop: 20 }}>Accent colour</h4>
       <div className="swatch-row">
         {ACCENT_SWATCHES.map((s) => (
           <button key={s.value} title={s.label}
-            className={`swatch ${accent.toLowerCase() === s.value.toLowerCase() ? 'active' : ''}`}
+            className={`swatch ${!accentFollowsTheme && accent.toLowerCase() === s.value.toLowerCase() ? 'active' : ''}`}
             style={{ background: s.value }} onClick={() => set({ accent: s.value })} />
         ))}
         <label className="swatch-custom" title="Custom colour">
           <input type="color" value={accent} onChange={(e) => set({ accent: e.target.value })} />
         </label>
       </div>
-
-      <h4 style={{ marginTop: 20 }}>Theme</h4>
-      <div className="seg-row">
-        {themes.map((t) => (
-          <button key={t.id} className={`seg ${theme === t.id ? 'active' : ''}`}
-            onClick={() => set({ theme: t.id })}>{t.label}</button>
-        ))}
-      </div>
+      <label className="pref-inline-check"
+        title="Each palette was drawn around its own accent — Dracula's violet, Nord's frost blue. Untick to keep one colour across every theme.">
+        <input type="checkbox" checked={accentFollowsTheme}
+          onChange={(e) => set({ accentFollowsTheme: e.target.checked })} />
+        Let the theme choose the accent
+      </label>
 
       <h4 style={{ marginTop: 20 }}>Density</h4>
       <div className="seg-row">
@@ -492,7 +512,7 @@ function DiagnosticsTab() {
         <h4 style={{ margin: '0 0 8px' }}>Services</h4>
         <DiagLine label="FFmpeg (NVENC)" ok={paths?.ffmpeg_available}
           okText="Available" badText="Not found" />
-        <DiagLine label="ComfyUI bridge (127.0.0.1:8188)" ok={paths?.comfyui_connected}
+        <DiagLine label={`ComfyUI bridge${COMFY_BASE ? ` (${hostPort(COMFY_BASE)})` : ''}`} ok={paths?.comfyui_connected}
           okText="Online" badText="Offline (fallback)" warn />
         <DiagLine label="ComfyUI input folder" ok={paths?.comfyui_input_dir_exists}
           okText="Exists" badText="Missing" />

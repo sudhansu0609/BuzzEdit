@@ -20,6 +20,7 @@ import { create } from 'zustand';
  */
 export type PanelId =
   | 'preview' | 'media' | 'transcript' | 'inspector'
+  | 'effects' | 'transitions'
   | 'timeline' | 'agents' | 'queue' | 'export';
 export type DockZone = 'center' | 'left' | 'right' | 'bottom';
 export type PanelPlacement = DockZone | 'floating';
@@ -51,6 +52,8 @@ export const PANEL_TITLES: Record<PanelId, string> = {
   media: 'Media',
   transcript: 'Transcript',
   inspector: 'Inspector',
+  effects: 'Effects',
+  transitions: 'Transitions',
   timeline: 'Timeline',
   agents: 'AI Agents',
   queue: 'Nightly Queue',
@@ -63,6 +66,8 @@ export const PANEL_TABS: Record<PanelId, string> = {
   media: 'Media',
   transcript: 'Transcript',
   inspector: 'Inspect',
+  effects: 'Effects',
+  transitions: 'Transitions',
   timeline: 'Timeline',
   agents: 'Agents',
   queue: 'Queue',
@@ -106,10 +111,14 @@ function makePanels(overrides: Partial<Record<PanelId, Partial<PanelConfig>>> = 
     media: { placement: MEDIA_HOME, visible: true, rect: defaultRect(1) },
     transcript: { placement: 'right', visible: true, rect: defaultRect(2) },
     inspector: { placement: 'right', visible: true, rect: defaultRect(3) },
-    timeline: { placement: 'bottom', visible: true, rect: defaultRect(4) },
-    agents: { placement: 'right', visible: true, rect: defaultRect(5) },
-    queue: { placement: 'right', visible: false, rect: defaultRect(6) },
-    export: { placement: 'right', visible: true, rect: defaultRect(7) },
+    // Tabbed beside the Inspector: they act on the same selection, and a cut is
+    // usually being dressed at the same time it is being graded.
+    effects: { placement: 'right', visible: true, rect: defaultRect(4) },
+    transitions: { placement: 'right', visible: true, rect: defaultRect(5) },
+    timeline: { placement: 'bottom', visible: true, rect: defaultRect(6) },
+    agents: { placement: 'right', visible: true, rect: defaultRect(7) },
+    queue: { placement: 'right', visible: false, rect: defaultRect(8) },
+    export: { placement: 'right', visible: true, rect: defaultRect(9) },
   };
   (Object.keys(overrides) as PanelId[]).forEach((id) => {
     base[id] = { ...base[id], ...overrides[id] };
@@ -129,14 +138,18 @@ export const LAYOUT_PRESETS: LayoutPreset[] = [
     label: 'Editing',
     // The transcript beside the picture and a tall timeline: the arrangement for
     // cutting, where the words are what you are working on.
-    panels: makePanels({ queue: { visible: false }, agents: { visible: false } }),
+    panels: makePanels({
+      queue: { visible: false }, agents: { visible: false },
+      effects: { visible: false }, transitions: { visible: false },
+    }),
     sizes: { left: 280, right: 420, bottom: 440 },
   },
   {
     id: 'colour',
     label: 'Colour & FX',
     // Big picture, wide inspector on its own, timeline out of the way. Grading
-    // and keying are judged by eye, so the preview gets the room.
+    // and keying are judged by eye, so the preview gets the room — and this is
+    // the arrangement where the effects and transitions browsers belong.
     panels: makePanels({
       transcript: { visible: false },
       agents: { visible: false },
@@ -151,6 +164,8 @@ export const LAYOUT_PRESETS: LayoutPreset[] = [
     panels: makePanels({
       transcript: { visible: false },
       inspector: { visible: false },
+      effects: { visible: false },
+      transitions: { visible: false },
       agents: { visible: false },
       export: { visible: false },
     }),

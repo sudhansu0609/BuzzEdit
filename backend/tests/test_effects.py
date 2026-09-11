@@ -73,8 +73,24 @@ def test_pan_offsets_the_crop_within_the_slack():
 def test_zoom_out_pads_rather_than_cropping_into_nothing():
     chain = _joined(build_canvas_transform(Transform(scale=0.5), 1920, 1080, 100, 30))
     assert "scale=960:540" in chain
-    assert "pad=1920:1080" in chain
+    assert "pad=1920:1080:480:270" in chain           # centred in the spare room
     assert "crop=1920:1080:0:0" in chain
+
+
+def test_a_shrunk_clip_can_be_moved_off_centre():
+    """Scaled under 1.0 the picture is smaller than the canvas, and every bit of
+    room to move it is in the pad — the crop has no slack left to work with. Pan
+    was ignored there, so two clips could be shrunk but never placed side by
+    side."""
+    left = _joined(build_canvas_transform(
+        Transform(scale=0.5, pos_x=-1.0), 1920, 1080, 100, 30))
+    right = _joined(build_canvas_transform(
+        Transform(scale=0.5, pos_x=1.0), 1920, 1080, 100, 30))
+    bottom = _joined(build_canvas_transform(
+        Transform(scale=0.5, pos_y=1.0), 1920, 1080, 100, 30))
+    assert "pad=1920:1080:0:270" in left              # flush left, still centred vertically
+    assert "pad=1920:1080:960:270" in right           # flush right
+    assert "pad=1920:1080:480:540" in bottom          # flush bottom
 
 
 def test_crop_fractions_eat_the_right_edges():

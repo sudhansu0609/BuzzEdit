@@ -439,6 +439,7 @@ def effect_preset(name: Optional[str]) -> Dict[str, Any]:
 
 def list_all() -> Dict[str, List[Dict[str, Any]]]:
     """Everything the preset pickers need, in one round trip."""
+    from render import atmosphere as atmosphere_lib
     from render import transitions as transition_lib
 
     return {
@@ -451,4 +452,9 @@ def list_all() -> Dict[str, List[Dict[str, Any]]]:
         "aspect": _listing(ASPECT_PRESETS, "ratio"),
         # The full xfade set, grouped, for users who want more than the presets.
         "transition_catalogue": transition_lib.catalogue(),
+        # Every atmosphere effect the renderer can build, with a line of prose
+        # each. EFFECT_PRESETS only seeds the eight most-asked-for looks; the
+        # panel needs the whole set, including the ones with no preset (glitch,
+        # VHS, shake, flash, flicker).
+        "effect_catalogue": atmosphere_lib.available(),
     }

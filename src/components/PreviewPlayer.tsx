@@ -1,10 +1,21 @@
 import { useRef, useEffect, useCallback, useState, useMemo } from 'react';
 import { useProjectStore } from '../hooks/store';
+import {
+  API_BASE, previewFrameUrl, getPreviewProxy, buildPreviewProxy, ProxyStatus,
+} from '../hooks/api';
+import StageLayout from './StageLayout';
 
-type PreviewMode = 'cut' | 'result' | 'source';
+/**
+ * `fx` is the dressed programme — grade, atmosphere, captions, B-roll, bars —
+ * which none of the other three modes can show. `cut` plays the source file and
+ * skips the struck words, so it is honest about the edit and silent about
+ * everything else; `result` is the last full render and may be well behind the
+ * timeline. FX sits between them: always current, and dressed.
+ */
+type PreviewMode = 'cut' | 'result' | 'source' | 'fx';
 
 export default function PreviewPlayer() {
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const { project, currentTime, setCurrentTime, isPlaying, setIsPlaying, isScrubbing } = useProjectStore();
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
@@ -87,7 +98,7 @@ export default function PreviewPlayer() {
     const poll = async () => {
       try {
         const res = await fetch(
-          `http://localhost:8099/api/media/proxy?path=${encodeURIComponent(sourceVideo)}`);
+          `${API_BASE}/api/media/proxy?path=${encodeURIComponent(sourceVideo)}`);
         if (cancelled) return;
         const data = await res.json();
         if (cancelled) return;
@@ -115,16 +126,137 @@ export default function PreviewPlayer() {
     setMode(hasCut ? 'cut' : (renderedOutput ? 'result' : 'source'));
   }, [hasCut, renderedOutput, project?.id]);
 
+  // --- the dressed preview ------------------------------------------------
+  // Programme time, which is what the renderer counts in and what the FX routes
+  // expect. The store's currentTime is SOURCE time (the cut preview plays the
+  // original file and jumps the gaps), so everything crossing into FX converts
+  // here and everything leaving it converts back — the store's meaning never
+  // changes, and the timeline and panels keep working exactly as before.
+  const programOffset = ((timeline?.program_offset_frames ?? 0)
+    / ((timeline?.fps_num ?? 30) / (timeline?.fps_den ?? 1) || 30));
+  const revision: number | undefined = timeline?.revision;
+  const programmeTime = srcToEdit(currentTime) + programOffset;
+  const programmeDuration = cutDuration + programOffset;
+
+  const [proxy, setProxy] = useState<ProxyStatus>({ state: 'none', stale: true });
+  const [fxFrame, setFxFrame] = useState<string | null>(null);
+  const [fxLoading, setFxLoading] = useState(false);
+  const [fxEmpty, setFxEmpty] = useState(false);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const pictureRef = useRef<HTMLImageElement | HTMLVideoElement | null>(null);
+
+  // Direct layout of the clips on the canvas. Only offered on the dressed
+  // preview: on the cut preview the stage shows the source file alone, so a box
+  // drawn round an overlay would be floating over a picture that does not
+  // contain it.
+  const [layoutMode, setLayoutMode] = useState(false);
+  // The picture's rectangle inside the container. The stage is letterboxed, so
+  // this is emphatically not the container's own box — the boxes would be
+  // stretched across the black bars.
+  const [pictureRect, setPictureRect] = useState<
+    { left: number; top: number; width: number; height: number } | null>(null);
+
+
+  // The proxy is only worth playing when it was built from the edit you are
+  // looking at; a stale one is offered, but labelled.
+  const proxyReady = proxy.state === 'ready' && !!proxy.path;
+  const useProxyVideo = mode === 'fx' && proxyReady;
+
+  useEffect(() => {
+    if (!layoutMode) { setPictureRect(null); return; }
+    const measure = () => {
+      const el = pictureRef.current;
+      const box = containerRef.current;
+      if (!el || !box) return;
+      const a = el.getBoundingClientRect();
+      const b = box.getBoundingClientRect();
+      if (a.width < 2 || a.height < 2) return;
+      setPictureRect({ left: a.left - b.left, top: a.top - b.top, width: a.width, height: a.height });
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    if (containerRef.current) observer.observe(containerRef.current);
+    if (pictureRef.current) observer.observe(pictureRef.current);
+    window.addEventListener('resize', measure);
+    return () => { observer.disconnect(); window.removeEventListener('resize', measure); };
+  }, [layoutMode, fxFrame, useProxyVideo, mode]);
+
+  const refreshProxy = useCallback(async () => {
+    if (!project?.id) return;
+    try {
+      setProxy(await getPreviewProxy(project.id));
+    } catch {
+      setProxy({ state: 'none', stale: true });
+    }
+  }, [project?.id]);
+
+  useEffect(() => { refreshProxy(); }, [refreshProxy, revision]);
+
+  // Poll only while something is actually being built.
+  useEffect(() => {
+    if (proxy.state !== 'building') return;
+    const timer = setInterval(refreshProxy, 2500);
+    return () => clearInterval(timer);
+  }, [proxy.state, refreshProxy]);
+
+  const startProxy = useCallback(async () => {
+    if (!project?.id) return;
+    setProxy({ state: 'building', elapsed: 0 });
+    try {
+      await buildPreviewProxy(project.id, 540);
+    } catch {
+      setProxy({ state: 'error', detail: 'Could not start the build' });
+    }
+  }, [project?.id]);
+
+  // The still: fetched when the playhead settles, not while it moves. A frame
+  // costs about half a second of ffmpeg, so firing on every scrub tick would
+  // queue up work for positions the user has already left — and the answer would
+  // arrive after they had moved on anyway.
+  useEffect(() => {
+    if (mode !== 'fx' || useProxyVideo || !project?.id) return;
+    let cancelled = false;
+    const width = Math.min(1280, Math.max(320,
+      Math.round((stageRef.current?.clientWidth || 640) * (window.devicePixelRatio || 1))));
+    const url = previewFrameUrl(project.id, programmeTime, width, revision);
+
+    const timer = setTimeout(() => {
+      setFxLoading(true);
+      // Decoded off-screen first, so the frame on screen is replaced rather than
+      // blanked — scrubbing through a cached run should not strobe.
+      const img = new Image();
+      img.onload = () => {
+        if (cancelled) return;
+        setFxFrame(url); setFxEmpty(false); setFxLoading(false);
+      };
+      img.onerror = () => {
+        if (cancelled) return;
+        // 204: nothing on V1 there — a gap, or past the end.
+        setFxEmpty(true); setFxLoading(false);
+      };
+      img.src = url;
+    }, 140);
+
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [mode, useProxyVideo, project?.id, programmeTime, revision]);
+
   // Cut and Source modes play the source itself — through the proxy when one is
   // ready, so seeks (and therefore the gap-skipping that IS the cut) work.
   // Rendered mode plays the finished file, which is already H.264 and seekable.
   const previewSource = proxyPath || sourceVideo;
-  const activeSrc = (mode === 'result' && renderedOutput) ? renderedOutput : previewSource;
+  const activeSrc = useProxyVideo
+    ? proxy.path!
+    : (mode === 'result' && renderedOutput) ? renderedOutput : previewSource;
+  // FX-still mode has no video at all; the stage is an <img>.
+  const showsVideo = mode !== 'fx' || useProxyVideo;
 
   // Refs so the (stable) timeupdate handler reads the latest values.
   const scrubRef = useRef(isScrubbing); scrubRef.current = isScrubbing;
   const modeRef = useRef(mode); modeRef.current = mode;
   const intervalsRef = useRef(keptIntervals); intervalsRef.current = keptIntervals;
+  const proxyRef = useRef(useProxyVideo); proxyRef.current = useProxyVideo;
+  const offsetRef = useRef(programOffset); offsetRef.current = programOffset;
 
   useEffect(() => {
     const video = videoRef.current;
@@ -134,15 +266,20 @@ export default function PreviewPlayer() {
 
     const handleTimeUpdate = () => {
       if (scrubRef.current) return;
-      setCurrentTime(video.currentTime);
+      // The proxy runs on programme time; the store speaks source time. Convert
+      // on the way out so the timeline and transcript stay where they were.
+      setCurrentTime(proxyRef.current
+        ? editToSrc(video.currentTime - offsetRef.current)
+        : video.currentTime);
     };
     const handlePlay = () => setIsPlaying(true);
     const handlePause = () => setIsPlaying(false);
     const handleEnded = () => setIsPlaying(false);
     const handleLoadedData = () => {
       setVideoReady(true);
-      // Start the live cut at the first kept moment.
-      if (modeRef.current === 'cut' && intervalsRef.current.length) {
+      // Start the live cut at the first kept moment. The proxy needs no such
+      // nudge — every frame in it is kept material already.
+      if (modeRef.current === 'cut' && !proxyRef.current && intervalsRef.current.length) {
         const first = intervalsRef.current[0][0];
         if (video.currentTime < first) video.currentTime = first;
       }
@@ -159,9 +296,11 @@ export default function PreviewPlayer() {
     // Cache-bust only the rendered file: every re-render overwrites the same
     // path, so a stable URL would keep the stale render on screen. The source
     // clip never changes, so it needs no token.
-    const bust = (mode === 'result' && renderedOutput && renderVersion != null)
-      ? `&v=${encodeURIComponent(String(renderVersion))}` : '';
-    video.src = `http://localhost:8099/api/media/stream?path=${encodeURIComponent(activeSrc)}${bust}`;
+    const bust = useProxyVideo
+      ? `&v=${encodeURIComponent(String(proxy.mtime ?? 0))}`
+      : (mode === 'result' && renderedOutput && renderVersion != null)
+        ? `&v=${encodeURIComponent(String(renderVersion))}` : '';
+    video.src = `${API_BASE}/api/media/stream?path=${encodeURIComponent(activeSrc)}${bust}`;
     video.load();
 
     return () => {
@@ -172,7 +311,8 @@ export default function PreviewPlayer() {
       video.removeEventListener('loadeddata', handleLoadedData);
       video.removeEventListener('error', handleError);
     };
-  }, [activeSrc, mode, renderedOutput, renderVersion, setCurrentTime, setIsPlaying]);
+  }, [activeSrc, mode, renderedOutput, renderVersion, useProxyVideo, proxy.mtime,
+      editToSrc, setCurrentTime, setIsPlaying]);
 
 function updateVideoTransform(video: HTMLVideoElement | null, t: number, timeline: any, mode: PreviewMode) {
   if (!video) return;
@@ -262,11 +402,15 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
   }, [mode, keptIntervals, setCurrentTime, timeline]);
 
   useEffect(() => {
-    if (videoRef.current && Math.abs(videoRef.current.currentTime - currentTime) > 0.3) {
-      videoRef.current.currentTime = currentTime;
+    const target = useProxyVideo ? programmeTime : currentTime;
+    if (videoRef.current && Math.abs(videoRef.current.currentTime - target) > 0.3) {
+      videoRef.current.currentTime = target;
     }
-    updateVideoTransform(videoRef.current, currentTime, timeline, mode);
-  }, [currentTime, timeline, mode]);
+    // The proxy already has every transform baked in; re-applying the CSS
+    // approximation on top would double every zoom.
+    updateVideoTransform(videoRef.current, currentTime, timeline,
+                         useProxyVideo ? 'result' : mode);
+  }, [currentTime, programmeTime, useProxyVideo, timeline, mode]);
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
@@ -278,6 +422,12 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
   const handleSeek = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    // FX-still mode has no video element at all, so the bar drives the store
+    // directly and the frame follows the playhead.
+    if (modeRef.current === 'fx' && !proxyRef.current) {
+      setCurrentTime(editToSrc(x * cutDuration));
+      return;
+    }
     const video = videoRef.current;
     if (!video || !video.duration) return;
     // In cut mode the bar spans the EDIT, so a click lands on the kept material
@@ -286,7 +436,8 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
       ? editToSrc(x * cutDuration)
       : x * video.duration;
     video.currentTime = newTime;
-    setCurrentTime(newTime);
+    setCurrentTime(proxyRef.current
+      ? editToSrc(newTime - offsetRef.current) : newTime);
   }, [setCurrentTime, editToSrc, cutDuration]);
 
   const toggleMute = useCallback(() => {
@@ -314,8 +465,11 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
   // The cut preview reports edit time: total = kept material only, and the
   // playhead position counts only kept seconds behind it.
   const isCutMode = mode === 'cut' && hasCut;
-  const duration = isCutMode ? cutDuration : (videoRef.current?.duration || 60);
-  const displayTime = isCutMode ? srcToEdit(currentTime) : currentTime;
+  const isFx = mode === 'fx';
+  const duration = isFx ? (programmeDuration || 60)
+    : isCutMode ? cutDuration : (videoRef.current?.duration || 60);
+  const displayTime = isFx ? programmeTime
+    : isCutMode ? srcToEdit(currentTime) : currentTime;
 
   const MODES: Array<{ id: PreviewMode; label: string; show: boolean; title: string }> = [
     { id: 'cut', label: 'Cut', show: hasCut,
@@ -324,11 +478,14 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
       title: 'The last rendered file (B-roll, zoom, captions baked in — may be behind recent edits)' },
     { id: 'source', label: 'Source', show: !!sourceVideo,
       title: 'The untouched original clip' },
+    { id: 'fx', label: '✦ FX', show: hasCut,
+      title: 'The dressed programme — grade, effects, captions, B-roll and bars, '
+        + 'composed by the renderer itself. Exact, and always current.' },
   ];
 
   return (
     <div className="preview-player">
-      <div className="video-container" style={{ position: 'relative' }}>
+      <div className="video-container" ref={containerRef} style={{ position: 'relative' }}>
         {(hasCut || renderedOutput) && (
           <div style={{ position: 'absolute', top: 8, left: 8, zIndex: 5, display: 'flex', gap: 4 }}>
             {MODES.filter((m) => m.show).map((m) => (
@@ -341,9 +498,69 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
             ))}
           </div>
         )}
-        {activeSrc ? (
+        {mode === 'fx' && (
+          <div className="fx-stage-bar">
+            {useProxyVideo ? (
+              <>
+                <span className={`fx-pill ${proxy.stale ? 'warn' : 'ok'}`}>
+                  {proxy.stale ? '✦ proxy · behind the edit' : '✦ proxy · current'}
+                </span>
+                <button className="btn btn-xs" onClick={startProxy}
+                  title="Re-encode the dressed programme from the timeline as it stands now">
+                  Rebuild
+                </button>
+              </>
+            ) : proxy.state === 'building' ? (
+              <span className="fx-pill">
+                <span className="spinner" style={{ width: 10, height: 10 }} />
+                Building FX preview… {proxy.elapsed ? `${Math.round(proxy.elapsed)}s` : ''}
+              </span>
+            ) : (
+              <>
+                <span className={`fx-pill ${fxLoading ? '' : 'ok'}`}>
+                  {fxLoading ? '✦ composing…' : '✦ exact frame'}
+                </span>
+                <button className="btn btn-xs" onClick={startProxy}
+                  title="Encode the whole dressed programme small, so it plays and scrubs live with the effects moving. Roughly 2.5× realtime to build.">
+                  Build moving preview
+                </button>
+              </>
+            )}
+            {proxy.state === 'error' && (
+              <span className="fx-pill warn" title={proxy.detail}>build failed</span>
+            )}
+            <button className={`btn btn-xs ${layoutMode ? 'btn-primary' : ''}`}
+              onClick={() => setLayoutMode((v) => !v)}
+              title="Move and resize the clips on the canvas by dragging them, so several can share the frame">
+              ⬚ Layout
+            </button>
+          </div>
+        )}
+        {mode === 'fx' && layoutMode && (
+          <StageLayout programmeTime={programmeTime} pictureRect={pictureRect} />
+        )}
+        {mode === 'fx' && !useProxyVideo ? (
+          <div className="fx-stage" ref={stageRef}>
+            {fxFrame && !fxEmpty && (
+              <img className="video-element" src={fxFrame} alt="Composed preview frame"
+                ref={(el) => { pictureRef.current = el; }} />
+            )}
+            {fxEmpty && (
+              <div className="video-placeholder">
+                <span>Nothing on V1 at this point in the programme</span>
+              </div>
+            )}
+            {!fxFrame && !fxEmpty && (
+              <div className="video-loading">
+                <div className="spinner" />
+                <span>Composing the dressed frame…</span>
+              </div>
+            )}
+          </div>
+        ) : activeSrc ? (
           <>
-            <video ref={videoRef} className="video-element" onClick={togglePlay} />
+            <video className="video-element" onClick={togglePlay}
+              ref={(el) => { videoRef.current = el; pictureRef.current = el; }} />
             {!videoReady && !videoError && (
               <div className="video-loading">
                 <div className="spinner" />

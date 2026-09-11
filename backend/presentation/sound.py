@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from config import DATA_DIR, FFMPEG_BIN
+from utils.proc import NO_WINDOW
 from timeline import clip_ops
 from timeline.authoring import clear_generated
 from timeline.schema import AudioMaster, SourceFile, Timeline, time_to_frame
@@ -284,7 +285,8 @@ def synth_path(kind: str) -> Optional[Path]:
                "-c:a", "pcm_s16le", str(path)]
     try:
         subprocess.run(command, check=True, stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE, timeout=120)
+                       stderr=subprocess.PIPE, timeout=120,
+                       creationflags=NO_WINDOW)
     except subprocess.CalledProcessError as e:
         logger.warning("Could not synthesise %r: %s", kind,
                        (e.stderr or b"").decode("utf-8", "replace")[-300:])

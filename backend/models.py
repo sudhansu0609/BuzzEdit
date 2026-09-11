@@ -131,7 +131,16 @@ class AnalyzeJob(BaseModel):
 
 
 class HealthResponse(BaseModel):
+    # The identity block. GUARDIAN_PLAN.md section 11 rule 4: every health route
+    # answers who it is, on which port, in which process — so a scan that finds
+    # *a* listener can tell whether it found *this* app, and a shell can refuse
+    # to publish a port that some other program answered on.
+    app: str = "buzzedit"
     status: str = "ok"
+    port: int = 0
+    pid: int = 0
+    version: str = ""
+
     whisper_available: bool = False
     comfyui_connected: bool = False
     ffmpeg_available: bool = False

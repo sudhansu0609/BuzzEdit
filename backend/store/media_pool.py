@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from config import FFMPEG_BIN, PROJECTS_DIR
+from utils.proc import NO_WINDOW
 from utils.ffmpeg_utils import get_video_duration, get_video_info
 
 logger = logging.getLogger(__name__)
@@ -137,7 +138,8 @@ def ensure_thumbnail(project_id: str, entry: Dict[str, Any]) -> Optional[Path]:
         cmd = [FFMPEG_BIN, "-y", "-v", "error", "-ss", "1", "-i", str(source),
                "-vf", "scale=320:-2", "-frames:v", "1", "-update", "1", str(target)]
     try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+                       creationflags=NO_WINDOW)
     except Exception as exc:
         logger.warning("Thumbnail failed for %s: %s", source, exc)
         return None
@@ -150,7 +152,8 @@ def ensure_thumbnail(project_id: str, entry: Dict[str, Any]) -> Optional[Path]:
             subprocess.run(
                 [FFMPEG_BIN, "-y", "-v", "error", "-i", str(source),
                  "-vf", "scale=320:-2", "-frames:v", "1", "-update", "1", str(target)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+                creationflags=NO_WINDOW)
         except Exception:
             return None
     return target if target.exists() and target.stat().st_size > 0 else None

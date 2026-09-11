@@ -5,7 +5,7 @@ import {
   startPresentationPass, getPresentationStatus, getProject, getTimeline,
   listGenerationWorkflows, updateAppSettings, WorkflowInfo,
   getShotPlan, ShotPrompt, setProjectScript, getProjectScript, ScriptStatus,
-  listStyleProfiles, StyleProfile,
+  listStyleProfiles, StyleProfile, COMFY_BASE, hostPort,
 } from '../hooks/api';
 
 /** The dressing layers the pass adds on top of the cut (presentation/models.py
@@ -297,7 +297,9 @@ export default function AgentPanel() {
           background: comfyStatus.connected ? '#10b981' : '#ef4444',
           color: '#fff'
         }}>
-          {comfyStatus.connected ? 'ONLINE (127.0.0.1:8188)' : 'OFFLINE (Fallback Active)'}
+          {comfyStatus.connected
+            ? `ONLINE (${COMFY_BASE ? hostPort(COMFY_BASE) : 'ComfyUI'})`
+            : 'OFFLINE (Fallback Active)'}
         </span>
       </div>
       {!comfyStatus.connected && comfyStatus.reason && (

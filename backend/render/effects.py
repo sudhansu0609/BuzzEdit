@@ -434,7 +434,19 @@ def build_canvas_transform(
         # Pad up to at least the canvas so the final crop always has pixels to
         # take, then cut the canvas out at the panned position.
         pad_w, pad_h = max(target_w, canvas_w), max(target_h, canvas_h)
-        filters.append(f"pad={pad_w}:{pad_h}:(ow-iw)/2:(oh-ih)/2:color=black")
+
+        # Where the picture sits *inside* that pad. Zoomed in there is no room —
+        # the pad is the picture — and the crop below does the panning. Zoomed
+        # OUT the picture is smaller than the canvas and all the room is here, so
+        # a centred pad was the reason pos_x/pos_y did nothing once scale went
+        # under 1.0: you could shrink a clip but never move it off centre, which
+        # makes laying two of them side by side impossible.
+        room_x, room_y = pad_w - target_w, pad_h - target_h
+        place_x = int(round(room_x / 2.0 * (1.0 + max(-1.0, min(1.0, pan_x_start)))))
+        place_y = int(round(room_y / 2.0 * (1.0 + max(-1.0, min(1.0, pan_y_start)))))
+        place_x = max(0, min(room_x, place_x))
+        place_y = max(0, min(room_y, place_y))
+        filters.append(f"pad={pad_w}:{pad_h}:{place_x}:{place_y}:color=black")
 
         slack_x, slack_y = pad_w - canvas_w, pad_h - canvas_h
         offset_x = int(round(slack_x / 2.0 * (1.0 + max(-1.0, min(1.0, pan_x_start)))))

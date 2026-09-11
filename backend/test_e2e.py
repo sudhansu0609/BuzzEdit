@@ -13,7 +13,17 @@ from utils.ffmpeg_utils import run_ffmpeg
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("test_e2e")
 
-BASE_URL = "http://127.0.0.1:8099"
+# Where the backend actually is, not where it would like to be. The ledger
+# first, then an identity scan of the preferred range — GUARDIAN_PLAN.md
+# section 11 rule 5. `BUZZEDIT_URL` overrides everything, for a backend on
+# another machine or in a container.
+import buzzcaf_ports
+from config import APP_NAME, PORT_SPAN, PREFERRED_PORT
+
+BASE_URL = buzzcaf_ports.discover(
+    APP_NAME, PREFERRED_PORT, "/api/health", PORT_SPAN,
+    os.environ.get("BUZZEDIT_URL"),
+) or f"http://127.0.0.1:{PREFERRED_PORT}"
 
 def run_e2e_test():
     print("--- STARTING END-TO-END SYSTEM INTEGRATION TEST ---")

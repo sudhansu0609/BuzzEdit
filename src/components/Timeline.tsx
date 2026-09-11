@@ -4,9 +4,12 @@ import {
   useElectron, splitClip, deleteClip, moveClip, trimClip, addMedia, getWaveform,
   detachAudio, compoundClips, uncompoundClip, addTextClip, addTrack, addAdjustment,
   setTrackFlags, deleteTrack, TrackState, WaveformData,
+  getFilmstrip, filmstripImageUrl, FilmstripData,
 } from '../hooks/api';
 import { MEDIA_DND_TYPE } from './MediaPool';
 import { useCommand } from '../hooks/commands';
+import { effectiveTransitions } from '../lib/programme';
+import { prettyTransition } from './TransitionsPanel';
 
 // Build a filled mirrored-waveform SVG path for a source-time slice of peaks.
 function buildWavePath(peaks: number[], pps: number, startSec: number, endSec: number, width: number, height: number): string {
@@ -43,6 +46,46 @@ function ClipWaveform({ wave, sourceStartSec, sourceEndSec, width, height }: {
       style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
       <path d={d} fill="rgba(255,255,255,0.45)" />
     </svg>
+  );
+}
+
+// A strip covers the whole source, so the slice under a clip is found by scaling
+// it to the clip's pixels-per-second and shifting it left by the trim-in point.
+// Left-edge alignment is therefore always exact; only the rate degrades when the
+// clamp below kicks in.
+//
+// Chromium refuses to paint a background scaled past roughly 16k px, so a very
+// short clip cut from very long footage — which would demand a strip hundreds of
+// thousands of pixels wide — is capped. Past that point the frames advance
+// slower than real time, which at a few pixels per frame reads as "roughly this
+// part of the shot", and that is all the strip is for.
+const MAX_STRIP_PX = 16000;
+
+function ClipFilmstrip({ strip, projectId, sourceId, sourceStartSec, sourceEndSec, width }: {
+  strip: FilmstripData; projectId: string; sourceId: string;
+  sourceStartSec: number; sourceEndSec: number; width: number;
+}) {
+  const style = useMemo<React.CSSProperties>(() => {
+    const url = `url("${filmstripImageUrl(projectId, sourceId)}")`;
+    // A still has no timeline of its own: repeat the one frame across the clip.
+    if (strip.columns <= 1 || strip.duration <= 0) {
+      return { backgroundImage: url, backgroundSize: 'auto 100%', backgroundRepeat: 'repeat-x' };
+    }
+    const visibleSpan = Math.max(0.001, sourceEndSec - sourceStartSec);
+    const stripWidth = Math.min((strip.duration / visibleSpan) * width, MAX_STRIP_PX);
+    return {
+      backgroundImage: url,
+      backgroundSize: `${stripWidth.toFixed(1)}px 100%`,
+      backgroundPosition: `${(-(sourceStartSec / strip.duration) * stripWidth).toFixed(1)}px 0`,
+      backgroundRepeat: 'no-repeat',
+    };
+  }, [strip, projectId, sourceId, sourceStartSec, sourceEndSec, width]);
+
+  return (
+    <div aria-hidden style={{
+      position: 'absolute', inset: 0, borderRadius: 3, overflow: 'hidden',
+      pointerEvents: 'none', opacity: 0.9, ...style,
+    }} />
   );
 }
 
@@ -146,6 +189,7 @@ export default function Timeline() {
   const [busy, setBusy] = useState(false);
   const [scrubbing, setScrubbing] = useState(false);
   const [waveforms, setWaveforms] = useState<Record<string, WaveformData>>({});
+  const [filmstrips, setFilmstrips] = useState<Record<string, FilmstripData | null>>({});
 
   const tl = project?.timeline as TTimeline | undefined;
   const projectId = project?.id;
@@ -155,6 +199,15 @@ export default function Timeline() {
   const pxToFrame = (px: number) => Math.round((px / pixelsPerSecond) * fps);
 
   const items = tl?.items ?? [];
+
+  // Transitions and programme effects had no representation on the lanes at all,
+  // which is why applying one looked like nothing had happened: the panel said
+  // "Dissolve", the preview plays the source file, and the timeline was silent.
+  // These two are the edit's own record of what the render will add.
+  const junctions = useMemo(() => effectiveTransitions(tl), [tl]);
+  const programmeEffects: any[] = (tl as any)?.effects ?? [];
+  const programmeTransition = (tl as any)?.default_transition ?? null;
+
   const maxEndFrame = items.reduce((m, i) => Math.max(m, i.timeline_end_frame), 0);
   const durationSec = Math.max(maxEndFrame / fps, currentTime + 5, 30);
   const trackWidth = durationSec * pixelsPerSecond;
@@ -193,6 +246,56 @@ export default function Timeline() {
         .then(w => setWaveforms(prev => ({ ...prev, [sid]: w })))
         .catch(() => { waveReqRef.current.delete(sid); });
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, items]);
+
+  // Fetch a filmstrip for every source shown on a video lane. Sequential on
+  // purpose: each one is an ffmpeg pass over the whole source, and firing a
+  // dozen at once on a timeline full of B-roll would starve the render queue for
+  // a picture nobody is waiting on. They fill in as they arrive.
+  const stripReqRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!projectId) return;
+    const videoSources = Array.from(new Set(
+      items
+        .filter(i => trackKind(i.track) === 'V' && (i.kind ?? 'media') === 'media')
+        .map(i => i.source_id)
+        .filter(sid => (tl?.sources?.[sid]?.kind ?? 'video') !== 'audio')
+    ));
+    let cancelled = false;
+    (async () => {
+      for (const sid of videoSources) {
+        if (cancelled) return;
+        if (stripReqRef.current.has(sid)) continue;
+        stripReqRef.current.add(sid);
+        // The first request can land while the backend is still coming up, and
+        // one silent failure would otherwise leave that clip a blank block for
+        // the rest of the session — nothing re-runs this unless the timeline
+        // itself changes.
+        let strip = null;
+        for (let attempt = 0; attempt < 3 && !cancelled; attempt++) {
+          try {
+            strip = await getFilmstrip(projectId, sid);
+            break;
+          } catch {
+            await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+          }
+        }
+        // Commit before checking `cancelled`. This effect re-runs whenever the
+        // timeline object is replaced, and dropping an answered request on the
+        // way out left that source marked as already-fetched with nothing
+        // stored — one clip stuck as a blank block for the rest of the session.
+        if (strip) {
+          // columns 0 means "no picture in this source" — remember the null so
+          // we stop asking, and let the clip keep its plain block.
+          setFilmstrips(prev => ({ ...prev, [sid]: strip!.columns > 0 ? strip : null }));
+        } else {
+          stripReqRef.current.delete(sid);   // a later pass may still get it
+        }
+        if (cancelled) return;
+      }
+    })();
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, items]);
 
@@ -488,6 +591,27 @@ export default function Timeline() {
           )}
           <button className="btn btn-sm btn-danger" disabled={busy || !selectedItem || !isEditable(selectedItem)} onClick={handleDelete} title="Delete selected clip">🗑 Delete</button>
         </div>
+        {/* What is dressed on the *programme* — not on any one clip, so there is
+            nowhere else on the lanes for it to show. Without this, a rain effect
+            and a dissolve on every cut were invisible until the export came back
+            looking unexpectedly different. */}
+        {(programmeEffects.length > 0 || programmeTransition) && (
+          <div className="programme-fx" title="Applied to the whole programme — drawn when you render">
+            {programmeEffects.length > 0 && (
+              <span className="programme-fx-chip"
+                title={programmeEffects.map((e: any) =>
+                  `${e.type.replace(/_/g, ' ')}${e.enabled === false ? ' (off)' : ''}`).join(', ')}>
+                ✦ {programmeEffects.length} effect{programmeEffects.length === 1 ? '' : 's'}
+              </span>
+            )}
+            {programmeTransition && (
+              <span className="programme-fx-chip"
+                title={`Every cut without its own transition uses ${prettyTransition(programmeTransition.type)}`}>
+                ⋈ {prettyTransition(programmeTransition.type)} at cuts
+              </span>
+            )}
+          </div>
+        )}
         <div className="timeline-zoom">
           <button className="btn btn-sm" onClick={() => setZoom(Math.max(MIN_ZOOM, zoom - 0.2))}>-</button>
           <span className="text-xs text-muted">{Math.round(zoom * 100)}%</span>
@@ -630,17 +754,45 @@ export default function Timeline() {
                               height={LANE_HEIGHT - 8}
                             />
                           )}
+                          {laneKind === 'V' && projectId && filmstrips[item.source_id] && (
+                            <ClipFilmstrip
+                              strip={filmstrips[item.source_id]!}
+                              projectId={projectId}
+                              sourceId={item.source_id}
+                              sourceStartSec={item.source_start_frame / fps}
+                              sourceEndSec={item.source_end_frame / fps}
+                              width={Math.max(2, frameToPx(endF - startF))}
+                            />
+                          )}
+                          {/* The transition into this clip, drawn at its true
+                              length so a 2s dissolve looks like one. Sits under
+                              the trim handle and takes no pointer events, so it
+                              cannot get in the way of an edit. */}
+                          {junctions[item.id] && (
+                            <span className={`clip-transition ${junctions[item.id].own ? 'own' : ''}`}
+                              style={{ width: Math.max(6, frameToPx(junctions[item.id].duration * fps)) }}
+                              title={`${prettyTransition(junctions[item.id].type)} · ${junctions[item.id].duration.toFixed(2)}s`
+                                + (junctions[item.id].own ? ' (set on this clip)' : ' (programme default)')} />
+                          )}
                           {editable && (
                             <div onMouseDown={(e) => startDrag(e, item, 'trim-start')}
                               style={{ position: 'absolute', left: 0, top: 0, width: HANDLE_PX, height: '100%', cursor: 'ew-resize', background: 'rgba(255,255,255,0.25)', zIndex: 2 }} />
                           )}
-                          <span style={{ pointerEvents: 'none', paddingLeft: editable ? HANDLE_PX : 0, position: 'relative', zIndex: 1, textOverflow: 'ellipsis', overflow: 'hidden' }}>
+                          {/* The label sits over the frames now, so it needs its own contrast. */}
+                          <span style={{ pointerEvents: 'none', paddingLeft: editable ? HANDLE_PX : 0, position: 'relative', zIndex: 1, textOverflow: 'ellipsis', overflow: 'hidden', textShadow: '0 1px 2px rgba(0,0,0,0.85)' }}>
                             {clipLabel(item, kind, laneKind)}
                           </span>
                           {/* Badges for state that is otherwise invisible on the lane. */}
                           {(styled || item.mute) && (
                             <span style={{ position: 'absolute', top: 1, right: editable ? HANDLE_PX + 2 : 2, fontSize: 9, opacity: 0.85, zIndex: 3, pointerEvents: 'none' }}
-                              title={[styled ? 'has transform/colour' : '', item.mute ? 'audio detached' : ''].filter(Boolean).join(' · ')}>
+                              title={[
+                                styled ? `dressed: ${[
+                                  item.transform ? 'transform' : '',
+                                  item.color ? 'colour' : '',
+                                  item.atmosphere?.length ? `${item.atmosphere.length} effect${item.atmosphere.length === 1 ? '' : 's'}` : '',
+                                ].filter(Boolean).join(', ')} — applied at render` : '',
+                                item.mute ? 'audio detached' : '',
+                              ].filter(Boolean).join(' · ')}>
                               {styled ? '✦' : ''}{item.mute ? '🔇' : ''}
                             </span>
                           )}

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { useProjectStore, Project } from './store';
-import { autoSaveProject, getRecoveryState, getProject } from './api';
+import { API_BASE, autoSaveProject, getRecoveryState, getProject } from './api';
 
 const AUTO_SAVE_INTERVAL_MS = 30000;
 
@@ -65,7 +65,7 @@ export function useAutoSave() {
           timeline: project.timeline,
         };
         navigator.sendBeacon(
-          'http://localhost:8099/api/settings/auto_save',
+          `${API_BASE}/api/settings/auto_save`,
           JSON.stringify({ project_id: project.id, project_data: projectData })
         );
       }

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import FFMPEG_BIN
+from utils.proc import NO_WINDOW
 from timeline import clip_ops
 from timeline.authoring import clear_generated
 from timeline.schema import SourceFile, Timeline, frame_to_time, time_to_frame
@@ -166,7 +167,8 @@ def grab_frame(source_path: str, source_seconds: float, destination: Path) -> Op
             [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
              "-ss", f"{max(0.0, source_seconds):.3f}", "-i", source_path,
              "-frames:v", "1", str(destination)],
-            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+            creationflags=NO_WINDOW)
     except Exception as e:
         logger.warning("Could not grab a frame at %.2fs: %s", source_seconds, e)
         return None

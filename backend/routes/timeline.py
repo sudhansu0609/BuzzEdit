@@ -3,6 +3,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from store.project_store import ProjectStore
 from config import PROJECTS_DIR, OUTPUT_DIR
@@ -14,6 +15,7 @@ from timeline.schema import SourceFile, time_to_frame
 from timeline import authoring, clip_ops
 from store import media_pool
 from render import render_timeline_async
+from render import preview
 
 router = APIRouter()
 project_store = ProjectStore(base_dir=str(PROJECTS_DIR))
@@ -151,6 +153,12 @@ class AspectRequest(BaseModel):
     ratio: Optional[float] = None      # null clears the bars
 
 
+class PreviewProxyRequest(BaseModel):
+    # 540 keeps a 1080p programme watchable while staying roughly 2.5x realtime
+    # to build; 360 is for a long edit you only want to sanity-check.
+    height: int = 540
+
+
 class CaptionsRequest(BaseModel):
     preset: str = "classic"
     style: Dict[str, Any] = {}
@@ -198,6 +206,9 @@ def _ensure_timeline(project_id: str):
 def _save_timeline(project_id: str, p_data: dict, tl: Timeline):
     p_data["timeline"] = tl.model_dump()
     project_store.save_project(project_id, p_data)
+    # Composed preview frames are keyed by revision, so a stale one can never be
+    # served — but it would sit in memory forever. Dropped on every edit.
+    preview.invalidate(project_id)
 
 @router.post("/{project_id}/generate")
 async def generate_timeline(project_id: str):
@@ -271,6 +282,41 @@ async def get_waveform(project_id: str, source_id: str):
     if not data:
         return {"peaks": [], "points_per_second": 60, "duration": 0.0}
     return data
+
+
+def _filmstrip_meta(project_id: str, source_id: str):
+    """Shared lookup for the two filmstrip endpoints: (source, strip) or a 404."""
+    from utils.filmstrip import compute_filmstrip
+    _p_data, tl = _load_timeline(project_id)
+    src = tl.sources.get(source_id)
+    if not src:
+        raise HTTPException(status_code=404, detail="Source not found in timeline")
+    return src, compute_filmstrip(src.path, getattr(src, "kind", "video") or "video")
+
+
+@router.get("/{project_id}/filmstrip/{source_id}")
+async def get_filmstrip(project_id: str, source_id: str):
+    """Layout of a source's filmstrip, so a video lane can show frames not blocks.
+
+    The strip itself is served by the sibling `/image` route; this is only the
+    geometry the UI needs to line the right part of it up under each clip.
+    `columns: 0` means the source has no picture (an audio file) — the caller
+    draws its normal block, and does not ask again.
+    """
+    _src, strip = await asyncio.to_thread(_filmstrip_meta, project_id, source_id)
+    if not strip:
+        return {"columns": 0, "tile_width": 0, "tile_height": 0, "duration": 0.0}
+    return {k: v for k, v in strip.items() if k != "image_path"}
+
+
+@router.get("/{project_id}/filmstrip/{source_id}/image")
+async def get_filmstrip_image(project_id: str, source_id: str):
+    """The strip itself: one row of evenly spaced frames across the whole source."""
+    _src, strip = await asyncio.to_thread(_filmstrip_meta, project_id, source_id)
+    if not strip:
+        raise HTTPException(status_code=404, detail="No filmstrip for this source")
+    return FileResponse(strip["image_path"], media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
 
 
 @router.get("/{project_id}")
@@ -460,6 +506,50 @@ async def add_adjustment(project_id: str, body: AddAdjustmentRequest):
 async def set_aspect(project_id: str, body: AspectRequest):
     """Letterbox the programme to a cinematic aspect ratio (null clears it)."""
     return _clip_op(project_id, lambda tl: clip_ops.set_aspect_bars(tl, body.ratio))
+
+
+# --- Dressed previews ------------------------------------------------------
+# The live preview plays the source and skips the struck words, so it shows the
+# cut and nothing else — no grade, no atmosphere, no captions, no B-roll. These
+# two routes are where the dressing becomes visible before a full render.
+
+@router.get("/{project_id}/preview/frame")
+async def preview_frame(project_id: str, t: float = 0.0, w: int = 640):
+    """The fully dressed frame at `t` seconds of programme time, as a JPEG.
+
+    Composed by the real render compiler, so it is exact rather than a
+    simulation. 204 means there is nothing on V1 at that moment — a gap, or past
+    the end — and the caller should show black rather than the previous frame.
+    """
+    _p_data, tl = _load_timeline(project_id)
+    width = max(160, min(1920, int(w)))
+    data = await asyncio.to_thread(preview.compose_frame, project_id, tl, float(t), width)
+    if not data:
+        return Response(status_code=204)
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        # Immutable per (revision, time, width): the URL carries the revision, so
+        # the browser may keep it forever and scrubbing back costs nothing.
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@router.get("/{project_id}/preview/proxy")
+async def preview_proxy_status(project_id: str):
+    """Whether a dressed proxy exists, is building, or is behind the edit."""
+    _p_data, tl = _load_timeline(project_id)
+    return preview.proxy_status(project_id, tl.revision)
+
+
+@router.post("/{project_id}/preview/proxy")
+async def preview_proxy_build(project_id: str, body: PreviewProxyRequest):
+    """Build a low-resolution encode of the dressed programme in the background.
+
+    Roughly 2.5x realtime, so this is deliberately something the user asks for.
+    """
+    _p_data, tl = _load_timeline(project_id)
+    return preview.start_proxy(project_id, tl, height=body.height)
 
 
 @router.post("/{project_id}/text/add")

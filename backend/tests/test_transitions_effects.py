@@ -19,7 +19,7 @@ from backend.render import transitions
 from backend.render.atmosphere import build_aspect_bars, build_effect
 from backend.render.compiler import FilterGraphCompiler
 from backend.timeline import build_timeline_from_transcript, clip_ops
-from backend.timeline.schema import AtmosphereEffect, Transition
+from backend.timeline.schema import AtmosphereEffect, SourceFile, Timeline, Transition
 
 
 def _program(segments: int = 4, clip: float = 0.9, gap: float = 0.6):
@@ -90,6 +90,46 @@ def test_a_transition_cannot_outlast_the_clips_it_joins():
     assert "xfade" in graph
     duration = float(graph.split("xfade=transition=fade:duration=")[1].split(":")[0])
     assert duration <= 0.4
+
+
+def _grouped_program():
+    """Three manual V1 clips with the last two grouped: one junction before the
+    group and one inside it. Built by hand because transcript-built clips are
+    AI-managed and refuse to be compounded."""
+    tl = Timeline(fps_num=30, fps_den=1, width=1920, height=1080)
+    tl.sources["s"] = SourceFile(id="s", path="C:/v.mp4", duration_seconds=20.0,
+                                 kind="video", has_audio=True)
+    clip_ops.add_media_item(tl, "s", "V1", 0, 0, 60)
+    b = clip_ops.add_media_item(tl, "s", "V1", 60, 60, 120)
+    c = clip_ops.add_media_item(tl, "s", "V1", 120, 120, 180)
+    return tl, clip_ops.make_compound(tl, [b.id, c.id], label="Group")
+
+
+def test_a_transition_on_a_compound_survives_flattening():
+    """A group is one block on the lane, so a transition set on it has exactly one
+    junction to mean: the group's leading edge.
+
+    Flattening used to keep only the children's own transitions and drop the
+    parent's, so a dissolve set on a compound was stored, drawn on the timeline,
+    and then silently rendered as a hard cut.
+    """
+    timeline, group = _grouped_program()
+    clip_ops.set_transition(timeline, group.id, updates={"type": "fade", "duration": 0.4})
+
+    graph = _graph(timeline)
+    # One junction, at the group's leading edge — not on the cut inside it.
+    assert graph.count("xfade=transition=fade") == 1
+
+
+def test_a_transition_inside_a_compound_is_left_alone():
+    """The parent's transition fills in only where a child has none of its own."""
+    timeline, group = _grouped_program()
+    group.children[1].transition = Transition(type="wipeleft", duration=0.3)
+    clip_ops.set_transition(timeline, group.id, updates={"type": "fade", "duration": 0.4})
+
+    graph = _graph(timeline)
+    assert graph.count("xfade=transition=fade") == 1
+    assert graph.count("xfade=transition=wipeleft") == 1
 
 
 def test_a_zero_duration_transition_is_a_hard_cut():

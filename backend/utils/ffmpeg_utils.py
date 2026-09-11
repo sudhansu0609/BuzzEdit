@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 from config import FFMPEG_BIN, FFPROBE_BIN, TEMP_DIR
+from utils.proc import NO_WINDOW
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ def run_ffmpeg(args: list[str], timeout: int = 3600) -> str:
         capture_output=True,
         text=True,
         timeout=timeout,
+        creationflags=NO_WINDOW,
     )
     if result.returncode != 0:
         logger.error(f"FFmpeg error: {result.stderr}")
@@ -39,7 +41,8 @@ def run_ffprobe(path: str, stream: Optional[str] = None) -> dict:
         cmd.extend(["-select_streams", stream])
     cmd.append(path)
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                            creationflags=NO_WINDOW)
     if result.returncode != 0:
         raise FFmpegError(f"FFprobe failed: {result.stderr}")
     return json.loads(result.stdout)

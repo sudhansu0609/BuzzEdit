@@ -4,19 +4,54 @@ import { useProjectStore } from './store';
 declare global {
   interface Window {
     electronAPI?: {
+      /** The backend URL the shell actually took — see electron/preload.cjs. */
+      apiUrl?: string | null;
+      /** The ComfyUI URL the shell actually took. */
+      comfyUrl?: string | null;
       dialogOpenFile: (opts: any) => Promise<any>;
       dialogSaveFile: (opts: any) => Promise<any>;
       windowMinimize: () => Promise<void>;
       windowMaximize: () => Promise<void>;
       windowClose: () => Promise<void>;
       getApiUrl: () => Promise<string>;
+      getPorts?: () => Promise<{
+        apiUrl: string; comfyUrl: string; backendPort: number; comfyPort: number;
+      }>;
       openPath: (filePath: string) => Promise<string>;
       showItemInFolder: (filePath: string) => Promise<void>;
     };
   }
 }
 
-const API_BASE = 'http://localhost:8099';
+/**
+ * Where the backend is, decided once at load.
+ *
+ * GUARDIAN_PLAN.md section 11: no port is written down here, because the
+ * backend may well not be on 8099 — if something else held it the shell stepped
+ * forward, and the number is only known at launch.
+ *
+ *  1. Electron hands the real URL to the preload as a command-line switch. That
+ *     is the production path, and the only one that works from `file://`.
+ *  2. `VITE_BUZZEDIT_API` for a browser pointed straight at a backend.
+ *  3. Otherwise relative, i.e. `window.location.origin` — correct both when the
+ *     bundle is served by the backend itself and under `vite dev`, whose proxy
+ *     (vite.config.ts) forwards to the port it was handed at launch.
+ */
+export const API_BASE: string =
+  (typeof window !== 'undefined' ? window.electronAPI?.apiUrl : null)
+  || (import.meta.env?.VITE_BUZZEDIT_API as string | undefined)
+  || '';
+
+/** The ComfyUI URL, for the places the UI names it. Empty when unknown. */
+export const COMFY_BASE: string =
+  (typeof window !== 'undefined' ? window.electronAPI?.comfyUrl : null)
+  || (import.meta.env?.VITE_COMFYUI_URL as string | undefined)
+  || '';
+
+/** Strips the scheme from a base URL, for display: `http://host:port` -> `host:port`. */
+export function hostPort(url: string): string {
+  return url.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+}
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -352,6 +387,9 @@ export interface PresetCatalogue {
   effect: PresetEntry[];
   aspect: PresetEntry[];
   transition_catalogue: { group: string; transitions: string[] }[];
+  /** Every atmosphere effect the renderer can build, including the ones with no
+   *  named preset (glitch, VHS, shake, flash, flicker). */
+  effect_catalogue: { id: string; label: string; description: string }[];
 }
 
 // --- Transitions, atmosphere effects and cinematic bars ---
@@ -419,6 +457,46 @@ export async function addAdjustment(
       duration_seconds: opts.durationSeconds ?? 5,
       preset: opts.preset ?? null,
     }),
+  });
+}
+
+// --- Dressed preview (what the render will actually look like) ---
+
+/**
+ * URL of the fully composed frame at `seconds` of programme time.
+ *
+ * `revision` is part of the URL rather than a cache-buster bolted on: the
+ * backend serves these `immutable`, so a frame the user scrubs back over is
+ * fetched once for the life of that edit and comes from the browser cache
+ * afterwards. Bumping the revision simply names a different resource.
+ */
+export function previewFrameUrl(
+  projectId: string, seconds: number, width: number, revision: number | undefined,
+): string {
+  const t = Math.max(0, seconds).toFixed(2);
+  return `${API_BASE}/api/timeline/${projectId}/preview/frame`
+    + `?t=${t}&w=${Math.round(width)}&r=${revision ?? 0}`;
+}
+
+export interface ProxyStatus {
+  state: 'none' | 'building' | 'ready' | 'error';
+  path?: string;
+  revision?: number | null;
+  stale?: boolean;
+  elapsed?: number;
+  detail?: string;
+  size_bytes?: number;
+  mtime?: number;
+}
+
+export async function getPreviewProxy(projectId: string): Promise<ProxyStatus> {
+  return api(`/api/timeline/${projectId}/preview/proxy`);
+}
+
+export async function buildPreviewProxy(projectId: string, height = 540): Promise<ProxyStatus> {
+  return api(`/api/timeline/${projectId}/preview/proxy`, {
+    method: 'POST',
+    body: JSON.stringify({ height }),
   });
 }
 
@@ -512,6 +590,25 @@ export interface WaveformData {
 
 export async function getWaveform(projectId: string, sourceId: string): Promise<WaveformData> {
   return api(`/api/timeline/${projectId}/waveform/${sourceId}`);
+}
+
+/** Layout of a source's filmstrip: `columns` frames spread evenly over `duration`
+ *  seconds. `columns: 0` means the source has no picture to show. */
+export interface FilmstripData {
+  columns: number;
+  tile_width: number;
+  tile_height: number;
+  duration: number;
+}
+
+export async function getFilmstrip(projectId: string, sourceId: string): Promise<FilmstripData> {
+  return api(`/api/timeline/${projectId}/filmstrip/${sourceId}`);
+}
+
+/** The strip image itself. One URL per source, so every clip cut from the same
+ *  footage shares a single decoded image in the browser cache. */
+export function filmstripImageUrl(projectId: string, sourceId: string): string {
+  return `${API_BASE}/api/timeline/${projectId}/filmstrip/${sourceId}/image`;
 }
 
 export async function addMedia(projectId: string, path: string, opts?: { track?: string; timelineStartFrame?: number }): Promise<any> {

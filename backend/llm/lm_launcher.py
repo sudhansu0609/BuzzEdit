@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+from utils.proc import NO_WINDOW
 
 logger = logging.getLogger("lm_launcher")
 
@@ -74,6 +75,7 @@ async def _run(cmd: List[str], timeout: float = 60.0):
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            creationflags=NO_WINDOW,
         )
     except Exception as e:
         return -1, "", f"spawn failed: {e}"

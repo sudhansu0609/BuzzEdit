@@ -4,16 +4,17 @@
   "description": "AI-Powered Automated Video Editor",
   "main": "electron/main.cjs",
   "scripts": {
-    "dev": "concurrently \"npm run dev:react\" \"npm run dev:electron\"",
-    "start": "START_APP.bat",
-    "start:all": "START_APP.bat",
+    "dev": "node scripts/dev.mjs",
+    "start": "START_APP.bat --console",
+    "start:silent": "START_APP.bat",
     "dev:react": "vite",
-    "dev:electron": "wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .",
+    "dev:electron": "cross-env NODE_ENV=development electron .",
     "dev:backend": "cd backend && python main.py",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "package": "electron-builder",
-    "lint": "eslint src --ext .ts,.tsx"
+    "lint": "eslint src --ext .ts,.tsx",
+    "test:ports": "node --test scripts/buzzcaf-ports.test.mjs scripts/port-plan.test.mjs"
   },
   "devDependencies": {
     "@types/react": "^18.2.43",
@@ -48,6 +49,7 @@
     "files": [
       "dist/**/*",
       "electron/**/*",
+      "scripts/buzzcaf-ports.mjs",
       "backend/**/*",
       "workflows/**/*",
       "requirements.txt"

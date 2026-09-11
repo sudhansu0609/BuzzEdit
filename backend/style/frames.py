@@ -16,6 +16,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from config import FFMPEG_BIN
+from utils.proc import NO_WINDOW
 from utils.ffmpeg_utils import get_video_info
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,7 @@ def sample(
 
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              timeout=600)
+                              timeout=600, creationflags=NO_WINDOW)
     except Exception as exc:
         raise FrameSampleError(f"ffmpeg failed sampling {path}: {exc}") from exc
 
@@ -95,7 +96,8 @@ def sample_audio(path: str, sample_rate: int = 22050, max_seconds: float = 1800.
         "-f", "f32le", "-acodec", "pcm_f32le", "-",
     ]
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300,
+                              creationflags=NO_WINDOW)
     except Exception as exc:
         logger.warning("Audio sampling failed for %s: %s", path, exc)
         return np.zeros(0, dtype=np.float32)

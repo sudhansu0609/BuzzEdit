@@ -13,11 +13,12 @@ Availability is therefore checked by *finding* the module, never importing it.
 """
 
 import importlib.util
+import os
 
 import requests
 from fastapi import APIRouter
 
-from config import COMFYUI_URL
+from config import APP_NAME, APP_VERSION, COMFYUI_URL, bound_port
 from models import HealthResponse
 from utils.ffmpeg_utils import run_ffprobe
 
@@ -42,7 +43,16 @@ def _module_installed(name: str) -> bool:
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
-    response = HealthResponse()
+    # The identity block first, and unconditionally: the launcher polls this
+    # route to decide whether the thing that answered on the port it picked is
+    # really us, so it has to be right even when every probe below fails.
+    response = HealthResponse(
+        app=APP_NAME,
+        status="ok",
+        port=bound_port(),
+        pid=os.getpid(),
+        version=APP_VERSION,
+    )
 
     try:
         run_ffprobe("NUL")

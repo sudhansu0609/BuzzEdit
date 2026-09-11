@@ -15,6 +15,7 @@ from typing import Optional
 import numpy as np
 
 from config import FFMPEG_BIN, TEMP_DIR
+from utils.proc import NO_WINDOW
 
 logger = logging.getLogger("waveform")
 
@@ -49,7 +50,8 @@ def compute_waveform(media_path: str, points_per_second: int = _POINTS_PER_SECON
         "-f", "f32le", "-acodec", "pcm_f32le", "-",
     ]
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+                              creationflags=NO_WINDOW)
     except Exception as e:
         logger.warning(f"waveform ffmpeg failed for {media_path}: {e}")
         return None
