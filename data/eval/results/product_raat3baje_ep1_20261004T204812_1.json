@@ -1,0 +1,100 @@
+{
+ "result": {
+  "wrongly_removed_s": 11.3,
+  "missed_s": 40.9,
+  "caught_pct": 58.8,
+  "cuts": 60,
+  "wrong_by_reason": {
+   "stutter": 5.3,
+   "retake": 5.1,
+   "false_start": 0.7,
+   "filler": 0.1
+  },
+  "recording": "raat3baje_ep1",
+  "run": 1,
+  "mode": "product",
+  "seconds": 163.4,
+  "tokens_in": 121512,
+  "tokens_out": 54894,
+  "usd": 1.584,
+  "reads": 3,
+  "removed_takes": 61,
+  "trims": 89,
+  "kept_under_doubt": 5,
+  "style_examples": 4,
+  "untranscribed_cut_s": 0.4,
+  "refused": 21
+ },
+ "review": [
+  {
+   "take": "U6",
+   "start": 19.32,
+   "end": 19.72,
+   "text": "रात के",
+   "decision": "kept",
+   "votes": "1 of 3 reads removed it",
+   "why": "Repeats 'रात' from U5.",
+   "twin": "U256",
+   "twin_start": 755.49,
+   "context": "U4 [11.0-13.0s, pause before 0.3s] हेलो दोस्तों मेरा नाम सुधान  || fades out; slow | similar to U2 (0.68) | same opening as U2\nU5 [13.5-16.1s, pause before 0.5s] सो और आप देखें रात  || ends on a level pitch; slow; a word held 1.3 s | similar to U2 (0.56)\nU6 [19.3-19.7s, pause before 3.2s] रात के  || fades out; ends on a level pitch | similar to U256 (0.56), U386 (0.51)\nU7 [20.7-21.7s, pause before 1.0s] तीन बजे  || fades out; slow\nU8 [22.2-39.1s, pause before 0.5s] एक सिक्योटी आपके लिए एक फिर से बहुत ही इंट्रेस्टिंग कहाने लेकर आ हूं मैं चलिए किसी देड़ी के आज की कहानी शुरू करते उस हैं तरवाजी के पीछे से  || slow; fillers ×1; a word held 2.1 s",
+   "kind": "doubt",
+   "answer": null
+  },
+  {
+   "take": "U168",
+   "start": 490.53,
+   "end": 491.46,
+   "text": "था खतरनाक हो कि",
+   "decision": "kept",
+   "votes": "2 of 3 reads removed it",
+   "why": "Fragment said again in U169.",
+   "twin": null,
+   "twin_start": null,
+   "context": "U166 [486.8-487.9s, pause before 0.6s] कि इसने बहुत जोर से  || ends on a level pitch\nU167 [488.3-489.3s, pause before 0.4s] बार बार उसे मिटा दिया  || similar to U281 (0.50)\nU168 [490.5-491.5s, pause before 1.2s] था खतरनाक हो कि  || ends on a level pitch\nU169 [491.9-497.8s, pause before 0.5s] लिखा ही नहीं जा जैसे [speech, no transcript, 1.7 s] ख़दरनाक होकी लिखा है जैसे वो वो इतना खतरनाक हो कि लिखा ही ना जा सके  || fades out; a word held 3.2 s; 1.7 s of speech the transcript missed\nU170 [500.7-502.1s, pause before 2.9s] अर्जुन ने कटे हुई लाइन को देखा",
+   "kind": "doubt",
+   "answer": null
+  },
+  {
+   "take": "U320",
+   "start": 999.23,
+   "end": 1002.15,
+   "text": "और यही एक जगह है जहाँ पे हमारी कहानी का बेस्मेंट चूरता है",
+   "decision": "kept",
+   "votes": "1 of 3 reads removed it",
+   "why": "U320 and U321 were reworded as U322 after a pause. (kept U322)",
+   "twin": "U322",
+   "twin_start": 1010.89,
+   "context": "U318 [993.3-997.2s, pause before 0.5s] जहां कोई अनाथ मरा आराहूँ हो, [speech, no transcript, 0.5 s] यहां जहां जमेन को ठीक से चुदना किया गया हो  || 0.5 s of speech the transcript missed | similar to U316 (0.61), U317 (0.56)\nU319 [997.6-998.5s, pause before 0.5s] घर बनाने से पहले  || similar to U157 (0.60), U158 (0.54)\nU320 [999.2-1002.2s, pause before 0.7s] और यही एक जगह है जहाँ पे हमारी कहानी का बेस्मेंट चूरता है  || similar to U322 (0.55), U463 (0.50)\nU321 [1004.5-1004.9s, pause before 2.3s] नहीं की  || ends on a level pitch | similar to U83 (0.53), U84 (0.50)\nU322 [1010.9-1014.4s, pause before 6.0s] इस कहानी का बेस्मेंट एक ऐसी जगह थी जहाँ पे कोई शुद्धता नहीं की हुई हो  || similar to U320 (0.55)",
+   "kind": "doubt",
+   "answer": null
+  },
+  {
+   "take": "U409",
+   "start": 1406.34,
+   "end": 1407.1,
+   "text": "ऐसा लोग कह देते हैं",
+   "decision": "kept",
+   "votes": "1 of 3 reads removed it",
+   "why": "Same idea; U409 is unfinished (kept U410)",
+   "twin": null,
+   "twin_start": null,
+   "context": "U407 [1399.1-1402.9s, pause before 0.6s] जहां टूरिस्ट को ना किसी लीगल वजह से या फिर बल्कि क्योंकि कुछ शब्द में बोल  || fades out\nU408 [1403.2-1405.2s, pause before 0.3s] बोल दिया जाता है कि आपको यहां जाना मना है  || similar to U424 (0.76), U451 (0.57), U463 (0.57)\nU409 [1406.3-1407.1s, pause before 1.2s] ऐसा लोग कह देते हैं  || fades out; ends on a level pitch\nU410 [1407.5-1428.8s, pause before 0.4s] जो गाइड से वहाँ पर ऐसा कह देते हैं कि बस यहां आप [speech, no transcript, 2.6 s] [speech, no transcript, 0.8 s] [speech, no transcript, 1.2 s] [speech, no transcript, 2.1 s] मैं यहाँ पर किसी specific हवेली का नाम नहीं लूँगा हमारे पास हमारे पास इस दपी हमारे पास इस episode के लिए कोई verified date या जगह का नाम नहीं है किसी स्पेसिफिक जगह का नाम नहीं है  || fades out; quieter (-9 dB); slow; a word held 14.5 s; 6.7 s of speech the transcript missed\nU411 [1429.4-1432.4s, pause before 0.6s] लेकिन यह पैटर्न यह व्यवहार देश बर में हर जगह देखा जाता है  || similar to U413 (1.00) | same opening as U413",
+   "kind": "doubt",
+   "answer": null
+  },
+  {
+   "take": "U466",
+   "start": 1662.54,
+   "end": 1663.92,
+   "text": "तो दोस्तों कैसे लगे आपको ये कहानी",
+   "decision": "kept",
+   "votes": "2 of 3 reads removed it",
+   "why": "Repeated outro attempts; the last one is inside U467. (kept U467)",
+   "twin": "U465",
+   "twin_start": 1657.8,
+   "context": "U464 [1647.6-1648.9s, pause before 1.3s] अब मैं साफ साफ कह जाता हूँ  || fades out; rushed\nU465 [1657.8-1661.7s, pause before 8.9s] तो दोस्तों कैसे लगे आपको ये कहानी अगर आपको ये rules वाली कहानी पसंद है और यह स्टूट  || ends on a level pitch | similar to U466 (0.75), U467 (0.66) | same opening as U466\nU466 [1662.5-1663.9s, pause before 0.8s] तो दोस्तों कैसे लगे आपको ये कहानी  || fades out | similar to U465 (0.75) | same opening as U465\nU467 [1664.4-1686.2s, pause before 0.5s] अगर आपको ये rules वाला format पसंद है और ये कहानी [speech, no transcript, 0.5 s] [speech, no transcript, 1.1 s] [speech, no transcript, 2.3 s] [speech, no transcript, 0.9 s] [speech, no transcript, 0.5 s] [speech, no transcript, 0.5 s] [speech, no transcript, 2.4 s] कीजिए अपना नाम लिखिए आपके अपना नाम लिखिए कि आप यह वीडियो कहां से देख रहे हैं कमेंट में बताएं तो कमेंट तुझ तुझ तुझ दोष्टों कैसे लगे आपको ये कहानी? अगर आपको ये कहानी पसंद आई है तो प्लीज इसको लाइक कीजिए अगर चैनल पर नहीं है तो इसको सब्सक्राइब कीजिए और और अपना नाम लिखिये  || ends on a level pitch; a word held 14.6 s; 8.1 s of speech the transcript missed | similar to U465 (0.66)\nU468 [1686.5-1688.1s, pause before 0.3s] कि आप ये वीडियो कहां से देख रहे  || fades out; rushed",
+   "kind": "doubt",
+   "answer": null
+  }
+ ]
+}

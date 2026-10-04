@@ -155,6 +155,10 @@ class Beat(BaseModel):
     # the still gets that character's face swapped in, and a clip made from it
     # keeps the face. False for anyone else, crowds, places and objects.
     shows_character: bool = False
+    # "in" / "out" when a gradual genre took a zoom out of this clip's prompt
+    # (presentation.camera): the clip is generated locked off and placement
+    # puts the move back as a slow timeline zoom. None = the clip moves itself.
+    camera_move: Optional[str] = None
 
     @property
     def duration_s(self) -> float:

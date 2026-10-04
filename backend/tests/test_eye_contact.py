@@ -293,3 +293,65 @@ def test_without_camera_looks_the_shared_push_stands():
     corr_e, lens_e = per_eye_limits(corr, s_e, np.ones(n, bool), np.ones(n), np.zeros(n), np.zeros(n),
                                     FPS, Settings())
     assert lens_e == {} and np.array_equal(corr_e["R"], corr) and np.array_equal(corr_e["L"], corr)
+
+
+def test_a_short_clip_uses_the_whole_recordings_lens_positions():
+    """A 30 s preview rarely holds 2 s of camera looks, so on its own it fell back to the shared
+    push and showed the old over-pushed eyes; given the whole recording's lens positions, the
+    same clip stops each eye at its own."""
+    from eyecontact.plan import LENS_MARGIN, per_eye_limits
+    n = 200
+    corr = np.full(n, -0.061)
+    s_e = {"R": np.full(n, -0.044), "L": np.full(n, 0.112)}
+    known = {"R": -0.07, "L": 0.086}
+    corr_e, lens_e = per_eye_limits(corr, s_e, np.ones(n, bool), np.ones(n), np.zeros(n), np.zeros(n),
+                                    FPS, Settings(tv_lambda=0.0), known)
+    assert lens_e == known
+    for k in "RL":
+        assert np.all(s_e[k] + corr_e[k] >= known[k] - LENS_MARGIN - 1e-9)
+        assert np.all(np.abs(corr_e[k]) < np.abs(corr))
+
+
+def _eye_v(c_t, c_s=0.0):
+    g = EyeGeom(mid=(500, 300), ex=(1, 0), corners=[(467, 300), (533, 300)],
+                upper=[(467 + 66 * s, 300 - 12 * np.sin(np.pi * s)) for s in np.linspace(0.1, 0.9, 7)],
+                lower=[(467 + 66 * s, 300 + 10 * np.sin(np.pi * s)) for s in np.linspace(0.1, 0.9, 7)],
+                iris=(500, 298), r=14)
+    return torch.tensor([eye_params(g, c_s, EYE_W, 0, 0, c_t=c_t)], dtype=torch.float32)
+
+
+def test_vertical_shift_moves_the_iris_down_and_leaves_the_face_alone():
+    p = _eye_v(1.5)
+    dx, dy = _d(p, [(500, 298), (495, 300), (505, 296)])
+    assert np.allclose(dy, 1.5, atol=1e-4) and np.allclose(dx, 0.0, atol=1e-4)
+    dx, dy = _d(p, [(467, 300), (533, 300), (500, 260), (500, 340)])
+    assert np.allclose(dy, 0.0, atol=1e-4)                  # corners, brow and cheek untouched
+    _, up = _d(_eye_v(-1.5), [(500, 298)])
+    assert np.allclose(up, -1.5, atol=1e-4)                 # negative looks higher
+
+
+def test_vertical_shift_never_folds_and_is_clamped():
+    for c_t in (2.0, 40.0):
+        p = _eye_v(c_t)
+        assert abs(float(p[0, 23])) <= 0.5 * 0.14 * EYE_W + 1e-6
+        ys = np.linspace(260, 340, 801)
+        for col in (480, 490, 500, 510, 520):
+            _, dy = _d(p, [(col, y) for y in ys])
+            assert np.all(np.diff(ys + dy) > 0)
+
+
+def test_pitch_moves_only_the_reaimed_frames():
+    from eyecontact.plan import EYE_WIDTHS_PER_DEGREE, vertical_shift
+    weight = np.array([0.0, 0.5, 1.0, 1.0])
+    valid = np.array([True, True, True, False])
+    assert not vertical_shift(Settings(), weight, valid).any()
+    v = vertical_shift(Settings(pitch_deg=2.0), weight, valid)
+    assert v[0] == 0 and v[3] == 0                            # a camera look and a lost face stay
+    assert v[2] == pytest.approx(2.0 * EYE_WIDTHS_PER_DEGREE, rel=1e-3) and v[1] == pytest.approx(v[2] / 2)
+    assert vertical_shift(Settings(pitch_deg=-2.0), weight, valid)[2] < 0
+
+
+def test_plan_carries_the_vertical_shift():
+    pts, _gaze, _ = _reading(seconds=8)
+    plan = make_plan(pts, np.full(len(pts), 10.0), FPS, Settings(angle_deg=10.0, pitch_deg=2.0))
+    assert plan["corr_t"].shape == plan["corr"].shape and plan["corr_t"].max() > 0

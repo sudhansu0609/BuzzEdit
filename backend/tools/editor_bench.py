@@ -169,6 +169,61 @@ async def bench(p: Dict[str, Any], args, style_text: str = "") -> List[Dict[str,
     return results
 
 
+def wrong_by_reason(words: List[Dict[str, Any]], key: Dict[str, Any]) -> Dict[str, float]:
+    """Seconds of kept speech removed, per cut reason (words capped at WORD_CAP_S, as in score)."""
+    cut = [(float(s["start"]), float(s["end"])) for s in key["spans"]]
+    editorial = [tuple(e) for e in key.get("editorial", [])]
+    out: Dict[str, float] = {}
+    for w in words:
+        if w.get("enabled", True) or not str(w.get("word") or "").strip():
+            continue
+        a, b = float(w["start"]), float(w["end"])
+        mid = (a + b) / 2
+        if any(s <= mid < e for s, e in editorial) or any(s <= mid < e for s, e in cut):
+            continue
+        reason = str(w.get("reason") or "?")
+        out[reason] = round(out.get(reason, 0.0) + min(WORD_CAP_S, b - a), 1)
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+
+async def bench_product(name: str, args) -> List[Dict[str, Any]]:
+    """The planner exactly as the app runs it (asr.editor_planner): the audio passes, three
+    reads, cut only where all agree, examples from data/style/examples.jsonl minus this key's own
+    (leave-one-out). Scored like the other modes, on the words it returns."""
+    from asr import editor
+    from asr.editor_planner import plan_with_editor_sync
+
+    key = json.loads((_eval_dir() / f"{name}.json").read_text(encoding="utf-8"))
+    wav = _wav(name, key)
+    words = await _words(name, key, wav)
+    client = editor.EditorClient(base_url=args.base_url, api_key=args.key or _studio_key(),
+                                 model=args.model, effort=args.effort)
+    results = []
+    for run in range(args.runs):
+        started = time.time()
+        out = await asyncio.to_thread(plan_with_editor_sync, [dict(w) for w in words], str(wav),
+                                      {"genre": key.get("genre"), "glossary": name.split("_")[0]},
+                                      client, name)
+        report = out[0]["_edit_report"]
+        removed = {i for i, w in enumerate(out) if not w.get("enabled", True)}
+        result = score(out, removed, [], key)
+        result["wrong_by_reason"] = wrong_by_reason(out, key)
+        ed = report["editor"]
+        result.update(recording=name, run=run, mode="product", seconds=round(time.time() - started, 1),
+                      tokens_in=ed["tokens_in"], tokens_out=ed["tokens_out"],
+                      usd=round((ed["tokens_in"] * OPUS_PRICE[0] + ed["tokens_out"] * OPUS_PRICE[1]) / 1e6, 3),
+                      reads=ed["reads"], removed_takes=ed["removed_takes"], trims=ed["trims"],
+                      kept_under_doubt=ed["kept_under_doubt"], style_examples=ed["style_examples"],
+                      untranscribed_cut_s=ed["untranscribed_cut_s"], refused=ed["refused"])
+        results.append(result)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        path = _eval_dir() / "results" / f"product_{name}_{time.strftime('%Y%m%dT%H%M%S')}_{run}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"result": result, "review": report.get("review")}, ensure_ascii=False,
+                                   indent=1), encoding="utf-8")
+    return results
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("keys", nargs="+")
@@ -184,7 +239,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="show the editor worked examples from the OTHER keys (leave-one-out)")
     p.add_argument("--full", action="store_true", help="run the whole double-check pipeline (asr.double_check)")
     p.add_argument("--agree-runs", type=int, default=3, help="editor passes that must agree, with --full")
+    p.add_argument("--product", action="store_true",
+                   help="run the planner exactly as the app does (asr.editor_planner)")
     args = p.parse_args(argv)
+
+    if args.product:
+        async def run_product():
+            for name in args.keys:
+                await bench_product(name, args)
+        asyncio.run(run_product())
+        return 0
 
     async def run_all():
         prepared = {name: await prepare(name, args) for name in args.keys}

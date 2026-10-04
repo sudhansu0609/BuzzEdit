@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from .gpu import VideoInfo, frame_tensor, torch_cuda_handles
-from .warp import GraphWarp, frame_rows, window_size
+from .warp import GraphWarp, frame_rows, moves, window_size
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ def render(src: str, dst: str, plan: dict, info: VideoInfo, quality: str = "high
                 torch.cuda.current_stream().synchronize()
                 for j, fr in enumerate(batch):
                     gw.frame.copy_(held[j])
-                    if i < n_plan and plan["valid"][i] and abs(plan["corr"][i]) > 1e-4:
+                    if moves(plan, i):
                         gw.set_eyes(frame_rows(plan, i, H, W, bh, bw))
                         gw.run()
                     slot = ring[i % len(ring)]

@@ -53,6 +53,11 @@ class WordItem(BaseModel):
     # verify.PROTECTED_WORDS could never match. None for English speech and for
     # words added by hand.
     word_native: Optional[str] = None
+    # The AI editor's utterance ("U41") this word belongs to, and its reason in
+    # its own words. A take is what the editor decides on and what the review
+    # list restores or removes as one; None for the classic planner's words.
+    take: Optional[str] = None
+    note: Optional[str] = None
 
 class TimelineEffect(BaseModel):
     type: str  # "zoompan", "fade", "lut"
@@ -486,6 +491,10 @@ class Timeline(BaseModel):
     # already implies. Reapplied by rebuild_primary_tracks after every
     # word-toggle rebuild so a hand cut survives a transcript edit.
     manual_cuts: List[List[int]] = Field(default_factory=list)
+    # The AI editor's "decided under doubt" list (asr.editor_planner): calls its
+    # reads disagreed on, plus cut points the listening check could not settle.
+    # Each item names a take; `answer` is the user's verdict once given.
+    review: List[Dict[str, Any]] = Field(default_factory=list)
     # Per-track switches, keyed by track name ("V2", "A1", "T1"). Absent means
     # every switch is off.
     tracks: Dict[str, TrackState] = Field(default_factory=dict)

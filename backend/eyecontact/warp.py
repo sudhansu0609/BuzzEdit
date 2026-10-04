@@ -7,6 +7,9 @@ catchlights and lashes. The displacement is a smooth field in each eye's own fra
     so the whites on one side compress and the other side stretches;
   * across t: full strength inside the lid opening, easing to zero a little way into
     the lids, so the iris slides under the lid edge the way a turning eye does.
+The same shape carries an optional shift ACROSS the axis (c_t, + = down): the opening's
+content and the lid edges move together and ease out into the lids, as when an eye looks
+a little lower or higher.
 Every pixel outside the eye windows is left bit-identical.
 
 Both eyes (luma bicubic, chroma bilinear) run as one CUDA-graph replay per frame;
@@ -20,7 +23,7 @@ from .gpu import DEV
 from .plan import EYES, P
 
 LID_DEG = 3
-K = 23   # per-eye parameter vector, see eye_params()
+K = 24   # per-eye parameter vector, see eye_params()
 
 
 class EyeGeom:
@@ -91,7 +94,7 @@ def window_for(g: EyeGeom, w_eye, H, W, bh, bw):
     return wx, wy
 
 
-def eye_params(g: EyeGeom, c_s: float, w_eye: float, x0: int, y0: int):
+def eye_params(g: EyeGeom, c_s: float, w_eye: float, x0: int, y0: int, c_t: float = 0.0):
     r = g.r
     lo_core = min(g.si - r, g.s_rc - 0.25 * w_eye)
     hi_core = max(g.si + r, g.s_lc + 0.25 * w_eye)
@@ -101,9 +104,13 @@ def eye_params(g: EyeGeom, c_s: float, w_eye: float, x0: int, y0: int):
     # 1.5x its mean, so keeping |c_s| <= half that stretch leaves the mapping at >= 25% of
     # its original spacing there: squeezed, never folded.
     c_s = max(-0.5 * left_len, min(0.5 * right_len, c_s))
+    # Across the axis the lid band (0.14 eye widths) absorbs the shift; the same half-stretch
+    # rule keeps it from folding.
+    band = 0.14 * w_eye
+    c_t = max(-0.5 * band, min(0.5 * band, c_t))
     (uc, us), (lc, ls) = g.up, g.lo
     return [g.mx, g.my, g.cx_, g.cy_, lo_core, hi_core, left_len, right_len,
-            0.04 * w_eye, 0.14 * w_eye, c_s, float(x0), float(y0), us, *uc, ls, *lc]
+            0.04 * w_eye, band, c_s, float(x0), float(y0), us, *uc, ls, *lc, c_t]
 
 
 def _smoothstep(x):
@@ -115,7 +122,7 @@ def field(p, x, y):
     """Forward displacement (dx, dy) at image points (x, y) for parameter rows p (B,K)."""
     Pk = [p[:, k, None, None] for k in range(K)]
     mx, my, cx, cy, lo_core, hi_core, left_len, right_len, margin, band, c_s = Pk[:11]
-    us, uc, ls, lc = Pk[13], Pk[14:18], Pk[18], Pk[19:23]
+    us, uc, ls, lc, c_t = Pk[13], Pk[14:18], Pk[18], Pk[19:23], Pk[23]
     dx_, dy_ = x - mx, y - my
     s = dx_ * cx + dy_ * cy
     t = dy_ * cx - dx_ * cy
@@ -129,7 +136,8 @@ def field(p, x, y):
     ht = torch.where(t < up - margin, _smoothstep((t - (up - margin - band)) / band),
                      torch.where(t > lo + margin, _smoothstep(((lo + margin + band) - t) / band), one))
     d = c_s * hs * ht
-    return d * cx, d * cy
+    e = c_t * hs * ht                       # across the axis: t points to (-cy, cx), i.e. down
+    return d * cx - e * cy, d * cy + e * cx
 
 
 class GraphWarp:
@@ -251,13 +259,23 @@ def frame_rows(plan, i, H, W, bh, bw):
     """Parameter rows for both eyes of frame i (an eye that can't be windowed gets c_s = 0)."""
     rows = []
     per_eye = plan.get("corr_e") or {}
+    vert = plan.get("corr_t")
     for k in "RL":
         we = float(plan["w_e"][k][i])
         corr = per_eye[k][i] if k in per_eye else plan["corr"][i]
         c = float(corr) * we if plan["valid"][i] else 0.0
+        ct = float(vert[i]) * we if vert is not None and plan["valid"][i] else 0.0
         g = eye_geom(plan, i, k)
-        win = window_for(g, we, H, W, bh, bw) if abs(c) > 1e-3 else None
+        win = window_for(g, we, H, W, bh, bw) if abs(c) > 1e-3 or abs(ct) > 1e-3 else None
         if win is None:
-            c, win = 0.0, (0, 0)
-        rows.append(eye_params(g, c, we, *win))
+            c, ct, win = 0.0, 0.0, (0, 0)
+        rows.append(eye_params(g, c, we, *win, c_t=ct))
     return rows
+
+
+def moves(plan, i) -> bool:
+    """Whether frame i has anything to warp (sideways or vertical)."""
+    if i >= len(plan["corr"]) or not plan["valid"][i]:
+        return False
+    vert = plan.get("corr_t")
+    return abs(plan["corr"][i]) > 1e-4 or (vert is not None and abs(vert[i]) > 1e-4)

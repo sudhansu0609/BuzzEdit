@@ -633,8 +633,9 @@ def trim_source_regions(timeline: Timeline, regions: List[List[int]],
         for start, end in _subtract_regions(
                 [item.source_start_frame, item.source_end_frame], collapsed):
             segments.append((start, end, item.anchor_word_id))
-    if len(segments) == len(v1):
-        return 0                                       # nothing overlapped
+    if [(a, b) for a, b, _ in segments] == [(i.source_start_frame, i.source_end_frame) for i in v1]:
+        return 0                                       # nothing overlapped (an edge trim keeps the
+                                                       # count, so compare the spans themselves)
 
     timeline.items = [i for i in timeline.items if i.track not in ("V1", "A1")]
     current = max(0, timeline.program_offset_frames)

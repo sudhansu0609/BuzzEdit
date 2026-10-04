@@ -415,6 +415,36 @@ async def toggle_word_endpoint(project_id: str, body: ToggleWordRequest):
     return {"status": "success", "timeline": tl}
 
 
+class ReviewAnswer(BaseModel):
+    answer: str          # "keep" | "cut" | "dismiss"
+
+
+@router.get("/{project_id}/review")
+async def get_review(project_id: str):
+    """The AI editor's "decided under doubt" list for this project."""
+    _p, tl = _load_timeline(project_id)
+    return {"review": tl.review}
+
+
+@router.post("/{project_id}/review/{take}")
+async def answer_review(project_id: str, take: str, body: ReviewAnswer):
+    """Answer one review item: the whole take plays (keep), goes (cut), or the item is
+    dismissed. A keep/cut answer becomes an example the editor reads on the next edit."""
+    from asr import review
+
+    p_data, tl = _load_timeline(project_id)
+    settings = p_data.get("settings") or {}
+    try:
+        result = review.answer(tl, take, body.answer, list(tl.sources.keys())[0],
+                               channel=str(settings.get("glossary") or ""), source=project_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"{take} is not on the review list")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _save_timeline(project_id, p_data, tl)
+    return {"status": "success", "timeline": tl, **result}
+
+
 @router.post("/{project_id}/program/cut")
 async def cut_program(project_id: str, body: ProgramCutRequest):
     """Delete a span of the finished programme — every track, not just the words."""

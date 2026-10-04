@@ -17,6 +17,11 @@ export const REASON_LABELS: Record<string, string> = {
   llm_filler: 'confirmed by the language model',
   not_fluent: 'words that broke the flow of the take',
   not_grammatical: 'debris that left a sentence unfinished',
+  chatter: 'recording chatter',
+  abandoned: 'abandoned sentences',
+  repeat: 'repeated lines',
+  drop: 'lines the AI editor removed',
+  review: 'removed in your review',
 };
 
 /** The same reasons phrased for a single word, as a tooltip. */
@@ -31,6 +36,11 @@ export const REASON_TOOLTIPS: Record<string, string> = {
   llm_filler: 'Removed on the language model’s judgement',
   not_fluent: 'Removed so the take reads as one continuous sentence',
   not_grammatical: 'Debris left over from a fumble, cut to complete the sentence',
+  chatter: 'Recording chatter: talking to the camera or crew',
+  abandoned: 'A sentence the speaker abandoned and never picked up again',
+  repeat: 'Said again elsewhere',
+  drop: 'Removed by the AI editor',
+  review: 'Removed in your review of the cut',
 };
 
 export function reasonTooltip(reason?: string | null): string {

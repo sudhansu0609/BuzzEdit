@@ -252,7 +252,7 @@ function EyeContactDialog({ entry, projectId, onRun, onClose }: {
   useEffect(() => {
     getEyeContactSetup().then(setSetup).catch(() => setSetup({
       prompter_side: 'left', angle_deg: 0, prompter_cm: 30, camera_cm: 110, steadiness: 0.7, aim_deg: 0,
-      quality: 'high',
+      pitch_deg: 0, quality: 'high',
     }));
   }, []);
 
@@ -339,6 +339,11 @@ function EyeContactDialog({ entry, projectId, onRun, onClose }: {
           Fine aim (degrees, + = toward your left)
           <input type="number" min={-15} max={15} step={0.5} value={setup.aim_deg}
             onChange={(e) => set({ aim_deg: Number(e.target.value) })} />
+        </label>
+        <label>
+          Up / down (degrees, + = look lower, − = look higher)
+          <input type="number" min={-10} max={10} step={0.5} value={setup.pitch_deg ?? 0}
+            onChange={(e) => set({ pitch_deg: Number(e.target.value) })} />
         </label>
         <label>
           Steadiness {Math.round(setup.steadiness * 100)}%

@@ -1146,6 +1146,47 @@ input:focus, textarea:focus, select:focus {
 .transcript-word.is-uncertain {
   border-bottom: 1px dotted var(--warning);
 }
+
+/* The AI editor's "decided under doubt" list, above the words in the Cuts view. */
+.review-list {
+  margin: 0 8px 8px;
+  border: 1px solid var(--warning);
+  border-radius: 6px;
+  min-width: 0;
+}
+.review-list-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: baseline;
+  width: 100%;
+  padding: 6px 8px;
+  background: none;
+  border: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font-weight: 600;
+}
+.review-item {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+}
+.review-item-text {
+  flex: 1 1 220px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.review-item-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
 .transcript-word.is-playing {
   background: rgba(59, 130, 246, 0.25);
 }

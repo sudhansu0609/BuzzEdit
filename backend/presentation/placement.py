@@ -224,6 +224,8 @@ def place_broll(timeline: Timeline, beats: List[Beat], assets: List[Asset],
             item.label = f"layout: {beat.kind}"
         elif asset.kind == "image":
             _apply_ken_burns(timeline, item.id, index, rng, duration_s)
+        elif getattr(beat, "camera_move", None) in ("in", "out"):
+            _apply_gradual_zoom(timeline, item.id, beat.camera_move, duration_s)
 
         placed.append((start_s, start_s + duration_s))
         count += 1
@@ -379,6 +381,15 @@ def _apply_ken_burns(timeline: Timeline, item_id: str, index: int,
         "pos_x": -pan,
         "pos_x_end": pan,
     })
+
+
+def _apply_gradual_zoom(timeline: Timeline, item_id: str, direction: str, duration_s: float) -> None:
+    """The zoom a gradual genre took out of a clip's prompt, back as a slow, even move across
+    the clip's whole time on screen (presentation.camera)."""
+    from .camera import gradual_depth
+    depth = gradual_depth(duration_s)
+    scale, scale_end = (1.0, 1.0 + depth) if direction == "in" else (1.0 + depth, 1.0)
+    clip_ops.set_transform(timeline, item_id, {"scale": scale, "scale_end": scale_end})
 
 
 def _drop_orphan_sources(timeline: Timeline) -> None:

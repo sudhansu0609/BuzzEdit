@@ -100,19 +100,55 @@ async def plan_auto_edit(
     """
     if use_llm:
         release_asr_gpu()
-    refined = await refine_disfluencies(
-        words,
-        aggressiveness=aggressiveness,
-        use_llm=use_llm,
-        audio_path=audio_path,
-        detect_fillers=detect_fillers,
-    )
+    planner = choose_planner(settings) if use_llm else "classic"
+    refined, fallback = None, None
+    if planner == "editor":
+        from .editor_planner import EditorUnavailable, plan_with_editor
+        try:
+            refined = await plan_with_editor(words, audio_path, settings)
+        except EditorUnavailable as e:
+            fallback = str(e)
+        except Exception as e:                       # the editor must never fail the edit
+            logger.exception("Auto-edit: the AI editor failed; using the classic planner.")
+            fallback = f"{type(e).__name__}: {e}"
+        if fallback:
+            logger.warning("Auto-edit: AI editor unavailable (%s); classic planner instead.", fallback)
+    if refined is None:
+        refined = await refine_disfluencies(
+            words,
+            aggressiveness=aggressiveness,
+            use_llm=use_llm,
+            audio_path=audio_path,
+            detect_fillers=detect_fillers,
+        )
     report = last_report(refined)
+    report.setdefault("planner", "classic")
+    if fallback:
+        report["planner_fallback"] = fallback
     if settings is not None:
-        genre = await apply_genre_pacing(settings, words, model_ready=bool(report.get("used_llm")))
+        genre = await apply_genre_pacing(settings, words, model_ready=bool(report.get("used_llm"))
+                                         and report.get("planner") != "editor")  # LM Studio not loaded
         if str(settings.get("pacing_source") or "").startswith(_GENRE_SOURCE):
             report["pacing"] = {"genre": genre, **pacing_kwargs(settings)}
     return AutoEditPlan(words=refined, report=report, audio_path=audio_path)
+
+
+PLANNERS = ("editor", "classic")
+DEFAULT_PLANNER = "editor"
+
+
+def choose_planner(settings: Optional[Dict[str, Any]]) -> str:
+    """Which planner cuts this project: the project's `planner` setting, else the app setting
+    `auto_cut_planner`, else the AI editor (AUTO_CUT_EDITOR_PLAN.md Phase 7). "classic" is the
+    rule + local-model planner (fumble_engine), kept as the offline fallback."""
+    value = (settings or {}).get("planner")
+    if value not in PLANNERS:
+        try:
+            from store.app_settings import AppSettings
+            value = AppSettings().get("auto_cut_planner")
+        except Exception:
+            value = None
+    return value if value in PLANNERS else DEFAULT_PLANNER
 
 
 def pacing_kwargs(settings: Optional[Dict[str, Any]]) -> Dict[str, Optional[float]]:
@@ -219,6 +255,10 @@ def record_cut_coverage(timeline, report: Dict[str, Any]) -> None:
     """
     from timeline.ops import audit_cut_coverage
 
+    if report.get("planner") == "editor":
+        _finish_editor_cut(timeline, report)
+    else:
+        timeline.review = []        # a classic plan replaces an editor plan's open questions
     coverage = audit_cut_coverage(timeline)
     quality = report.setdefault("quality", {})
     quality["cut_words_still_audible"] = coverage["still_audible"]
@@ -230,6 +270,23 @@ def record_cut_coverage(timeline, report: Dict[str, Any]) -> None:
             "(examples: %s). The edit will play them.",
             coverage["still_audible"], coverage["checked"],
             ", ".join(coverage["examples"]) or "-")
+
+
+def _finish_editor_cut(timeline, report: Dict[str, Any]) -> None:
+    """After the AI editor's cut is built: the listening check's small nudges, and the
+    "decided under doubt" list onto the timeline, where the Cuts view reads it and it
+    survives with the project (AUTO_CUT_EDITOR_PLAN.md §4.6, §4.7)."""
+    try:
+        from .cut_verify import nudge_cut_edges
+        primary = next(iter(timeline.sources.keys()), None) if timeline.sources else None
+        if primary and not timeline.keep_full_source:
+            listened = nudge_cut_edges(timeline, primary)
+            report.setdefault("quality", {})["cut_nudges"] = {
+                k: v for k, v in listened.items() if k != "review"}
+            report.setdefault("review", []).extend(listened.get("review") or [])
+    except Exception as e:
+        logger.warning("Listening check skipped (%s).", e)
+    timeline.review = list(report.get("review") or [])
 
 
 def public_report(report: Dict[str, Any]) -> Dict[str, Any]:
@@ -261,6 +318,13 @@ def public_report(report: Dict[str, Any]) -> Dict[str, Any]:
     # whether what remains is a sentence. That happened for a long time on a
     # machine whose configured model was larger than its GPU, and the only trace
     # was `used_llm: False` in a log nobody reads.
+    if out.get("planner_fallback"):
+        warnings.append("the AI editor could not run (" + str(out["planner_fallback"])
+                        + "), so the classic planner made this cut")
+    review = [r for r in out.get("review") or [] if r.get("answer") is None]
+    if review:
+        warnings.append(f"{len(review)} calls were decided under doubt and kept; "
+                        "they are listed in the Cuts view")
     if not out.get("used_fluency"):
         warnings.append("the language model never ran, so this is a structural "
                         "edit only — check that LM Studio is up and its model "

@@ -143,6 +143,17 @@ export async function toggleWordApi(projectId: string, wordId: string, enabled: 
   });
 }
 
+/** Answer one item of the AI editor's "decided under doubt" list: the whole take
+ *  plays ("keep"), goes ("cut"), or the item is dismissed. A keep/cut answer is
+ *  stored as an example the editor reads on the next edit. Returns the timeline. */
+export async function answerReview(projectId: string, take: string,
+                                   answer: 'keep' | 'cut' | 'dismiss'): Promise<any> {
+  return api(`/api/timeline/${projectId}/review/${encodeURIComponent(take)}`, {
+    method: 'POST',
+    body: JSON.stringify({ answer }),
+  });
+}
+
 /** Find/replace across the transcript. Omit `wordIds` (or pass null) to match
  *  every occurrence; pass one or more word ids to scope the replacement to
  *  specific words (e.g. "replace this one match only"). */
@@ -919,6 +930,8 @@ export interface EyeContactSetup {
   camera_cm: number;
   steadiness: number;
   aim_deg: number;
+  /** Vertical re-aim in degrees: + = lower the gaze (down), - = raise it. */
+  pitch_deg: number;
   quality: 'standard' | 'high' | 'max';
 }
 
@@ -1307,6 +1320,26 @@ export async function setPresentationOverrides(
 // See presentation.stock: used only when ComfyUI cannot make a visual for a
 // beat and the project's "Allow free stock" is on. Keys are masked server-side
 // — GET/PUT never return one in full.
+
+/** The auto-cut planner and the Claude proxy the AI editor calls (key never returned). */
+export interface AutoCutEditorState {
+  planner: 'editor' | 'classic';
+  model: string;
+  effort: string;
+  base_url: string;
+  key_configured: boolean;
+  key_source: 'app_settings' | 'env' | null;
+}
+
+export async function getAutoCutEditor(): Promise<AutoCutEditorState> {
+  return api('/api/settings/auto_cut_editor');
+}
+
+export async function setAutoCutEditor(
+  body: { planner?: 'editor' | 'classic'; base_url?: string; api_key?: string },
+): Promise<AutoCutEditorState> {
+  return api('/api/settings/auto_cut_editor', { method: 'PUT', body: JSON.stringify(body) });
+}
 
 export interface StockKeysState {
   pexels_api_key: string;

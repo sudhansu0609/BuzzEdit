@@ -155,6 +155,10 @@ class TranscribeJob(BaseModel):
     # entries override both the common-word table and the loanword restore.
     # Stored on project settings like `language`.
     glossary: Optional[str] = None
+    # Which auto-cut planner: "editor" (the AI editor, asr.editor_planner) or
+    # "classic" (fumble_engine). None = the project's or app's choice, else the
+    # editor (asr.auto_edit.choose_planner). Stored on project settings.
+    planner: Optional[Literal["editor", "classic"]] = None
 
 
 class AnalyzeJob(BaseModel):

@@ -6,6 +6,7 @@ import {
   getGpuStatus, getSystemPaths, clearVram, COMFY_BASE, hostPort,
   getPresentationOverrides, setPresentationOverrides, PresentationOverrideMode,
   getStockKeys, setStockKeys, StockKeysState,
+  getAutoCutEditor, setAutoCutEditor, AutoCutEditorState,
   audioPreview, mediaStreamUrl,
 } from '../hooks/api';
 import { useProjectStore } from '../hooks/store';
@@ -384,7 +385,27 @@ function PresentationTab() {
 
   useEffect(() => {
     getStockKeys().then(setStockKeysState).catch(() => {});
+    getAutoCutEditor().then(setEditorState).catch(() => {});
   }, []);
+
+  // The AI editor (auto-cut planner): which planner cuts, and the Claude proxy key it needs.
+  const [editorState, setEditorState] = useState<AutoCutEditorState | null>(null);
+  const [editorKeyInput, setEditorKeyInput] = useState('');
+  const [editorUrlInput, setEditorUrlInput] = useState('');
+  const saveEditor = async (body: { planner?: 'editor' | 'classic'; base_url?: string; api_key?: string }) => {
+    setSavingKeys(true);
+    try {
+      setEditorState(await setAutoCutEditor(body));
+      setEditorKeyInput('');
+      setEditorUrlInput('');
+      setKeysNote('Saved.');
+      setTimeout(() => setKeysNote(null), 1500);
+    } catch (e: any) {
+      setKeysNote(`Save failed: ${e.message}`);
+    } finally {
+      setSavingKeys(false);
+    }
+  };
 
   const saveStockKey = async (field: 'pexels_api_key' | 'pixabay_api_key', value: string) => {
     if (!value) return;
@@ -579,6 +600,44 @@ function PresentationTab() {
           {SOURCE_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
       </LockableField>
+
+      <h4>AI auto-cut</h4>
+      <p className="pref-note">
+        The AI editor reads the whole recording three times through your Claude proxy
+        ({editorState?.model ?? 'claude-opus-5-5'}, {editorState?.effort ?? 'medium'} effort) and cuts only
+        where all three agree. Without a proxy key, cuts fall back to the classic planner.
+      </p>
+      <Field label="Planner">
+        <select className="pref-input" value={editorState?.planner ?? 'editor'} disabled={savingKeys}
+          onChange={(e) => saveEditor({ planner: e.target.value as 'editor' | 'classic' })}>
+          <option value="editor">AI editor (Claude)</option>
+          <option value="classic">Classic (rules + local model)</option>
+        </select>
+      </Field>
+      <Field label="Claude proxy URL">
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flex: 1 }}>
+          <input type="text" className="pref-input" value={editorUrlInput}
+            placeholder={editorState?.base_url ?? 'http://127.0.0.1:8787/v1'}
+            onChange={(e) => setEditorUrlInput(e.target.value)} />
+          <button className="btn btn-sm" disabled={!editorUrlInput || savingKeys}
+            onClick={() => saveEditor({ base_url: editorUrlInput })}>
+            Save
+          </button>
+        </div>
+      </Field>
+      <Field label="Claude proxy key">
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flex: 1 }}>
+          <input type="password" className="pref-input" value={editorKeyInput}
+            placeholder={editorState?.key_configured
+              ? (editorState.key_source === 'env' ? 'Set by CLAUDE_API_KEY' : 'Saved')
+              : 'Not set: cuts use the classic planner'}
+            onChange={(e) => setEditorKeyInput(e.target.value)} />
+          <button className="btn btn-sm" disabled={!editorKeyInput || savingKeys}
+            onClick={() => saveEditor({ api_key: editorKeyInput })}>
+            Save
+          </button>
+        </div>
+      </Field>
 
       <h4>Free stock fallback</h4>
       <p className="pref-note">

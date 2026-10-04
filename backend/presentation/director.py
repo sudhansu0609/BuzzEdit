@@ -471,6 +471,13 @@ async def _run_presentation_pass(
             default=None)
         report.metadata_written = metadata_task is not None
 
+    # Horror zooms creep: a clip asked to zoom is generated locked off and the
+    # move goes back on the timeline, slow (presentation.camera).
+    from . import camera as camera_mod
+    steadied = camera_mod.steady_for_genre(plan.beats, genre)
+    if steadied:
+        logger.info("Presentation: %d %s clips will zoom gradually on the timeline", steadied, genre)
+
     # Persist the plan (prompts + title) so generation reads from a file rather
     # than from a model that is about to be unloaded — and so a run is inspectable.
     _write_shot_plan(project_id, plan, thumb_title, thumb_scene)

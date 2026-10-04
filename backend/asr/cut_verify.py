@@ -361,3 +361,78 @@ async def verify_and_repair(timeline: Timeline, source_path: str,
     report = await verify_cut(timeline, source_path, language=language)
     report["repaired_regions"] = repair["repaired_regions"]
     return report
+
+
+# The listening check's nudge (AUTO_CUT_EDITOR_PLAN.md §4.6): a removed word the cut still
+# plays by at most this much past the breath tolerance is a cut point a few frames off, and is
+# trimmed; anything larger is not "fixed" blindly (automatic trimming of big leaks was switched
+# off for good reason) but goes on the review list for a person to hear.
+NUDGE_SECONDS = 0.15
+_REVIEW_LISTEN_MAX = 12
+
+
+def nudge_cut_edges(timeline: Timeline, primary_source_id: str) -> Dict[str, Any]:
+    """Nudge small leaks out of the cut, list the rest. Returns counts and review items.
+
+    Two faults, both by frame overlap (no transcription):
+    - a removed word still audible: trimmed when the leak is within NUDGE_SECONDS of the
+      tolerance (then re-measured), else listed as "leak";
+    - a kept word whose speech the cut clips: listed as "clipped" (widening a cut is not
+      something the timeline does safely on its own).
+    """
+    from timeline.ops import trim_source_regions
+
+    fps = timeline.fps_num / max(1, timeline.fps_den)
+    tolerance = _LEAK_TOLERANCE_SECONDS * fps
+    nudge = NUDGE_SECONDS * fps
+    regions = sorted((int(a), int(b)) for a, b in (timeline.speech_regions or []) if b > a)
+
+    def spans():
+        return [(int(round(s * fps)), int(round(e * fps))) for s, e in _cut_spans(timeline)]
+
+    def covered(a: int, b: int, kept) -> List[List[int]]:
+        return [[max(a, s), min(b, e)] for s, e in kept if min(b, e) > max(a, s)]
+
+    def speech_of(a: int, b: int) -> List[Tuple[int, int]]:
+        if not regions:
+            return [(a, b)]
+        return [(max(a, s), min(b, e)) for s, e in regions if min(b, e) > max(a, s)]
+
+    kept = spans()
+    small, big = [], []
+    for w in timeline.words:
+        if w.enabled or w.end_frame <= w.start_frame:
+            continue
+        over = covered(w.start_frame, w.end_frame, kept)
+        amount = sum(b - a for a, b in over)
+        if amount <= tolerance:
+            continue
+        (small if amount <= tolerance + nudge else big).append((w, over))
+    nudged = trim_source_regions(timeline, [r for _w, over in small for r in over],
+                                 primary_source_id) if small else 0
+
+    review: List[Dict[str, Any]] = []
+    for w, _over in big:
+        review.append({"take": w.take, "start": round(w.start_frame / fps, 2),
+                       "end": round(w.end_frame / fps, 2), "text": w.text, "kind": "leak",
+                       "decision": "listen", "why": "a removed word is still audible at this cut",
+                       "answer": None})
+    kept = spans()
+    clipped = 0
+    for w in timeline.words:
+        if not w.enabled or w.end_frame <= w.start_frame:
+            continue
+        speech = speech_of(w.start_frame, w.end_frame)
+        total = sum(b - a for a, b in speech)
+        heard = sum(b - a for s, e in speech for a, b in covered(s, e, kept))
+        missing = total - heard
+        if total and heard and missing > tolerance / 2:
+            clipped += 1
+            review.append({"take": w.take, "start": round(w.start_frame / fps, 2),
+                           "end": round(w.end_frame / fps, 2), "text": w.text, "kind": "clipped",
+                           "decision": "listen", "why": f"{missing / fps:.2f} s of a kept word is cut off",
+                           "answer": None})
+    leak_left = struck_audio_leak(timeline)
+    return {"nudged": nudged, "leaks_listed": len(big), "clipped_listed": clipped,
+            "leaked_struck_seconds": leak_left["leaked_struck_seconds"],
+            "review": review[:_REVIEW_LISTEN_MAX]}

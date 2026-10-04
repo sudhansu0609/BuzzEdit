@@ -90,3 +90,69 @@ def style_block(sources: Sequence[Tuple[str, Sequence[Any], Dict[str, str]]], no
     for name, utts, decided in sources:
         parts.extend(excerpts(utts, decided, name))
     return "\n\n".join(parts)
+
+
+# --- the stored examples (§4.7) ------------------------------------------------------
+#
+# One JSON object per line in data/style/examples.jsonl:
+#   {"id", "channel", "source", "kind": "hand_cut" | "correction", "text", "created"}
+# "hand_cut" excerpts come from recordings the creator cut by hand (tools/build_style.py);
+# "correction" ones from answers in the Cuts view's review list. Corrections go first: they
+# are the creator overruling this editor, the most direct statement of taste there is.
+
+MAX_EXAMPLES = 8
+
+
+def store_path():
+    from config import DATA_DIR
+    return DATA_DIR / "style" / "examples.jsonl"
+
+
+def load_examples() -> List[Dict[str, Any]]:
+    import json
+    path = store_path()
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def add_examples(entries: Sequence[Dict[str, Any]], replace_source: str = "") -> int:
+    """Append examples; with `replace_source`, first drop that source's hand-cut excerpts so a
+    rebuilt key does not pile up duplicates. Returns how many are stored."""
+    import json, time, uuid
+    kept = [e for e in load_examples()
+            if not (replace_source and e.get("source") == replace_source and e.get("kind") == "hand_cut")]
+    for e in entries:
+        kept.append({"id": uuid.uuid4().hex[:10], "created": time.strftime("%Y-%m-%dT%H:%M:%S"), **e})
+    path = store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in kept), encoding="utf-8")
+    tmp.replace(path)
+    return len(kept)
+
+
+def stored_style(channel: str = "", exclude_source: str = "", notes: str = "",
+                 limit: int = MAX_EXAMPLES) -> str:
+    """The style block for a new recording, from the stored examples.
+
+    Corrections before hand cuts, this channel's before other channels', newest first; never
+    from `exclude_source` (leave-one-out when the recording being cut is itself an answer key).
+    """
+    channel = (channel or "").lower()
+    pool = [e for e in load_examples() if e.get("text") and e.get("source") != exclude_source]
+    bands: Dict[Tuple[bool, bool], List[Dict[str, Any]]] = {}
+    for e in pool:
+        bands.setdefault((e.get("kind") != "correction",
+                          (e.get("channel") or "").lower() != channel), []).append(e)
+    ordered = [e for key in sorted(bands) for e in sorted(bands[key], key=lambda e: e.get("created") or "",
+                                                          reverse=True)]
+    parts = [notes.strip()] if notes.strip() else []
+    parts.extend(e["text"] for e in ordered[:limit])
+    return "\n\n".join(parts)

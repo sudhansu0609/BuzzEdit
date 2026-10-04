@@ -1,7 +1,7 @@
 import { useCallback, useRef, useEffect, useState, useMemo } from 'react';
 import { useProjectStore } from '../hooks/store';
 import type { TranscriptSegment } from '../hooks/store';
-import { toggleWordApi, replaceWords, getProject } from '../hooks/api';
+import { toggleWordApi, replaceWords, getProject, answerReview } from '../hooks/api';
 import { reasonTooltip } from '../lib/editReasons';
 
 type ViewMode = 'hinglish' | 'native' | 'english';
@@ -16,6 +16,24 @@ interface TimelineWord {
   disfluency: boolean;
   reason?: string | null;
   candidate?: boolean;
+  take?: string | null;
+  note?: string | null;
+}
+
+/** One call the AI editor made under doubt, or a cut point the listening check
+ *  could not settle (backend: asr.editor_planner / cut_verify.nudge_cut_edges). */
+interface ReviewItem {
+  take: string | null;
+  start: number;
+  end: number;
+  text: string;
+  kind: 'doubt' | 'leak' | 'clipped';
+  decision: string;
+  votes?: string;
+  why?: string;
+  twin?: string | null;
+  twin_start?: number | null;
+  answer: string | null;
 }
 
 // The backend may store `transcript` either as a bare segment array or as a
@@ -64,6 +82,27 @@ export default function TranscriptEditor() {
   // Putting a word back, or taking one out, is a real edit: the backend rebuilds
   // V1/A1 around the new decision and hands back the whole timeline, which is
   // what the timeline panel and preview then read.
+  const reviewItems: ReviewItem[] = useMemo(
+    () => (Array.isArray(timeline?.review) ? timeline.review : []).filter((r: ReviewItem) => !r.answer),
+    [timeline]);
+  const [busyReview, setBusyReview] = useState<string | null>(null);
+  const [reviewOpen, setReviewOpen] = useState(true);
+
+  // An answer applies to the whole take and is remembered as an example the
+  // AI editor follows next time, so the list should shrink with every video.
+  const handleAnswer = useCallback(async (item: ReviewItem, answer: 'keep' | 'cut' | 'dismiss') => {
+    if (!project?.id || !item.take || busyReview) return;
+    setBusyReview(item.take);
+    try {
+      const res: any = await answerReview(project.id, item.take, answer);
+      if (res?.timeline) updateProject({ timeline: res.timeline } as any);
+    } catch (err) {
+      console.error('Could not save that answer:', err);
+    } finally {
+      setBusyReview(null);
+    }
+  }, [project?.id, busyReview, updateProject]);
+
   const handleToggleWord = useCallback(async (word: TimelineWord) => {
     if (!project?.id || busyWord) return;
     setBusyWord(word.id);
@@ -369,14 +408,56 @@ export default function TranscriptEditor() {
         )}
       </div>
 
+      {showWords && reviewItems.length > 0 && (
+        <div className="review-list">
+          <button className="review-list-header" onClick={() => setReviewOpen(v => !v)}>
+            <span>{reviewOpen ? '▾' : '▸'} Decided under doubt · {reviewItems.length}</span>
+            <span className="text-xs text-muted">Kept unless you say otherwise. Your answers teach the editor.</span>
+          </button>
+          {reviewOpen && reviewItems.map((item, n) => (
+            <div key={`${item.take}-${item.kind}-${n}`} className={`review-item is-${item.kind}`}>
+              <div className="review-item-text">
+                <span className="font-mono text-xs">{formatTime(item.start)}</span>{' '}
+                <span>{item.text}</span>
+                <div className="text-xs text-muted">
+                  {item.kind === 'doubt'
+                    ? `${item.votes ?? ''}${item.why ? ` — ${item.why}` : ''}`
+                    : item.why}
+                </div>
+              </div>
+              <div className="review-item-actions">
+                <button className="btn btn-sm" onClick={() => setCurrentTime(item.start)}
+                        title="Jump here and listen">▶ {item.kind === 'doubt' ? 'This' : 'Listen'}</button>
+                {item.twin && item.twin_start != null && (
+                  <button className="btn btn-sm" onClick={() => setCurrentTime(item.twin_start!)}
+                          title={`Jump to ${item.twin}, the take this one sounds like`}>▶ Other take</button>
+                )}
+                {item.kind === 'doubt' ? (
+                  <>
+                    <button className="btn btn-sm" disabled={!!busyReview}
+                            onClick={() => handleAnswer(item, 'keep')}>Keep</button>
+                    <button className="btn btn-sm btn-danger" disabled={!!busyReview}
+                            onClick={() => handleAnswer(item, 'cut')}>Cut</button>
+                  </>
+                ) : (
+                  <button className="btn btn-sm" disabled={!!busyReview || !item.take}
+                          onClick={() => handleAnswer(item, 'dismiss')}>Sounds fine</button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       {showWords && (
         <div className="transcript-words">
           {words.map((word) => {
             const start = wordTime(word.start_frame);
             const isActive = currentTime >= start && currentTime < wordTime(word.end_frame);
+            const why = word.note ? ` (${word.note})` : '';
             const title = word.enabled
-              ? `${formatTime(start)} — click to cut this word`
-              : `${formatTime(start)} — ${reasonTooltip(word.reason)}. Click to put it back.`;
+              ? `${formatTime(start)} — click to cut this word${why}`
+              : `${formatTime(start)} — ${reasonTooltip(word.reason)}${why}. Click to put it back.`;
             return (
               <span
                 key={word.id}

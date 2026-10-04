@@ -63,6 +63,8 @@ def build_timeline_from_transcript(
             # shows; the fluency and grammar passes must judge this instead.
             word_native=(str(w.get("word_native")).strip() or None)
             if w.get("word_native") else None,
+            take=w.get("take") or None,
+            note=w.get("note") or None,
         ))
 
     timeline = Timeline(

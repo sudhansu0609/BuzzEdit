@@ -213,6 +213,33 @@ def parse(answer: Any, utterances: Sequence[Any], words: Sequence[Dict[str, Any]
     return out
 
 
+def proxy_config(settings: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """{base_url, api_key} for the claude-local-api proxy; api_key "" when none is configured.
+
+    1. the job's own `llm_*` settings, when the caller routed the job to an OpenAI-compatible
+       endpoint (BuzzcafStudio does that for presentation jobs when production runs on Claude);
+    2. BuzzEdit's app setting `auto_cut_editor` ({"base_url", "api_key"});
+    3. the `CLAUDE_API_KEY` (and optional `CLAUDE_URL`) environment variables.
+
+    The model is never taken from any of these: the editor is Opus 5.5 (§10 item 4), whatever
+    model the caller uses for its own planning.
+    """
+    import os
+    settings = settings or {}
+    if settings.get("llm_api_key") and str(settings.get("llm_provider") or "") == "openai_compat":
+        return {"base_url": str(settings.get("llm_base_url") or DEFAULT_BASE_URL),
+                "api_key": str(settings["llm_api_key"])}
+    try:
+        from store.app_settings import AppSettings
+        own = AppSettings().get("auto_cut_editor") or {}
+    except Exception:
+        own = {}
+    if own.get("api_key"):
+        return {"base_url": str(own.get("base_url") or DEFAULT_BASE_URL), "api_key": str(own["api_key"])}
+    return {"base_url": os.environ.get("CLAUDE_URL", DEFAULT_BASE_URL),
+            "api_key": os.environ.get("CLAUDE_API_KEY", "")}
+
+
 class EditorClient:
     """OpenAI-compatible chat call to the proxy, pinned to one model and one effort level."""
 

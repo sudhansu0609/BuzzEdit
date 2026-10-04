@@ -66,6 +66,8 @@ class Settings:
     camera_cm: float = 110.0      # distance from the speaker's eyes to the camera
     steadiness: float = 0.7       # 0 = keep the reading sweep, 1 = lock the eyes on the lens
     aim_deg: float = 0.0          # fine nudge of the lens direction, + = toward the speaker's left
+    pitch_deg: float = 0.0        # vertical re-aim of the re-aimed (reading) gaze, + = lower (down),
+                                  # - = raise (up); same degree scale as angle_deg / aim_deg
     max_shift: float = 0.14       # never move an iris more than this many eye widths (~23 deg)
     away_lo: float = 0.07         # gaze this far from both prompter and lens (eye widths) starts to pass through
     away_hi: float = 0.12         # ...and this far is left completely untouched (a deliberate look away)
@@ -176,7 +178,7 @@ def smoothstep(x):
     return x * x * (3 - 2 * x)
 
 
-def make_plan(pts, score, fps, s: Settings = Settings()):
+def make_plan(pts, score, fps, s: Settings = Settings(), lens_e=None):
     """pts: (N, len(USED), 3) compact landmarks (NaN where no face), score: (N,) presence logits.
 
     Returns per-frame arrays: smoothed landmarks the warp anchors to, the inter-ocular axis,
@@ -280,9 +282,10 @@ def make_plan(pts, score, fps, s: Settings = Settings()):
     w = gauss_smooth(w, 1.0)
     corr = np.clip(corr * w, -s.max_shift, s.max_shift)
     corr[~valid] = 0.0
-    corr_e, lens_e = per_eye_limits(corr, s_e, eye_ok, w, gaze_f, lens_m, fps, s)
+    corr_e, lens_e = per_eye_limits(corr, s_e, eye_ok, w, gaze_f, lens_m, fps, s, lens_e)
+    corr_t = vertical_shift(s, w, valid)
 
-    return dict(pts=smooth, ex=ex, w_e=w_e, corr=corr, corr_e=corr_e, lens_e=lens_e,
+    return dict(pts=smooth, ex=ex, w_e=w_e, corr=corr, corr_e=corr_e, lens_e=lens_e, corr_t=corr_t,
                 gaze=gaze, gaze_f=gaze_f, base=base,
                 weight=w, eye_ok=eye_ok, valid=valid, lens_m=lens_m,
                 camera_pct=float(100.0 * np.mean((w < 0.5)[valid])) if valid.any() else 0.0,
@@ -292,11 +295,29 @@ def make_plan(pts, score, fps, s: Settings = Settings()):
                 sweep_deg=float(np.std((gaze_f - base)[eye_ok]) / EYE_WIDTHS_PER_DEGREE) if eye_ok.any() else 0.0)
 
 
+MAX_PITCH_DEG = 10.0       # the vertical field folds past ~11 deg (warp clamps it there anyway)
+
+
+def vertical_shift(s: Settings, weight, valid):
+    """Per-frame vertical iris shift in eye widths, + = down (across the inter-ocular axis).
+
+    The prompter is usually not exactly at lens height, so the re-aimed eyes can read a little
+    high or low; `pitch_deg` moves them by the same degree scale the sideways aim uses. It
+    rides on the same weight as the sideways correction: only re-aimed reading frames move, and
+    a real look into the lens (or away) is left where it was."""
+    pitch = float(np.clip(s.pitch_deg, -MAX_PITCH_DEG, MAX_PITCH_DEG))
+    if abs(pitch) < 1e-6:
+        return np.zeros(len(weight))
+    out = IRIS_SWING * np.sin(np.radians(pitch)) * np.asarray(weight, np.float64)
+    out[~valid] = 0.0
+    return out
+
+
 LENS_LOOK_MIN_S = 2.0      # seconds of real camera looks needed to trust each eye's lens position
 LENS_MARGIN = 0.01         # eye widths an eye may land past its own lens position
 
 
-def per_eye_limits(corr, s_e, eye_ok, weight, gaze_f, lens_m, fps, s: Settings):
+def per_eye_limits(corr, s_e, eye_ok, weight, gaze_f, lens_m, fps, s: Settings, known=None):
     """Per-eye corrections that never push an iris past where THAT eye sits when the
     speaker really looks into the lens.
 
@@ -308,20 +329,27 @@ def per_eye_limits(corr, s_e, eye_ok, weight, gaze_f, lens_m, fps, s: Settings):
     middle: a lazy eye. Each eye's own lens position is measured from the frames the plan
     left alone because the speaker was looking at the camera; with too few of those, the
     shared correction stands. Returns ({"R": corr_R, "L": corr_L}, {"R": lens_R, "L": lens_L}).
+
+    `known` ({"R", "L"}) supplies the lens positions measured over the WHOLE recording, for a
+    short clip of it (a preview, a sample): 30 s of reading rarely holds the 2 s of camera looks
+    needed, and without them a preview silently showed the old, over-pushed eyes.
     """
-    cam = eye_ok & (weight < 0.2) & (np.abs(gaze_f - lens_m) < s.away_lo)
-    if cam.sum() < fps * LENS_LOOK_MIN_S:
-        return {k: corr.copy() for k in EYES}, {}
-    out, lens_e = {}, {}
+    if known and all(k in known for k in EYES):
+        lens_e = {k: float(known[k]) for k in EYES}
+    else:
+        cam = eye_ok & (weight < 0.2) & (np.abs(gaze_f - lens_m) < s.away_lo)
+        if cam.sum() < fps * LENS_LOOK_MIN_S:
+            return {k: corr.copy() for k in EYES}, {}
+        lens_e = {k: float(np.median(s_e[k][cam])) for k in EYES}
+    out = {}
     for k in EYES:
-        lens_k = float(np.median(s_e[k][cam]))
+        lens_k = lens_e[k]
         pos = tv_denoise(fill_gaps(s_e[k], eye_ok), s.tv_lambda)
         landed = pos + corr
         landed = np.where(corr < 0, np.maximum(landed, lens_k - LENS_MARGIN),
                           np.minimum(landed, lens_k + LENS_MARGIN))
         # Only ever a smaller push in the same direction: never reversed, never larger.
         out[k] = np.where(corr < 0, np.clip(landed - pos, corr, 0.0), np.clip(landed - pos, 0.0, corr))
-        lens_e[k] = lens_k
     return out, lens_e
 
 
@@ -329,5 +357,5 @@ def _empty_plan(pts, valid):
     n = len(pts)
     z = np.zeros(n)
     return dict(pts=np.nan_to_num(pts.astype(np.float64)), ex=np.tile([1.0, 0.0], (n, 1)),
-                w_e={"R": z + 1, "L": z + 1}, corr=z, corr_e={"R": z, "L": z}, lens_e={}, gaze=z, gaze_f=z, base=z, weight=z,
+                w_e={"R": z + 1, "L": z + 1}, corr=z, corr_e={"R": z, "L": z}, lens_e={}, corr_t=z, gaze=z, gaze_f=z, base=z, weight=z,
                 eye_ok=np.zeros(n, bool), valid=valid, lens_m=z, camera_pct=0.0, lens_sep_deg=0.0, offset_deg=0.0, symmetry_offset_deg=0.0, sweep_deg=0.0)

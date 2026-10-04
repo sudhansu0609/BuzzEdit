@@ -77,6 +77,8 @@ async def transcribe_video(job: TranscribeJob):
             settings["vocabulary"] = job.vocabulary
         if job.glossary is not None:
             settings["glossary"] = job.glossary
+        if job.planner:
+            settings["planner"] = job.planner
         vocabulary = settings.get("vocabulary")
         glossary_key = settings.get("glossary")
         glossary_map = glossary_store.load_merged(glossary_key)

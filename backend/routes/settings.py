@@ -26,17 +26,63 @@ class AutoSaveRequest(BaseModel):
     project_data: Dict[str, Any]
 
 
+def _masked_all() -> Dict[str, Any]:
+    from store.app_settings import _mask_key
+    out = app_settings.get_all()
+    editor = out.get("auto_cut_editor")
+    if isinstance(editor, dict) and editor.get("api_key"):
+        out["auto_cut_editor"] = {**editor, "api_key": _mask_key(editor["api_key"])}
+    return out
+
+
 @router.get("/")
 async def get_app_settings():
-    """Get all app settings including last project ID."""
-    return app_settings.get_all()
+    """Get all app settings including last project ID (secrets masked)."""
+    return _masked_all()
 
 
 @router.put("/")
 async def update_app_settings(updates: Dict[str, Any]):
     """Update app settings."""
+    # The editor's proxy key has its own route; a generic save round-tripping the
+    # masked value must never overwrite the real key.
+    updates = {k: v for k, v in updates.items() if k != "auto_cut_editor"}
     app_settings.update(updates)
-    return app_settings.get_all()
+    return _masked_all()
+
+
+class AutoCutEditorRequest(BaseModel):
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    planner: Optional[str] = None      # "editor" | "classic": the default for every project
+
+
+@router.get("/auto_cut_editor")
+async def get_auto_cut_editor():
+    """Which planner cuts by default, and whether the AI editor has a proxy to call."""
+    from asr.auto_edit import choose_planner
+    from asr.editor import DEFAULT_BASE_URL, DEFAULT_EFFORT, DEFAULT_MODEL, proxy_config
+    proxy = proxy_config()
+    own = app_settings.get("auto_cut_editor") or {}
+    return {"planner": choose_planner(None), "model": DEFAULT_MODEL, "effort": DEFAULT_EFFORT,
+            "base_url": proxy["base_url"] or DEFAULT_BASE_URL, "key_configured": bool(proxy["api_key"]),
+            "key_source": "app_settings" if own.get("api_key") else ("env" if proxy["api_key"] else None)}
+
+
+@router.put("/auto_cut_editor")
+async def put_auto_cut_editor(body: AutoCutEditorRequest):
+    """Store the proxy the AI editor calls (key never echoed back) and the default planner."""
+    own = dict(app_settings.get("auto_cut_editor") or {})
+    if body.base_url is not None:
+        own["base_url"] = body.base_url
+    if body.api_key is not None:
+        own["api_key"] = body.api_key
+    app_settings.set("auto_cut_editor", own)
+    if body.planner is not None:
+        if body.planner not in ("editor", "classic"):
+            raise HTTPException(status_code=400, detail="planner must be 'editor' or 'classic'")
+        app_settings.set("auto_cut_planner", body.planner)
+    return await get_auto_cut_editor()
 
 
 @router.get("/last_project")

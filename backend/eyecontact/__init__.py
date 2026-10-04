@@ -114,19 +114,36 @@ def prune_previews():
 
 def analyse(src: str, settings: Settings = Settings(),
             progress: Optional[Callable[[float], None]] = None,
-            cancelled: Optional[Callable[[], bool]] = None):
-    """Pass 1 + plan only: (VideoInfo, plan). Cheap to repeat once the landmarks are cached."""
+            cancelled: Optional[Callable[[], bool]] = None, lens_e: Optional[dict] = None):
+    """Pass 1 + plan only: (VideoInfo, plan). Cheap to repeat once the landmarks are cached.
+    `lens_e`: each eye's lens position from the whole recording, for a clip of it."""
     from .gpu import probe
     info = probe(src)
     data = _track(src, info, progress, cancelled)
-    return info, make_plan(data["pts"], data["score"], info.fps, settings)
+    return info, make_plan(data["pts"], data["score"], info.fps, settings, lens_e)
+
+
+def lens_positions(src: str, settings: Settings = Settings()) -> Optional[dict]:
+    """Where each eye sits when looking into the lens, over the whole of `src`, or None.
+
+    Only from landmarks already cached (a full run or an earlier preview tracked them): a
+    preview must stay quick, so it never tracks a whole recording just for this."""
+    try:
+        if not _cache_path(src).exists():
+            return None
+        _info, plan = analyse(src, settings)
+        return plan.get("lens_e") or None
+    except Exception:
+        return None
 
 
 def correct_eye_contact(src: str, dst: Optional[str] = None, settings: Settings = Settings(),
                         quality: str = "high", codec: str = "hevc",
                         progress: Optional[Callable[[float], None]] = None,
-                        cancelled: Optional[Callable[[], bool]] = None) -> dict:
-    """Write an eye-contact-corrected copy of `src`. Returns a small report."""
+                        cancelled: Optional[Callable[[], bool]] = None,
+                        lens_e: Optional[dict] = None) -> dict:
+    """Write an eye-contact-corrected copy of `src`. Returns a small report. Pass `lens_e`
+    (lens_positions of the whole recording) when `src` is a short clip of it."""
     ok, why = available()
     if not ok:
         raise RuntimeError(f"Eye contact correction needs an NVIDIA GPU setup: {why}")
@@ -136,7 +153,7 @@ def correct_eye_contact(src: str, dst: Optional[str] = None, settings: Settings 
     t0 = time.time()
     report = lambda f: progress(f) if progress else None   # noqa: E731
 
-    info, plan = analyse(src, settings, lambda f: report(f * TRACK_SHARE), cancelled)
+    info, plan = analyse(src, settings, lambda f: report(f * TRACK_SHARE), cancelled, lens_e)
     t_track = time.time() - t0
     from .render import render
     frames = render(src, dst, plan, info, quality, codec,
@@ -157,6 +174,10 @@ def correct_eye_contact(src: str, dst: Optional[str] = None, settings: Settings 
         "symmetry_offset_deg": round(plan["symmetry_offset_deg"], 1),
         "reading_sweep_deg": round(plan["sweep_deg"], 1),
         "median_shift_px": round(float(np.median(np.abs(plan["corr"][moved]))) * w, 2) if moved.any() else 0.0,
+        # What each eye actually moved (per_eye_limits); median_shift_px is the shared push before it.
+        "median_shift_px_per_eye": {k: round(float(np.median(np.abs(plan["corr_e"][k][moved]))) * w, 2)
+                                    for k in plan.get("corr_e", {})} if moved.any() else {},
+        "lens_per_eye": {k: round(v, 3) for k, v in (plan.get("lens_e") or {}).items()},
         "settings": asdict(settings),
         "quality": quality,
         "seconds": round(time.time() - t0, 1),

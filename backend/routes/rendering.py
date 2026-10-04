@@ -229,6 +229,8 @@ async def _plan_cut_and_render(p_data: dict, tl: Timeline, project_id: str, phas
             candidate=bool(rd.get("candidate", False)),
             word_native=(str(rd.get("word_native")).strip() or None)
             if rd.get("word_native") else None,
+            take=rd.get("take") or None,
+            note=rd.get("note") or None,
         )
         for i, rd in enumerate(plan.words)
     ]

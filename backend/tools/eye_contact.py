@@ -68,9 +68,13 @@ def main():
                     help="0 keeps the reading sweep, 1 locks the eyes on the lens (default %(default)s)")
     ap.add_argument("--aim", type=float, default=0.0,
                     help="fine nudge of the lens direction in degrees, + = toward your left")
+    ap.add_argument("--pitch", type=float, default=0.0,
+                    help="vertical re-aim in degrees, + = lower the gaze (down), - = raise it")
     ap.add_argument("--quality", choices=["standard", "high", "max"], default="high")
     ap.add_argument("--codec", choices=["hevc", "h264"], default="hevc")
     ap.add_argument("--compare", action="store_true", help="also write <output>_compare.mp4")
+    ap.add_argument("--lens-from", default="",
+                    help="the whole recording this input was cut from: measure each eye's lens position there")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
@@ -85,9 +89,14 @@ def main():
     t0 = time.time()
     settings = Settings(prompter_side=args.side, angle_deg=args.angle,
                         prompter_cm=args.prompter_cm, camera_cm=args.camera_cm,
-                        steadiness=args.steadiness, aim_deg=args.aim)
+                        steadiness=args.steadiness, aim_deg=args.aim, pitch_deg=args.pitch)
+    lens = None
+    if args.lens_from:
+        from eyecontact import lens_positions
+        lens = lens_positions(args.lens_from, settings)
+        print("lens per eye from the whole recording:", lens)
     report = correct_eye_contact(args.input, out, settings,
-                                 args.quality, args.codec, progress)
+                                 args.quality, args.codec, progress, lens_e=lens)
     print(json.dumps(report, indent=2))
     if args.compare:
         cmp_path = str(Path(out).with_name(Path(out).stem + "_compare.mp4"))

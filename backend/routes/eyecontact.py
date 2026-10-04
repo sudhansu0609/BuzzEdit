@@ -33,7 +33,7 @@ VRAM_MB = 3000.0
 # pre-filled for every run; a run may still override any of it.
 SETTINGS_KEY = "eye_contact"
 DEFAULTS = {"prompter_side": "left", "angle_deg": 0.0, "prompter_cm": 30.0, "camera_cm": 110.0,
-            "steadiness": 0.7, "aim_deg": 0.0, "quality": "high"}
+            "steadiness": 0.7, "aim_deg": 0.0, "pitch_deg": 0.0, "quality": "high"}
 
 
 class EyeContactSetup(BaseModel):
@@ -43,6 +43,8 @@ class EyeContactSetup(BaseModel):
     camera_cm: Optional[float] = Field(None, ge=20.0, le=1000.0)
     steadiness: Optional[float] = Field(None, ge=0.0, le=1.0)
     aim_deg: Optional[float] = Field(None, ge=-15.0, le=15.0)
+    # vertical re-aim, + = lower the gaze (down), - = raise it (eyecontact.plan.vertical_shift)
+    pitch_deg: Optional[float] = Field(None, ge=-10.0, le=10.0)
     quality: Optional[str] = Field(None, pattern="^(standard|high|max)$")
 
 
@@ -139,7 +141,8 @@ def _settings(setup: Dict[str, Any]):
     from eyecontact import Settings
     return Settings(prompter_side=setup["prompter_side"], angle_deg=float(setup["angle_deg"]),
                     prompter_cm=float(setup["prompter_cm"]), camera_cm=float(setup["camera_cm"]),
-                    steadiness=float(setup["steadiness"]), aim_deg=float(setup["aim_deg"]))
+                    steadiness=float(setup["steadiness"]), aim_deg=float(setup["aim_deg"]),
+                    pitch_deg=float(setup.get("pitch_deg") or 0.0))
 
 
 def _cleanup(dst: str):
@@ -187,7 +190,7 @@ async def start_eye_contact_preview(project_id: str, media_id: str, body: Previe
 
 
 async def _run_preview(job_id: str, src: str, start_s: float, duration_s: float, setup: Dict[str, Any]):
-    from eyecontact import correct_eye_contact, preview_clip, prune_previews
+    from eyecontact import correct_eye_contact, lens_positions, preview_clip, prune_previews
     job = jobs[job_id]
     dst = ""
 
@@ -204,9 +207,12 @@ async def _run_preview(job_id: str, src: str, start_s: float, duration_s: float,
             before = await asyncio.to_thread(preview_clip, src, start_s, duration_s)
             # a distinct file per setup: the dialog may still be streaming the previous one
             dst = before.replace("_before.mp4", f"_after_{uuid.uuid4().hex[:6]}.mp4")
+            # Each eye's own lens position from the whole recording: the preview clip alone is
+            # too short to measure it, and would show the old over-pushed eyes.
+            lens = await asyncio.to_thread(lens_positions, src, _settings(setup))
             report = await asyncio.to_thread(
                 correct_eye_contact, before, dst, _settings(setup), "high", "h264", progress,
-                lambda: job["cancel"])
+                lambda: job["cancel"], lens)
         finally:
             await gpu_broker.release_lease("eye_contact")
         prune_previews()
