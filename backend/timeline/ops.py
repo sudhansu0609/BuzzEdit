@@ -238,7 +238,64 @@ def audit_cut_coverage(timeline: Timeline, limit: int = 5) -> dict:
             "kept_but_dropped": len(dropped), "dropped_examples": dropped[:limit]}
 
 
+def _lay_full_source(timeline: Timeline, primary_source_id: str, carried: dict) -> None:
+    """One V1 and one A1 clip over the whole source (Timeline.keep_full_source).
+
+    The user cut this recording themselves, so nothing is trimmed: not the
+    pauses, not the fumbles, not the silence before the first word. Every word
+    is marked enabled because every word plays -- a struck word here would show
+    as cut in the transcript panel while the render still played it.
+    """
+    fps = timeline.fps_num / max(1, timeline.fps_den)
+    source = timeline.sources.get(primary_source_id)
+    if source is not None and source.duration_seconds > 0:
+        src_end = int(round(source.duration_seconds * fps))
+    else:
+        src_end = max((w.end_frame for w in timeline.words), default=0)
+    for word in timeline.words:
+        word.enabled = True
+    if src_end <= 0:
+        timeline.recalculate_duration()
+        return
+
+    anchor_id = timeline.words[0].id if timeline.words else None
+    tl_start = max(0, timeline.program_offset_frames)
+    for track, prefix in (("V1", "v1"), ("A1", "a1")):
+        item = TimelineItem(
+            id=f"{prefix}_0_{uuid.uuid4().hex[:6]}",
+            track=track,
+            source_id=primary_source_id,
+            source_start_frame=0,
+            source_end_frame=src_end,
+            timeline_start_frame=tl_start,
+            timeline_end_frame=tl_start + src_end,
+            enabled=True,
+            anchor_word_id=anchor_id,
+        )
+        restored = carried.get((track, anchor_id))
+        if restored:
+            item.transform, item.color = restored
+        timeline.items.append(item)
+
+    timeline.recalculate_duration()
+    timeline.revision += 1
+
+
 def rebuild_primary_tracks(timeline: Timeline, primary_source_id: str) -> None:
+    """Rebuild V1/A1 from the word list, then reapply any manual cuts on top.
+
+    `manual_cuts` are hand-made removals on the AI-managed tracks (via
+    `cut_program_range`) that the word-driven rebuild knows nothing about; every
+    word toggle throws V1/A1 away and rebuilds them from scratch, which would
+    silently bring a manually cut span back. Reapplying `trim_source_regions`
+    here is what makes a manual cut survive that rebuild.
+    """
+    _rebuild_primary_tracks_inner(timeline, primary_source_id)
+    if timeline.manual_cuts:
+        trim_source_regions(timeline, timeline.manual_cuts, primary_source_id)
+
+
+def _rebuild_primary_tracks_inner(timeline: Timeline, primary_source_id: str) -> None:
     """
     Rebuild V1 (video) and A1 (audio) tracks from enabled words.
     Contiguous enabled words are merged into continuous video/audio segments.
@@ -256,6 +313,10 @@ def rebuild_primary_tracks(timeline: Timeline, primary_source_id: str) -> None:
 
     # Remove existing V1 and A1 items
     timeline.items = [item for item in timeline.items if item.track not in ("V1", "A1")]
+
+    if timeline.keep_full_source:
+        _lay_full_source(timeline, primary_source_id, carried)
+        return
 
     enabled_words = [w for w in timeline.words if w.enabled]
     if not enabled_words:
@@ -478,11 +539,28 @@ def rebuild_primary_tracks(timeline: Timeline, primary_source_id: str) -> None:
     timeline.recalculate_duration()
     timeline.revision += 1
 
+def _uncut_word_span(timeline: Timeline, word) -> None:
+    """Re-enabling a word must also lift any manual cut sitting over it.
+
+    Otherwise `rebuild_primary_tracks` would rebuild the word back in and then
+    immediately trim it straight back out again via `manual_cuts`.
+    """
+    if word.end_frame <= word.start_frame or not timeline.manual_cuts:
+        return
+    span = [word.start_frame, word.end_frame]
+    survivors: List[List[int]] = []
+    for region in timeline.manual_cuts:
+        survivors.extend(_subtract_regions(region, [span]))
+    timeline.manual_cuts = survivors
+
+
 def toggle_word(timeline: Timeline, word_id: str, enabled: bool, primary_source_id: str) -> bool:
     """Toggle a word's enabled status and rebuild primary tracks."""
     for word in timeline.words:
         if word.id == word_id:
             word.enabled = enabled
+            if enabled:
+                _uncut_word_span(timeline, word)
             rebuild_primary_tracks(timeline, primary_source_id)
             return True
     return False
@@ -494,6 +572,8 @@ def toggle_word_range(timeline: Timeline, word_ids: List[str], enabled: bool, pr
     for word in timeline.words:
         if word.id in id_set:
             word.enabled = enabled
+            if enabled:
+                _uncut_word_span(timeline, word)
             count += 1
     if count > 0:
         rebuild_primary_tracks(timeline, primary_source_id)
@@ -579,6 +659,118 @@ def trim_source_regions(timeline: Timeline, regions: List[List[int]],
     timeline.recalculate_duration()
     timeline.revision += 1
     return len(collapsed)
+
+
+def _merge_regions(regions: List[List[int]]) -> List[List[int]]:
+    """Sort and coalesce overlapping/adjacent [start,end) spans."""
+    merged: List[List[int]] = []
+    for start, end in sorted([r for r in regions if r[1] > r[0]]):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def cut_program_range(timeline: Timeline, start_frame: int, end_frame: int,
+                      primary_source_id: str) -> int:
+    """Delete a span of the finished programme — V1/A1 *and* every other track.
+
+    `start_frame`/`end_frame` are TIMELINE (programme) frames: a "delete this
+    span of the finished video" edit, not a transcript one. The span is mapped
+    across the current V1 items into source-frame spans, folded into
+    `manual_cuts` (so the cut survives every future word-toggle rebuild) and
+    applied to V1/A1 via `trim_source_regions`. Every other item then ripples:
+    an item entirely inside the cut is dropped, an item entirely after it
+    shifts left to close the gap, and an item straddling an edge keeps only its
+    surviving part (its source region trimmed to match, for a media item).
+    Words wholly inside the newly cut source span read as a manual strike.
+
+    Returns the number of programme frames removed.
+    """
+    start_frame, end_frame = int(start_frame), int(end_frame)
+    if start_frame < 0 or end_frame <= start_frame:
+        raise ValueError("cut_program_range: invalid or empty range")
+    cut_length = end_frame - start_frame
+
+    v1 = sorted([i for i in timeline.items if i.track == "V1"],
+                key=lambda i: i.timeline_start_frame)
+    new_spans: List[List[int]] = []
+    for item in v1:
+        overlap_start = max(item.timeline_start_frame, start_frame)
+        overlap_end = min(item.timeline_end_frame, end_frame)
+        if overlap_end <= overlap_start:
+            continue
+        src_start = item.source_start_frame + (overlap_start - item.timeline_start_frame)
+        src_end = item.source_start_frame + (overlap_end - item.timeline_start_frame)
+        if src_end > src_start:
+            new_spans.append([src_start, src_end])
+
+    timeline.manual_cuts = _merge_regions(timeline.manual_cuts + new_spans)
+    if new_spans:
+        trim_source_regions(timeline, timeline.manual_cuts, primary_source_id)
+
+    fps = timeline.fps_num / max(1, timeline.fps_den)
+
+    def map_frame(frame: int) -> int:
+        # Collapses anything inside the cut to its start, and shifts anything
+        # after it left by the cut's length — the same ripple in one formula.
+        if frame <= start_frame:
+            return frame
+        if frame >= end_frame:
+            return frame - cut_length
+        return start_frame
+
+    kept_items: List[TimelineItem] = []
+    for item in timeline.items:
+        if item.track in ("V1", "A1"):
+            kept_items.append(item)          # already rippled by trim_source_regions
+            continue
+        old_start, old_end = item.timeline_start_frame, item.timeline_end_frame
+        if old_end <= start_frame:
+            kept_items.append(item)          # entirely before the cut
+            continue
+
+        new_start, new_end = map_frame(old_start), map_frame(old_end)
+        if new_end <= new_start:
+            continue                          # entirely inside the cut -> dropped
+
+        overlap_start = max(old_start, start_frame)
+        overlap_end = min(old_end, end_frame)
+        overlap_len = max(0, overlap_end - overlap_start)
+
+        if item.kind == "media" and item.source_id and overlap_len > 0:
+            if old_start < start_frame:
+                item.source_end_frame -= overlap_len     # tail of the item cut away
+            else:
+                item.source_start_frame += overlap_len   # head of the item cut away
+
+        shift_frames = old_start - new_start
+        if shift_frames and item.atmosphere:
+            shift_s = shift_frames / fps
+            for fx in item.atmosphere:
+                extra = fx.extra or {}
+                if "start_s" in extra:
+                    extra["start_s"] = float(extra["start_s"]) - shift_s
+                if "end_s" in extra:
+                    extra["end_s"] = float(extra["end_s"]) - shift_s
+
+        item.timeline_start_frame = new_start
+        item.timeline_end_frame = new_end
+        kept_items.append(item)
+
+    timeline.items = kept_items
+
+    # A word wholly inside a freshly cut source span reads as a manual strike —
+    # no reason/disfluency, exactly like toggle_word leaves one.
+    for span_start, span_end in new_spans:
+        for word in timeline.words:
+            if word.enabled and word.start_frame >= span_start and word.end_frame <= span_end:
+                word.enabled = False
+
+    timeline.recalculate_duration()
+    timeline.revision += 1
+    return cut_length
 
 
 def add_broll_item(

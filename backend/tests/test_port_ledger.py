@@ -76,3 +76,18 @@ def test_withdrawing_twice_is_harmless(ledger, monkeypatch):
     backend_main._withdraw_ledger_entry()
     backend_main._withdraw_ledger_entry()
     assert buzzcaf_ports.entry(APP_NAME) is None
+
+
+def test_a_second_backend_leaves_a_live_buzzedits_entry_alone(ledger):
+    """A dev run on 8197 took the entry from the headless BuzzEdit on 8100;
+    the Studio enqueued a render on it and the job died with that process."""
+    buzzcaf_ports.publish(APP_NAME, 8100, "http://127.0.0.1:8100/api/health")
+    live = lambda url: url == "http://127.0.0.1:8100/api/health"  # noqa: E731
+    assert backend_main._ledger_held_by_another(8197, live) == "http://127.0.0.1:8100/api/health"
+
+
+def test_a_dead_holder_or_our_own_entry_does_not_block_publishing(ledger):
+    assert backend_main._ledger_held_by_another(8197, lambda url: True) is None  # empty ledger
+    buzzcaf_ports.publish(APP_NAME, 8100, "http://127.0.0.1:8100/api/health")
+    assert backend_main._ledger_held_by_another(8197, lambda url: False) is None  # holder gone
+    assert backend_main._ledger_held_by_another(8100, lambda url: True) is None  # that is us

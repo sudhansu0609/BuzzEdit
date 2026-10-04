@@ -1,0 +1,31 @@
+{
+ "result": {
+  "wrongly_removed_s": 8.8,
+  "missed_s": 38.2,
+  "caught_pct": 65.2,
+  "cuts": 29,
+  "recording": "life3baje_ep1",
+  "run": 0,
+  "mode": "full",
+  "examples": true,
+  "seconds": 132.4,
+  "calls": 6,
+  "tokens_in": 113115,
+  "tokens_out": 32567,
+  "usd": 1.104,
+  "groups": 14,
+  "drops": 28,
+  "trims": 105,
+  "refused": 0,
+  "utterances": 138,
+  "runs": 3,
+  "unanimous": 44,
+  "disputed": 8,
+  "second_opinion_removed": 5,
+  "restored_by_content_check": 0,
+  "final_read_removed": 2,
+  "final_read_restored": 0
+ },
+ "answer": null,
+ "refused": []
+}

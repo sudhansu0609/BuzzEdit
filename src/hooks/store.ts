@@ -65,6 +65,8 @@ export interface PipelineState {
   setError: (e: string | null) => void;
   setSelectedClip: (id: string | null) => void;
   toggleSelectedClip: (id: string) => void;
+  /** Replace the whole selection; `primary` (default: the last id) drives the inspector. */
+  setSelection: (ids: string[], primary?: string | null) => void;
   setCurrentTime: (t: number) => void;
   setIsPlaying: (v: boolean) => void;
   setScrubbing: (v: boolean) => void;
@@ -104,6 +106,12 @@ export const useProjectStore = create<PipelineState>((set) => ({
       // The primary selection drives the inspector, so keep it on a clip that
       // is still selected.
       return { selectedClipIds: next, selectedClipId: next[next.length - 1] ?? null };
+    }),
+  setSelection: (ids, primary) =>
+    set(() => {
+      const unique = Array.from(new Set(ids));
+      const lead = primary && unique.includes(primary) ? primary : unique[unique.length - 1] ?? null;
+      return { selectedClipIds: unique, selectedClipId: lead };
     }),
   setCurrentTime: (t) => set({ currentTime: t }),
   setIsPlaying: (v) => set({ isPlaying: v }),

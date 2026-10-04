@@ -4,6 +4,7 @@ import {
   API_BASE, previewFrameUrl, getPreviewProxy, buildPreviewProxy, ProxyStatus,
 } from '../hooks/api';
 import StageLayout from './StageLayout';
+import { useCommand } from '../hooks/commands';
 
 /**
  * `fx` is the dressed programme — grade, atmosphere, captions, B-roll, bars —
@@ -418,6 +419,7 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
     if (isPlaying) video.pause();
     else video.play().catch(() => {});
   }, [isPlaying]);
+  useCommand('playback.playPause', togglePlay);
 
   const handleSeek = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();

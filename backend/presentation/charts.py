@@ -51,6 +51,34 @@ def _format(value: float, unit: str) -> str:
     return f"{text} {unit}".strip()
 
 
+def _tint(rgb: Tuple[int, int, int], factor: float) -> Tuple[int, int, int]:
+    """Lighten (factor > 0, toward white) or darken (factor < 0, toward black) an RGB colour."""
+    r, g, b = rgb
+    if factor >= 0:
+        r = r + (255 - r) * factor
+        g = g + (255 - g) * factor
+        b = b + (255 - b) * factor
+    else:
+        r = r * (1 + factor)
+        g = g * (1 + factor)
+        b = b * (1 + factor)
+    return (int(max(0, min(255, r))), int(max(0, min(255, g))), int(max(0, min(255, b))))
+
+
+def _pie_palette(look: Dict[str, Any], count: int, accent_index: int) -> List[Tuple[int, int, int]]:
+    """Wedge colours: `bar` for the largest slice, `bar_alt` and derived tints for the rest."""
+    factors = [0.0, 0.35, -0.25, 0.55, -0.45, 0.2, -0.15]
+    colours: List[Tuple[int, int, int]] = []
+    fi = 0
+    for i in range(count):
+        if i == accent_index:
+            colours.append(look["bar"])
+        else:
+            colours.append(_tint(look["bar_alt"], factors[fi % len(factors)]))
+            fi += 1
+    return colours
+
+
 def render_bar_chart(labels: Sequence[str], values: Sequence[float], width: int, height: int,
                      unit: str = "", title: Optional[str] = None, style: str = "clean"):
     """Horizontal bars, largest value full width."""
@@ -128,6 +156,149 @@ def render_timeline_strip(years: Sequence[str], width: int, height: int,
     return image.resize((width, height), Image.LANCZOS)
 
 
+def render_pie_chart(labels: Sequence[str], values: Sequence[float], width: int, height: int,
+                     unit: str = "", title: Optional[str] = None, style: str = "clean"):
+    """Filled wedges sized by share of total, with a legend and the largest wedge in accent."""
+    from PIL import Image, ImageDraw
+
+    look = STYLES.get(style, STYLES["clean"])
+    ss = 2
+    W, H = width * ss, height * ss
+    image = Image.new("RGB", (W, H), look["bg"])
+    draw = ImageDraw.Draw(image)
+    scale = min(W, H) / (1080 * ss)
+
+    margin = int(W * 0.08)
+    top = int(H * 0.14)
+    title_font = _font(int(64 * ss * scale))
+    label_font = _font(int(38 * ss * scale), bold=False)
+    if title:
+        draw.text((margin, int(H * 0.06)), title, font=title_font, fill=look["text"])
+        top = int(H * 0.06) + int(64 * ss * scale) + int(40 * ss * scale)
+
+    values = list(values) or [0.0]
+    labels = list(labels)
+    count = len(values)
+    total = sum(abs(v) for v in values) or 1.0
+    accent_index = max(range(count), key=lambda i: abs(values[i]))
+    colours = _pie_palette(look, count, accent_index)
+
+    bottom = H - int(H * 0.08)
+    diameter = min(W * 0.46, bottom - top)
+    diameter = max(diameter, 10 * ss)
+    cx = margin + diameter / 2
+    cy = top + (bottom - top) / 2
+    bbox = [cx - diameter / 2, cy - diameter / 2, cx + diameter / 2, cy + diameter / 2]
+
+    start_angle = -90.0
+    for index, value in enumerate(values):
+        share = abs(value) / total
+        sweep = share * 360.0
+        if sweep > 0:
+            end_angle = start_angle + sweep
+            draw.pieslice(bbox, start_angle, end_angle, fill=colours[index])
+            start_angle = end_angle
+
+    legend_x = cx + diameter / 2 + int(60 * ss * scale)
+    legend_y = top + int(10 * ss * scale)
+    row_h = max(int(56 * ss * scale), (bottom - top) / count)
+    swatch = int(34 * ss * scale)
+    for index, value in enumerate(values):
+        label = labels[index] if index < len(labels) else ""
+        ly = legend_y + row_h * index
+        draw.rectangle([legend_x, ly, legend_x + swatch, ly + swatch], fill=colours[index])
+        pct = abs(value) / total * 100.0
+        text = f"{label} — {pct:.0f}%" if label else f"{pct:.0f}%"
+        draw.text((legend_x + swatch + int(20 * ss * scale), ly - int(2 * ss * scale)), text,
+                  font=label_font, fill=look["text"])
+
+    return image.resize((width, height), Image.LANCZOS)
+
+
+def render_line_chart(labels: Sequence[str], values: Sequence[float], width: int, height: int,
+                      unit: str = "", title: Optional[str] = None, style: str = "clean"):
+    """A single line with area fill, gridlines, point markers, and labels on the peak."""
+    from PIL import Image, ImageDraw
+
+    look = STYLES.get(style, STYLES["clean"])
+    ss = 2
+    W, H = width * ss, height * ss
+    image = Image.new("RGB", (W, H), look["bg"])
+    draw = ImageDraw.Draw(image)
+    scale = min(W, H) / (1080 * ss)
+
+    margin = int(W * 0.1)
+    top = int(H * 0.14)
+    title_font = _font(int(64 * ss * scale))
+    label_font = _font(int(36 * ss * scale), bold=False)
+    value_font = _font(int(40 * ss * scale))
+    if title:
+        draw.text((margin, int(H * 0.06)), title, font=title_font, fill=look["text"])
+        top = int(H * 0.06) + int(64 * ss * scale) + int(40 * ss * scale)
+
+    values = list(values) or [0.0]
+    labels = list(labels)
+    count = len(values)
+    bottom = H - int(H * 0.14)
+    left = margin
+    right = W - margin
+
+    vmax = max(values)
+    vmin = min(values)
+    if vmax == vmin:
+        vmax += 1.0
+        vmin -= 1.0
+    span = vmax - vmin
+    vmax += span * 0.15
+    if vmin < 0:
+        vmin -= span * 0.15
+
+    def x_at(i: int) -> float:
+        return left if count == 1 else left + (right - left) * (i / (count - 1))
+
+    def y_at(v: float) -> float:
+        return bottom - (bottom - top) * ((v - vmin) / (vmax - vmin))
+
+    grid_lines = 4
+    for g in range(grid_lines + 1):
+        gy = top + (bottom - top) * g / grid_lines
+        draw.line([(left, gy), (right, gy)], fill=look["grid"], width=max(1, int(2 * ss * scale)))
+
+    points = [(x_at(i), y_at(v)) for i, v in enumerate(values)]
+
+    if points:
+        fill_colour = _tint(look["bar_alt"], 0.78)
+        area = points + [(points[-1][0], bottom), (points[0][0], bottom)]
+        draw.polygon(area, fill=fill_colour)
+
+    if len(points) > 1:
+        draw.line(points, fill=look["bar"], width=max(2, int(6 * ss * scale)), joint="curve")
+
+    r = int(12 * ss * scale)
+    for x, y in points:
+        draw.ellipse([x - r, y - r, x + r, y + r], fill=look["panel"], outline=look["bar"],
+                     width=max(2, int(4 * ss * scale)))
+
+    peak_val = max(values)
+    for i, v in enumerate(values):
+        if v == peak_val:
+            x, y = points[i]
+            text = _format(v, unit)
+            tw = draw.textlength(text, font=value_font)
+            draw.text((x - tw / 2, y - r - int(50 * ss * scale)), text, font=value_font, fill=look["text"])
+
+    for i in range(count):
+        label = labels[i] if i < len(labels) else ""
+        if not label:
+            continue
+        x = x_at(i)
+        tw = draw.textlength(str(label), font=label_font)
+        draw.text((x - tw / 2, bottom + int(20 * ss * scale)), str(label), font=label_font,
+                  fill=look["muted"])
+
+    return image.resize((width, height), Image.LANCZOS)
+
+
 def style_for(genre: str) -> str:
     return "noir" if genre in ("horror", "true_crime") else "clean"
 
@@ -144,7 +315,10 @@ def render_chart_assets(beats: Sequence[Beat], project_dir: Path, width: int, he
     directory.mkdir(parents=True, exist_ok=True)
     for beat in wanted:
         data = beat.data
-        key = hashlib.sha1(f"{sorted(data.items())!r}:{style}:{width}x{height}".encode()).hexdigest()[:12]
+        chart_type = str(data.get("chart_type", "")).lower()
+        key = hashlib.sha1(
+            f"{sorted(data.items())!r}:{style}:{width}x{height}:{chart_type}".encode()
+        ).hexdigest()[:12]
         path = directory / f"chart_{key}.png"
         if not path.exists():
             try:
@@ -152,6 +326,14 @@ def render_chart_assets(beats: Sequence[Beat], project_dir: Path, width: int, he
                     image = render_timeline_strip(data["years"], width, height,
                                                   title=data.get("title") or beat.text,
                                                   style=style, active=data.get("active"))
+                elif chart_type == "pie":
+                    image = render_pie_chart(data["labels"], data["values"], width, height,
+                                             unit=data.get("unit") or "",
+                                             title=data.get("title") or None, style=style)
+                elif chart_type in ("line", "graph"):
+                    image = render_line_chart(data["labels"], data["values"], width, height,
+                                              unit=data.get("unit") or "",
+                                              title=data.get("title") or None, style=style)
                 else:
                     image = render_bar_chart(data["labels"], data["values"], width, height,
                                              unit=data.get("unit") or "",

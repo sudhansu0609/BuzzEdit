@@ -33,6 +33,13 @@ onnxruntime>=1.16.0
 # Transliteration (native script -> Hinglish/romanized Latin)
 indic-transliteration>=2.3.0
 
+# Eye-contact correction (eyecontact/): NVDEC/NVENC straight to and from CUDA tensors,
+# PyAV to mux with the source's own timestamps, tflite to unpack MediaPipe's landmark
+# model once (it then runs on CUDA through torch, so mediapipe itself is not needed).
+PyNvVideoCodec>=2.0
+av>=13.0
+tflite>=2.18
+
 # Hardware & System
 nvidia-ml-py>=12.535.133
 

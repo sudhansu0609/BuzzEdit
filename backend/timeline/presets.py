@@ -92,7 +92,7 @@ TEXT_PRESETS: Dict[str, Dict[str, Any]] = {
         "label": "Lower Third",
         "style": {"font_family": "Poppins", "font_size": 48, "bold": True,
                   "color": "white", "box": True, "box_color": "#111111@0.75",
-                  "box_padding": 18, "align": "left", "pos_x": -0.55, "pos_y": 0.62,
+                  "box_padding": 18, "align": "left", "pos_x": -0.55, "pos_y": 0.42,
                   "animation": "slide-up"},
     },
     "neon": {
@@ -140,14 +140,14 @@ TEXT_PRESETS: Dict[str, Dict[str, Any]] = {
         "label": "Character Card",
         "style": {"font_family": "Montserrat", "font_size": 46, "bold": True,
                   "color": "white", "box": True, "box_color": "#0B0B0B@0.7",
-                  "box_padding": 16, "align": "left", "pos_x": -0.92, "pos_y": 0.55,
+                  "box_padding": 16, "align": "left", "pos_x": -0.92, "pos_y": 0.42,
                   "line_spacing": 4, "animation": "slide-up", "animation_duration": 0.3},
     },
     "source_card": {
         "label": "Source Citation",
         "style": {"font_family": "Inter", "font_size": 30, "color": "#DDDDDD",
                   "box": True, "box_color": "black@0.55", "box_padding": 10,
-                  "align": "right", "pos_x": 0.94, "pos_y": 0.88,
+                  "align": "right", "pos_x": 0.94, "pos_y": -0.88,
                   "animation": "fade", "animation_duration": 0.3},
     },
     "chapter_title": {
@@ -199,6 +199,15 @@ TEXT_PRESETS: Dict[str, Dict[str, Any]] = {
 # `words_per_caption` and `max_gap_seconds` control how the word stream is cut
 # into caption cards; the style block is a TextStyle override.
 
+# The caption band. `pos_y` is the centre of the whole caption block (ASS
+# alignment 5), main line and the smaller translation line under it together:
+# 0.74 centres it at 87% of the frame, so a two-line block ends ~6% above the
+# bottom edge. Everything else that draws text in the lower half — cards,
+# text effects, lower thirds, split-screen labels — stays at or above
+# TEXT_ZONE_MAX_POS_Y so it can never land on the captions.
+CAPTION_POS_Y = 0.74
+TEXT_ZONE_MAX_POS_Y = 0.42
+
 CAPTION_PRESETS: Dict[str, Dict[str, Any]] = {
     "classic": {
         "label": "Classic Subtitles",
@@ -217,7 +226,7 @@ CAPTION_PRESETS: Dict[str, Dict[str, Any]] = {
         "style": {"font_family": "Montserrat", "font_size": 80, "bold": True,
                   "color": "white", "highlight_color": "#FFE23A",
                   "stroke_width": 6, "stroke_color": "black",
-                  "shadow_x": 3, "shadow_y": 3, "pos_y": 0.4,
+                  "shadow_x": 3, "shadow_y": 3, "pos_y": CAPTION_POS_Y,
                   "animation": "karaoke", "animation_duration": 0.1},
     },
     "youtube_shorts": {
@@ -347,6 +356,9 @@ TRANSITION_PRESETS: Dict[str, Dict[str, Any]] = {
     "pixelize": {"label": "Pixelise", "type": "pixelize", "duration": 0.5},
     "squeeze": {"label": "Squeeze", "type": "squeezeh", "duration": 0.45},
     "radial": {"label": "Radial", "type": "radial", "duration": 0.6},
+    "iris_open": {"label": "Iris Open", "type": "circleopen", "duration": 0.5},
+    "iris_close": {"label": "Iris Close", "type": "circleclose", "duration": 0.5},
+    "folder_flip": {"label": "Folder Flip", "type": "vertopen", "duration": 0.5},
 }
 
 
@@ -380,6 +392,8 @@ EFFECT_PRESETS: Dict[str, Dict[str, Any]] = {
     "wind": {"label": "Wind", "values": {"type": "wind", "intensity": 0.5, "speed": 1.0}},
     "film_grain": {"label": "Film Grain",
                    "values": {"type": "grain", "intensity": 0.35, "speed": 1.0}},
+    "camera_shutter": {"label": "Camera Shutter",
+                       "values": {"type": "shutter", "intensity": 0.95, "speed": 1.0}},
 }
 
 

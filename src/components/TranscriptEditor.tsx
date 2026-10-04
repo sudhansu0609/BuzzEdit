@@ -1,7 +1,7 @@
 import { useCallback, useRef, useEffect, useState, useMemo } from 'react';
 import { useProjectStore } from '../hooks/store';
 import type { TranscriptSegment } from '../hooks/store';
-import { toggleWordApi } from '../hooks/api';
+import { toggleWordApi, replaceWords, getProject } from '../hooks/api';
 import { reasonTooltip } from '../lib/editReasons';
 
 type ViewMode = 'hinglish' | 'native' | 'english';
@@ -37,12 +37,21 @@ const FIELD_BY_MODE: Record<ViewMode, keyof TranscriptSegment> = {
 
 export default function TranscriptEditor() {
   const containerRef = useRef<HTMLDivElement>(null);
-  const { project, currentTime, setCurrentTime, updateProject } = useProjectStore();
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const { project, currentTime, setCurrentTime, updateProject, setProject } = useProjectStore();
   const [viewMode, setViewMode] = useState<ViewMode>('hinglish');
   // The auto-edit decides word by word, so reviewing it needs a word-by-word
   // view. The segment view stays for reading and correcting the text itself.
   const [wordView, setWordView] = useState(true);
   const [busyWord, setBusyWord] = useState<string | null>(null);
+
+  // --- Search + replace (F3) ---
+  const [searchTerm, setSearchTerm] = useState('');
+  const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
+  const [showReplace, setShowReplace] = useState(false);
+  const [replaceTerm, setReplaceTerm] = useState('');
+  const [busyReplace, setBusyReplace] = useState(false);
+  const [replacedMsg, setReplacedMsg] = useState<string | null>(null);
 
   const segments = useMemo(() => getSegments(project?.transcript), [project?.transcript]);
 
@@ -67,6 +76,139 @@ export default function TranscriptEditor() {
       setBusyWord(null);
     }
   }, [project?.id, busyWord, updateProject]);
+
+  // Matches are always found against the word list — it's the one place with
+  // real per-word timing, so it's what a jump (in either view) lands on.
+  const matches = useMemo(() => {
+    const term = searchTerm.trim().toLowerCase();
+    if (!term) return [] as TimelineWord[];
+    // Either script counts — the native view shows `word_native`.
+    return words.filter(w => w.text.toLowerCase().includes(term)
+      || ((w as any).word_native || '').toLowerCase().includes(term));
+  }, [words, searchTerm]);
+  const matchIds = useMemo(() => new Set(matches.map(m => m.id)), [matches]);
+  const currentMatchId = matches[currentMatchIndex]?.id ?? null;
+
+  useEffect(() => {
+    setCurrentMatchIndex(0);
+  }, [searchTerm]);
+
+  useEffect(() => {
+    if (currentMatchIndex >= matches.length && matches.length > 0) {
+      setCurrentMatchIndex(matches.length - 1);
+    }
+  }, [matches, currentMatchIndex]);
+
+  // Which segment a match falls in, so segment view can highlight it too —
+  // the textarea it renders into can't host inline <mark>s, so the whole
+  // segment is what lights up.
+  const matchSegmentIds = useMemo(() => {
+    const set = new Set<number>();
+    matches.forEach(w => {
+      const t = wordTime(w.start_frame);
+      const seg = segments.find(s => t >= s.start && t <= s.end);
+      if (seg) set.add(seg.id);
+    });
+    return set;
+  }, [matches, segments, wordTime]);
+
+  const currentMatchSegmentId = useMemo(() => {
+    const m = matches[currentMatchIndex];
+    if (!m) return null;
+    const t = wordTime(m.start_frame);
+    return segments.find(s => t >= s.start && t <= s.end)?.id ?? null;
+  }, [matches, currentMatchIndex, segments, wordTime]);
+
+  const showWords = wordView && words.length > 0;
+
+  const jumpToMatch = useCallback((index: number) => {
+    if (matches.length === 0) return;
+    const wrapped = ((index % matches.length) + matches.length) % matches.length;
+    setCurrentMatchIndex(wrapped);
+    const match = matches[wrapped];
+    setCurrentTime(wordTime(match.start_frame));
+    requestAnimationFrame(() => {
+      if (!containerRef.current) return;
+      const el = showWords
+        ? containerRef.current.querySelector(`[data-word-id="${match.id}"]`)
+        : (() => {
+            const t = wordTime(match.start_frame);
+            const seg = segments.find(s => t >= s.start && t <= s.end);
+            return seg ? containerRef.current!.querySelector(`[data-segment-id="${seg.id}"]`) : null;
+          })();
+      el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
+  }, [matches, setCurrentTime, wordTime, segments, showWords]);
+
+  const handleNextMatch = useCallback(() => jumpToMatch(currentMatchIndex + 1), [jumpToMatch, currentMatchIndex]);
+  const handlePrevMatch = useCallback(() => jumpToMatch(currentMatchIndex - 1), [jumpToMatch, currentMatchIndex]);
+
+  const handleSearchKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (e.shiftKey) handlePrevMatch(); else handleNextMatch();
+    }
+  }, [handleNextMatch, handlePrevMatch]);
+
+  // Ctrl+F focuses the search box for as long as this panel is mounted,
+  // without touching the global command dispatcher (no command owns that chord).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  const refreshTranscriptFromServer = useCallback(async () => {
+    if (!project?.id) return;
+    try {
+      const fresh = await getProject(project.id);
+      if (fresh) setProject(fresh);
+    } catch (err) {
+      console.error('Could not refresh the transcript:', err);
+    }
+  }, [project?.id, setProject]);
+
+  const handleReplaceOne = useCallback(async () => {
+    const match = matches[currentMatchIndex];
+    if (!project?.id || !match || !searchTerm.trim() || busyReplace) return;
+    setBusyReplace(true);
+    try {
+      const res: any = await replaceWords(project.id, searchTerm.trim(), replaceTerm, { wordIds: [match.id], wholeWord: false });
+      if (res?.timeline) updateProject({ timeline: res.timeline } as any);
+      await refreshTranscriptFromServer();
+      setReplacedMsg(`Replaced ${res?.replaced ?? 1} word${(res?.replaced ?? 1) === 1 ? '' : 's'}`);
+    } catch (err) {
+      console.error('Could not replace that word:', err);
+    } finally {
+      setBusyReplace(false);
+      setTimeout(() => setReplacedMsg(null), 2500);
+    }
+  }, [project?.id, matches, currentMatchIndex, searchTerm, replaceTerm, busyReplace, updateProject, refreshTranscriptFromServer]);
+
+  const handleReplaceAll = useCallback(async () => {
+    if (!project?.id || !searchTerm.trim() || busyReplace || matches.length === 0) return;
+    setBusyReplace(true);
+    try {
+      // Exactly the highlighted words, with the same substring match the
+      // search used — what you see highlighted is what gets replaced.
+      const res: any = await replaceWords(project.id, searchTerm.trim(), replaceTerm,
+        { wordIds: matches.map(m => m.id), wholeWord: false });
+      if (res?.timeline) updateProject({ timeline: res.timeline } as any);
+      await refreshTranscriptFromServer();
+      setReplacedMsg(`Replaced ${res?.replaced ?? 0} word${(res?.replaced ?? 0) === 1 ? '' : 's'}`);
+    } catch (err) {
+      console.error('Could not replace those words:', err);
+    } finally {
+      setBusyReplace(false);
+      setTimeout(() => setReplacedMsg(null), 2500);
+    }
+  }, [project?.id, matches, searchTerm, replaceTerm, busyReplace, updateProject, refreshTranscriptFromServer]);
 
   const cutCount = words.filter(w => !w.enabled).length;
 
@@ -146,8 +288,6 @@ export default function TranscriptEditor() {
     );
   }
 
-  const showWords = wordView && words.length > 0;
-
   const MODE_LABELS: Record<ViewMode, string> = {
     hinglish: 'Hinglish',
     native: 'Native',
@@ -197,6 +337,38 @@ export default function TranscriptEditor() {
         </span>
       </div>
 
+      <div className="transcript-search">
+        <input
+          ref={searchInputRef}
+          type="text"
+          className="transcript-search-input"
+          placeholder="Search transcript… (Ctrl+F)"
+          value={searchTerm}
+          onChange={(e) => setSearchTerm(e.target.value)}
+          onKeyDown={handleSearchKeyDown}
+        />
+        <span className="text-xs text-muted transcript-search-count">
+          {searchTerm.trim() ? (matches.length > 0 ? `${currentMatchIndex + 1} of ${matches.length}` : '0 of 0') : ''}
+        </span>
+        <button className="btn btn-sm" disabled={matches.length === 0} onClick={handlePrevMatch} title="Previous match (Shift+Enter)">▲</button>
+        <button className="btn btn-sm" disabled={matches.length === 0} onClick={handleNextMatch} title="Next match (Enter)">▼</button>
+        <button className={`btn btn-sm ${showReplace ? 'btn-primary' : ''}`} onClick={() => setShowReplace(v => !v)} title="Replace">🔁 Replace</button>
+        {replacedMsg && <span className="text-xs text-muted transcript-replaced-msg">{replacedMsg}</span>}
+        {showReplace && (
+          <>
+            <input
+              type="text"
+              className="transcript-search-input"
+              placeholder="Replace with…"
+              value={replaceTerm}
+              onChange={(e) => setReplaceTerm(e.target.value)}
+            />
+            <button className="btn btn-sm" disabled={busyReplace || !searchTerm.trim() || !currentMatchId} onClick={handleReplaceOne} title="Replace the current match only">Replace</button>
+            <button className="btn btn-sm" disabled={busyReplace || !searchTerm.trim()} onClick={handleReplaceAll} title="Replace every match in the transcript">Replace all</button>
+          </>
+        )}
+      </div>
+
       {showWords && (
         <div className="transcript-words">
           {words.map((word) => {
@@ -208,12 +380,15 @@ export default function TranscriptEditor() {
             return (
               <span
                 key={word.id}
+                data-word-id={word.id}
                 className={[
                   'transcript-word',
                   word.enabled ? 'is-kept' : 'is-cut',
                   word.candidate ? 'is-uncertain' : '',
                   isActive ? 'is-playing' : '',
                   busyWord === word.id ? 'is-busy' : '',
+                  matchIds.has(word.id) ? 'is-match' : '',
+                  word.id === currentMatchId ? 'is-current-match' : '',
                 ].filter(Boolean).join(' ')}
                 title={title}
                 onClick={() => handleToggleWord(word)}
@@ -235,7 +410,12 @@ export default function TranscriptEditor() {
             <div
               key={segment.id}
               data-segment-id={segment.id}
-              className={`transcript-segment ${isActive ? 'active' : ''}`}
+              className={[
+                'transcript-segment',
+                isActive ? 'active' : '',
+                matchSegmentIds.has(segment.id) ? 'has-match' : '',
+                segment.id === currentMatchSegmentId ? 'current-match' : '',
+              ].filter(Boolean).join(' ')}
               onClick={() => handleSegmentClick(segment.start, segment.end)}
             >
               <div className="segment-timecode font-mono text-xs">

@@ -90,8 +90,14 @@ async def plan_auto_edit(
     aggressiveness: float = 0.5,
     use_llm: bool = True,
     detect_fillers: bool = True,
+    settings: Optional[Dict[str, Any]] = None,
 ) -> AutoEditPlan:
-    """Run the planner over `words` and collect its report."""
+    """Run the planner over `words` and collect its report.
+
+    Pass the project's `settings` and the genre's pacing is filled in when nobody
+    chose one (`apply_genre_pacing`); `pacing_kwargs(settings)` then hands the
+    pacing to the timeline build.
+    """
     if use_llm:
         release_asr_gpu()
     refined = await refine_disfluencies(
@@ -101,7 +107,77 @@ async def plan_auto_edit(
         audio_path=audio_path,
         detect_fillers=detect_fillers,
     )
-    return AutoEditPlan(words=refined, report=last_report(refined), audio_path=audio_path)
+    report = last_report(refined)
+    if settings is not None:
+        genre = await apply_genre_pacing(settings, words, model_ready=bool(report.get("used_llm")))
+        if str(settings.get("pacing_source") or "").startswith(_GENRE_SOURCE):
+            report["pacing"] = {"genre": genre, **pacing_kwargs(settings)}
+    return AutoEditPlan(words=refined, report=report, audio_path=audio_path)
+
+
+def pacing_kwargs(settings: Optional[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    """The project's pacing as `build_timeline_from_transcript` keywords; None
+    leaves the Timeline default."""
+    settings = settings or {}
+    return {"max_pause_seconds": settings.get("max_pause_seconds"),
+            "pause_padding_seconds": settings.get("pause_padding_seconds")}
+
+
+_GENRE_SOURCE = "genre:"
+
+
+async def apply_genre_pacing(settings: Dict[str, Any], words: List[Dict[str, Any]],
+                             model_ready: bool = False) -> Optional[str]:
+    """Give a project its genre's pacing when nobody chose one; returns the genre,
+    or None when a chosen pacing stands.
+
+    A pacing the channel sent (the Studio's `auto_edit` block) or the user set
+    always wins. Otherwise the genre decides — horror keeps its pauses, see
+    `presentation.genre.pacing_for`. The genre is the caller's when it named one
+    (`settings["genre"]`), else the model's reading of the opening minutes. Not
+    keywords alone: on a Raat3Baje horror story that never says "bhoot" they
+    voted "cooking". `model_ready` says the planner's model is already loaded;
+    without it this does not start one, and keywords are all there is.
+
+    The pacing is written onto `settings`, so every later rebuild keeps it, with
+    `pacing_source` naming the genre — values still equal to what that genre gives
+    are the genre's to re-decide on the next run; anything else is a choice.
+    """
+    from presentation.genre import detect_genre_in_text, normalise, pacing_for
+
+    source = str(settings.get("pacing_source") or "")
+    current = (settings.get("max_pause_seconds"), settings.get("pause_padding_seconds"))
+    from_genre = (source.startswith(_GENRE_SOURCE)
+                  and current == pacing_for(source[len(_GENRE_SOURCE):]))
+    if any(value is not None for value in current) and not from_genre:
+        return None
+
+    genre = settings.get("genre")
+    if not genre:
+        ask = None
+        if model_ready:
+            from llm.client import lm_studio_client
+
+            async def ask(system_prompt: str, user_prompt: str, schema=None):
+                return await lm_studio_client.ask_with_schema(system_prompt, user_prompt, schema or {})
+
+        opening = " ".join(str(w.get("word") or "") for w in words
+                           if float(w.get("start") or 0.0) < 300.0)
+        whole = " ".join(str(w.get("word") or "") for w in words)
+        genre = await detect_genre_in_text(opening, whole, ask)
+    genre = normalise(genre)
+
+    pacing = pacing_for(genre)
+    if pacing:
+        settings["max_pause_seconds"], settings["pause_padding_seconds"] = pacing
+        settings["pacing_source"] = _GENRE_SOURCE + genre
+        logger.info("Auto-edit pacing from the genre (%s): pauses up to %.2fs kept, "
+                    "%.2fs either side of a cut", genre, *pacing)
+    elif from_genre:
+        # The genre that set these no longer applies: back to the defaults.
+        for key in ("max_pause_seconds", "pause_padding_seconds", "pacing_source"):
+            settings.pop(key, None)
+    return genre
 
 
 def apply_report_to_timeline(timeline, report: Dict[str, Any]) -> None:

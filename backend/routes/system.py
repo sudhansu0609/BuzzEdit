@@ -42,9 +42,17 @@ async def system_paths_status():
 
 @router.post("/clear_vram")
 async def trigger_vram_clear():
+    """Give the card back: drop this process's Whisper and aligner weights
+    (they stay resident after a transcription) and ask an idle ComfyUI to
+    unload its models. The Studio calls this before it plans visuals on a
+    local LLM, which could not fit beside them on a 16 GB card."""
+    from runtime import gpu_handover
+
+    gpu_handover.release_in_process_models()
+    comfyui_freed = await gpu_handover.free_comfyui()
     clear_vram_cache()
     info = get_gpu_info()
-    return {"status": "cleared", "gpu": info}
+    return {"status": "cleared", "comfyui_freed": comfyui_freed, "gpu": info}
 
 
 @router.post("/test_comfyui")

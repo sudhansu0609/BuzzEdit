@@ -177,9 +177,8 @@ async def _plan_cut_and_render(p_data: dict, tl: Timeline, project_id: str, phas
     coverage audit, render. Every entry point ends up here so a fresh project
     and a re-cut get exactly the same treatment."""
     settings = p_data.get("settings") or {}
+    p_data["settings"] = settings
     aggressiveness = float(settings.get("fumble_aggressiveness", 0.5))
-    tl.max_pause_seconds = float(settings.get("max_pause_seconds", tl.max_pause_seconds))
-    tl.pause_padding_seconds = float(settings.get("pause_padding_seconds", tl.pause_padding_seconds))
 
     # The planner needs the audio, not just the transcript: the filler sounds
     # it cuts were never in the transcript, and the word timings need checking
@@ -203,9 +202,13 @@ async def _plan_cut_and_render(p_data: dict, tl: Timeline, project_id: str, phas
     } for w in tl.words]
 
     phase(0.25, "Cleaning fumbles with the LLM… (this is the slow part)")
-    plan = await plan_auto_edit(word_dicts, audio_path, aggressiveness=aggressiveness)
+    plan = await plan_auto_edit(word_dicts, audio_path, aggressiveness=aggressiveness,
+                                settings=settings)
     report = plan.report
     apply_report_to_timeline(tl, report)
+    # After planning: the planner may have given the project its genre's pacing.
+    tl.max_pause_seconds = float(settings.get("max_pause_seconds", tl.max_pause_seconds))
+    tl.pause_padding_seconds = float(settings.get("pause_padding_seconds", tl.pause_padding_seconds))
 
     phase(0.6, "Rebuilding the edit…")
     # Rebuild the word list rather than zipping onto the old one: the planner

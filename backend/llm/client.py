@@ -509,4 +509,79 @@ class LMStudioClient:
         return None
 
 
+class RemoteChatClient:
+    """An OpenAI-compatible chat endpoint reached with an API key.
+
+    BuzzcafStudio hands one over per render job (`PresentationSettings.llm_*`)
+    so the planning passes run on its claude-local-api proxy instead of LM
+    Studio. There is nothing to load or eject: `ensure_ready` is a single
+    authenticated request, and `_chat_json` has the same signature as
+    `LMStudioClient._chat_json`, so the director's `ask` closure does not care
+    which of the two it holds.
+    """
+
+    def __init__(self, base_url: str, api_key: str = "", model: str = ""):
+        self.base_url = (base_url or "").rstrip("/")
+        self.api_key = api_key or ""
+        self._model = model or "default"
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    async def ensure_ready(self, timeout: float = 8.0) -> Optional[str]:
+        """The model id to send, or None when the endpoint is down or the key
+        is refused -- the director then falls back to LM Studio."""
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(f"{self.base_url}/models", headers=self._headers())
+            if resp.status_code == 200:
+                return self._model
+            logger.warning("Remote LLM %s answered HTTP %s to /models; not using it.",
+                           self.base_url, resp.status_code)
+        except Exception as e:
+            logger.warning("Remote LLM %s unreachable (%s); not using it.", self.base_url, e)
+        return None
+
+    async def _chat_json(self, model: str, system_prompt: str,
+                         user_prompt: str,
+                         schema: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """One completion asking for JSON. No `response_format` is sent (the
+        proxy renders schemas into the prompt itself); the schema, when given,
+        is restated in the system prompt so the shape is still explicit, and a
+        code fence around the answer is peeled off before it is returned."""
+        prompt = system_prompt
+        if schema:
+            shape = schema.get("schema", schema) if isinstance(schema, dict) else schema
+            prompt += ("\n\nAnswer with ONE JSON object only -- no prose, no code fence -- "
+                       "matching this JSON schema:\n" + json.dumps(shape)[:6000])
+        body = {
+            "model": model or self._model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 4096,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=240.0) as client:
+                resp = await client.post(f"{self.base_url}/chat/completions",
+                                         headers=self._headers(), json=body)
+        except Exception as e:
+            logger.warning("Remote LLM %s request failed: %s", self.base_url, e)
+            return None
+        if resp.status_code != 200:
+            logger.warning("Remote LLM %s for model %r: %s", resp.status_code, model, resp.text[:200])
+            return None
+        content = resp.json()["choices"][0]["message"].get("content") or ""
+        return _FENCE_RE.sub("", content).strip()
+
+
 lm_studio_client = LMStudioClient()

@@ -1,0 +1,189 @@
+{
+ "source": "B:/youtubeProjects/life3Baje/ep1/eptemFullRaw.mp4",
+ "reference_cut": "B:/youtubeProjects/life3Baje/ep1/eptemp1.wav",
+ "note": "Creator's own edit of Life3Baje ep1 (2026-09-26), aligned sample-accurately to the raw. 'editorial' = whole passages dropped for pacing, not fumbles; the auto-edit is not expected to find those.",
+ "spans": [
+  {
+   "start": 0.0,
+   "end": 29.943,
+   "kind": "silence",
+   "note": ""
+  },
+  {
+   "start": 45.211,
+   "end": 64.444,
+   "kind": "editorial",
+   "note": "ऐसा क्यों? आखिर क्यों? पर क्यों?"
+  },
+  {
+   "start": 83.507,
+   "end": 111.594,
+   "kind": "editorial",
+   "note": "हैं जो सबसे important बात है, starting small यह नहीं कर पाते हैं जहाँ भी हैं, जो"
+  },
+  {
+   "start": 122.723,
+   "end": 134.603,
+   "kind": "silence",
+   "note": ""
+  },
+  {
+   "start": 150.27,
+   "end": 163.07,
+   "kind": "editorial",
+   "note": "राजित करने कभी मैं वह बुक टाइड नहीं कर पाया उसको उसको मेरे और"
+  },
+  {
+   "start": 172.04,
+   "end": 174.6,
+   "kind": "false_start",
+   "note": "में"
+  },
+  {
+   "start": 177.266,
+   "end": 181.186,
+   "kind": "false_start",
+   "note": "के फिल्ड"
+  },
+  {
+   "start": 184.632,
+   "end": 203.144,
+   "kind": "editorial",
+   "note": "बहुत ही नामिदामी बहुत ही अच्छा सा करिए इस्टैबलेश करेंगे और इस केरियर के चक्कर मे"
+  },
+  {
+   "start": 211.37,
+   "end": 217.218,
+   "kind": "retake",
+   "note": "हमें लगता है कि बहुत सारी चीजे है करने को और इतनी सारी चीजे हम करने पाएंगे या फि"
+  },
+  {
+   "start": 223.747,
+   "end": 229.827,
+   "kind": "retake",
+   "note": "हम ले दे के सब कुछ एक साथ करने की कोशिश करते हैं हैं और इसी चक्कर और"
+  },
+  {
+   "start": 239.909,
+   "end": 257.783,
+   "kind": "editorial",
+   "note": "है बहुत यही है एक बहुत बड़ा ट्रैप इसे ही कहते हैं यह है"
+  },
+  {
+   "start": 259.397,
+   "end": 266.963,
+   "kind": "retake",
+   "note": "कीजिए अगर आपको कोई पहार चरना है तो आप एक ही बार में टॉप तो"
+  },
+  {
+   "start": 271.827,
+   "end": 274.187,
+   "kind": "false_start",
+   "note": "को अगर"
+  },
+  {
+   "start": 278.854,
+   "end": 293.334,
+   "kind": "false_start",
+   "note": "एक"
+  },
+  {
+   "start": 298.53,
+   "end": 355.37,
+   "kind": "editorial",
+   "note": "जो जब मैं जिम जाता हूं तो कोई नया लड़का जो आता है वो पूछता है कि कितने दिन में ब"
+  },
+  {
+   "start": 367.561,
+   "end": 370.481,
+   "kind": "editorial",
+   "note": "बनानी है तो बस छोड़ा अगर आप"
+  },
+  {
+   "start": 383.828,
+   "end": 391.988,
+   "kind": "retake",
+   "note": "यह है यह है दिआर्ट ऑफ स्टार्टिंग स्मॉल इससे फायदा यह होता है कि हमारे मन में ज्य"
+  },
+  {
+   "start": 421.811,
+   "end": 423.291,
+   "kind": "editorial",
+   "note": "This is the art of"
+  },
+  {
+   "start": 425.002,
+   "end": 471.322,
+   "kind": "silence",
+   "note": ""
+  },
+  {
+   "start": 549.207,
+   "end": 554.047,
+   "kind": "retake",
+   "note": "लगता है. प्रसिटिली, बहुत सारे बुक्स परने के बाद मुझे ये बाता का realisation हुआ"
+  },
+  {
+   "start": 573.042,
+   "end": 584.242,
+   "kind": "false_start",
+   "note": "इसके"
+  },
+  {
+   "start": 589.215,
+   "end": 591.175,
+   "kind": "false_start",
+   "note": "जैसा आप सबको"
+  },
+  {
+   "start": 642.771,
+   "end": 648.051,
+   "kind": "false_start",
+   "note": "कैफ"
+  },
+  {
+   "start": 650.287,
+   "end": 654.287,
+   "kind": "silence",
+   "note": ""
+  },
+  {
+   "start": 667.275,
+   "end": 671.795,
+   "kind": "retake",
+   "note": "और मैं चाहता हूं कि यह पैशन लोगों के साथ शेयर करूं ने एक अच्छा कॉफी देखे जाओ"
+  },
+  {
+   "start": 681.633,
+   "end": 684.353,
+   "kind": "silence",
+   "note": ""
+  },
+  {
+   "start": 692.594,
+   "end": 694.107,
+   "kind": "silence",
+   "note": ""
+  },
+  {
+   "start": 753.826,
+   "end": 777.347,
+   "kind": "editorial",
+   "note": "यह है मेरी में तो यह है मेरी शुरुआत मेरी जर्नी एक मैसेज जर्नी तो यह है मेरी शुरु"
+  },
+  {
+   "start": 797.045,
+   "end": 799.731,
+   "kind": "editorial",
+   "note": "और उस small step के"
+  },
+  {
+   "start": 818.264,
+   "end": 830.84,
+   "kind": "silence",
+   "note": "tail after last kept"
+  }
+ ],
+ "language": "hi",
+ "genre": "vlog"
+}

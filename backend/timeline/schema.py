@@ -297,6 +297,26 @@ class AudioMaster(BaseModel):
     voice_denoise: float = 0.0     # 0..1, FFT noise reduction on the voice
     voice_deess: float = 0.0       # 0..1, de-esser strength
     voice_compress: float = 0.0    # 0..1, gentle broadcast compression
+    voice_gain_db: float = 0.0     # -24..24, a flat trim applied before anything else
+    # Which denoiser engine build_voice_chain should reach for: "auto" tries a
+    # speech-trained one first (DeepFilterNet, then FFmpeg's rnnoise) and falls
+    # back to a gentle afftdn; see render/audio.py:resolve_voice_enhance.
+    voice_enhance: str = "auto"
+    # The named EQ/character curve from render/audio.EQ_PRESETS ("studio_mic",
+    # "broadcast", ...). Empty means no EQ stage — just the plain denoise/deess/
+    # compress chain, which is what an old (pre-EQ) master still compiles to.
+    voice_eq_preset: str = ""
+    # 0..1 harmonic saturation (aexciter), 0 = off. Only a few presets use it
+    # (rap_vocal wants some grit on top of the compression).
+    voice_saturation: float = 0.0
+    # A named reverb character ("dark_room", "hall") applied to the WHOLE voice
+    # for presets that want an ambience (horror_intimate); "" = none. Distinct
+    # from `voice_fx`, which windows a reverb onto one line rather than all of it.
+    voice_reverb: str = ""
+    # Line-level effects: [{"start_s", "end_s", "effect"}], each one applied only
+    # inside its own window (ffmpeg `enable='between(t,a,b)'`) so a "phone call"
+    # cutaway or a hard echo lands on the one line it was written for.
+    voice_fx: List[Dict[str, Any]] = Field(default_factory=list)
     # Integrated loudness target for the final mix, or None to leave levels alone.
     loudness_lufs: Optional[float] = None
     true_peak_db: float = -1.5
@@ -304,7 +324,10 @@ class AudioMaster(BaseModel):
 
     def is_identity(self) -> bool:
         return (self.voice_denoise <= 0.0 and self.voice_deess <= 0.0
-                and self.voice_compress <= 0.0 and self.loudness_lufs is None)
+                and self.voice_compress <= 0.0 and self.loudness_lufs is None
+                and not self.voice_eq_preset and self.voice_saturation <= 0.0
+                and not self.voice_reverb and not self.voice_fx
+                and self.voice_gain_db == 0.0)
 
 
 class AtmosphereEffect(BaseModel):
@@ -317,6 +340,12 @@ class AtmosphereEffect(BaseModel):
     # Who put it here. The presentation pass tags its own layer ("presentation")
     # so a re-run replaces exactly that one and leaves the user's effects alone.
     origin: Optional[str] = None
+    # A free-form payload for effects that need more than intensity/speed/colour
+    # (the presentation text-fx pass: the word to draw, its start/end seconds
+    # local to this effect, a matte file + offset, a face box to dodge, …).
+    # Kept generic rather than a dozen more optional fields because only a
+    # handful of effect types ever read it.
+    extra: Dict[str, Any] = Field(default_factory=dict)
 
 
 class TextClip(BaseModel):
@@ -387,6 +416,10 @@ class TimelineItem(BaseModel):
     audio_fade_out: float = 0.0
     duck: float = 0.0
     label: Optional[str] = None
+    # Clips sharing a link_id are halves of one piece of media — the picture on
+    # a V track and its sound on an A track. Move, trim, split and delete act on
+    # the whole set so the two can never drift out of sync; unlinking clears it.
+    link_id: Optional[str] = None
 
     @property
     def duration_frames(self) -> int:
@@ -426,6 +459,11 @@ class Timeline(BaseModel):
     # tightened edit still breathes; shorter pauses are left exactly as recorded.
     max_pause_seconds: float = 0.40
     pause_padding_seconds: float = 0.12
+    # The recording arrived already cut (the user edited it before import, e.g.
+    # through BuzzcafStudio's produce_video). The rebuild then lays the whole
+    # source down as one V1/A1 clip: no pause trimming, no fumble removal, and
+    # no word toggle can reopen a cut the user already made by hand.
+    keep_full_source: bool = False
     # A removal shorter than this is not worth the jump cut it would cost, so the
     # material is kept and the segments stay joined. Must never sit above the
     # filler admission floor, or a detected filler plays despite being marked cut.
@@ -443,6 +481,11 @@ class Timeline(BaseModel):
     # speech still hides two seconds of silence *inside* it, which no gap-based
     # rule can see. The rebuild intersects kept words with these regions.
     speech_regions: List[List[int]] = Field(default_factory=list)
+    # Manual cuts on the AI-managed V1/A1 tracks: SOURCE-frame [start,end) spans
+    # of the primary source removed by hand, on top of whatever the word list
+    # already implies. Reapplied by rebuild_primary_tracks after every
+    # word-toggle rebuild so a hand cut survives a transcript edit.
+    manual_cuts: List[List[int]] = Field(default_factory=list)
     # Per-track switches, keyed by track name ("V2", "A1", "T1"). Absent means
     # every switch is off.
     tracks: Dict[str, TrackState] = Field(default_factory=dict)

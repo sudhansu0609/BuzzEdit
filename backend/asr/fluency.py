@@ -29,6 +29,7 @@ blemish, a deleted sentence is a defect.
 """
 
 import difflib
+import asyncio
 import logging
 import re
 import unicodedata
@@ -36,6 +37,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("fluency")
+
+# Fluency windows asked at once (LM Studio serves 4 parallel slots by default).
+FLUENCY_CONCURRENCY = 4
 
 _PUNCT_RE = re.compile(r"[^\w]", re.UNICODE)
 
@@ -699,7 +703,28 @@ async def plan_fluent_cuts(
                     none_answers=0, oversized_runs=0, orphan_runs=0)
     found_reasons = reasons if reasons is not None else {}
 
-    for start, end, core_start, core_end in windows(len(words)):
+    all_windows = list(windows(len(words)))
+    # Every window's first JSON answer is asked for up front, a few at a time:
+    # windows are independent, and asked one after another the pass took ~6
+    # minutes of a real 13:50 take. Retries and the prose fallback below stay
+    # sequential -- they are rare.
+    first_answers: List[Optional[str]] = [None] * len(all_windows)
+    if use_spans and ask_json is not None and all_windows:
+        gate = asyncio.Semaphore(FLUENCY_CONCURRENCY)
+
+        async def first(window_words) -> Optional[str]:
+            async with gate:
+                try:
+                    return await ask_json(JSON_SPAN_SYSTEM_PROMPT,
+                                          span_user_prompt(number_tokens(window_words)), SPAN_SCHEMA)
+                except Exception as e:
+                    logger.warning("Fluency: JSON request failed (%s)", e)
+                    return None
+
+        first_answers = list(await asyncio.gather(
+            *(first(words[s:e]) for s, e, _cs, _ce in all_windows)))
+
+    for window_number, (start, end, core_start, core_end) in enumerate(all_windows):
         window = words[start:end]
         plan = None
         window_reasons: Dict[int, str] = {}
@@ -708,7 +733,7 @@ async def plan_fluent_cuts(
         if use_spans and ask_json is not None:
             from .spans import parse_json_spans
             prompt = span_user_prompt(number_tokens(window))
-            answer = await ask_json(JSON_SPAN_SYSTEM_PROMPT, prompt, SPAN_SCHEMA)
+            answer = first_answers[window_number]
             if not answer:
                 logger.warning("Fluency: no JSON answer for words %d-%d; retrying once",
                                start, end)

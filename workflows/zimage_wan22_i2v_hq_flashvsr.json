@@ -1,0 +1,395 @@
+{
+  "z_unet": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "z_image_turbo_bf16.safetensors",
+      "weight_dtype": "fp8_e4m3fn"
+    }
+  },
+  "z_clip": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen_3_4b.safetensors",
+      "type": "lumina2",
+      "device": "default"
+    }
+  },
+  "z_vae": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    }
+  },
+  "z_shift": {
+    "class_type": "ModelSamplingAuraFlow",
+    "inputs": {
+      "model": [
+        "z_unet",
+        0
+      ],
+      "shift": 3
+    }
+  },
+  "z_pos": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "z_clip",
+        0
+      ],
+      "text": "a cinematic photograph"
+    }
+  },
+  "z_neg": {
+    "class_type": "ConditioningZeroOut",
+    "inputs": {
+      "conditioning": [
+        "z_pos",
+        0
+      ]
+    }
+  },
+  "z_latent": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "width": 1024,
+      "height": 576,
+      "batch_size": 1
+    }
+  },
+  "z_sample": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "z_shift",
+        0
+      ],
+      "positive": [
+        "z_pos",
+        0
+      ],
+      "negative": [
+        "z_neg",
+        0
+      ],
+      "latent_image": [
+        "z_latent",
+        0
+      ],
+      "seed": 42,
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "res_multistep",
+      "scheduler": "simple",
+      "denoise": 1
+    }
+  },
+  "z_decode": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "z_sample2",
+        0
+      ],
+      "vae": [
+        "z_vae",
+        0
+      ]
+    }
+  },
+  "w_clip": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    }
+  },
+  "w_vae": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "wan_2.1_vae.safetensors"
+    }
+  },
+  "w_unet_high": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": {
+      "unet_name": "wan2.2_i2v_high_noise_14B_Q5_K_M.gguf"
+    }
+  },
+  "w_lora_high": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": [
+        "w_unet_high",
+        0
+      ],
+      "lora_name": "wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors",
+      "strength_model": 1.0
+    }
+  },
+  "w_shift_high": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": {
+      "model": [
+        "w_lora_high",
+        0
+      ],
+      "shift": 5.0
+    }
+  },
+  "w_unet_low": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": {
+      "unet_name": "wan2.2_i2v_low_noise_14B_Q5_K_M.gguf"
+    }
+  },
+  "w_lora_low": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": [
+        "w_unet_low",
+        0
+      ],
+      "lora_name": "wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors",
+      "strength_model": 1.0
+    }
+  },
+  "w_shift_low": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": {
+      "model": [
+        "w_lora_low",
+        0
+      ],
+      "shift": 5.0
+    }
+  },
+  "w_pos": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "w_clip",
+        0
+      ],
+      "text": "gentle cinematic camera movement"
+    }
+  },
+  "w_neg": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "w_clip",
+        0
+      ],
+      "text": "\u8272\u8c03\u8273\u4e3d\uff0c\u8fc7\u66dd\uff0c\u9759\u6001\uff0c\u7ec6\u8282\u6a21\u7cca\u4e0d\u6e05\uff0c\u5b57\u5e55\uff0c\u98ce\u683c\uff0c\u4f5c\u54c1\uff0c\u753b\u4f5c\uff0c\u753b\u9762\uff0c\u9759\u6b62\uff0c\u6574\u4f53\u53d1\u7070\uff0c\u6700\u5dee\u8d28\u91cf\uff0c\u4f4e\u8d28\u91cf\uff0cJPEG\u538b\u7f29\u6b8b\u7559\uff0c\u4e11\u964b\u7684\uff0c\u6b8b\u7f3a\u7684\uff0c\u591a\u4f59\u7684\u624b\u6307\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u624b\u90e8\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u8138\u90e8\uff0c\u7578\u5f62\u7684\uff0c\u6bc1\u5bb9\u7684\uff0c\u5f62\u6001\u7578\u5f62\u7684\u80a2\u4f53\uff0c\u624b\u6307\u878d\u5408\uff0c\u9759\u6b62\u4e0d\u52a8\u7684\u753b\u9762\uff0c\u6742\u4e71\u7684\u80cc\u666f\uff0c\u4e09\u6761\u817f\uff0c\u80cc\u666f\u4eba\u5f88\u591a\uff0c\u5012\u7740\u8d70, watermark, text, logo"
+    }
+  },
+  "w_i2v": {
+    "class_type": "WanImageToVideo",
+    "inputs": {
+      "positive": [
+        "w_pos",
+        0
+      ],
+      "negative": [
+        "w_neg",
+        0
+      ],
+      "vae": [
+        "w_vae",
+        0
+      ],
+      "width": 1024,
+      "height": 576,
+      "length": 81,
+      "batch_size": 1,
+      "start_image": [
+        "z_decode",
+        0
+      ]
+    }
+  },
+  "w_sample_high": {
+    "class_type": "KSamplerAdvanced",
+    "inputs": {
+      "model": [
+        "w_shift_high",
+        0
+      ],
+      "add_noise": "enable",
+      "noise_seed": 42,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "positive": [
+        "w_i2v",
+        0
+      ],
+      "negative": [
+        "w_i2v",
+        1
+      ],
+      "latent_image": [
+        "w_i2v",
+        2
+      ],
+      "start_at_step": 0,
+      "end_at_step": 2,
+      "return_with_leftover_noise": "enable"
+    }
+  },
+  "w_sample_low": {
+    "class_type": "KSamplerAdvanced",
+    "inputs": {
+      "model": [
+        "w_shift_low",
+        0
+      ],
+      "add_noise": "disable",
+      "noise_seed": 42,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "positive": [
+        "w_i2v",
+        0
+      ],
+      "negative": [
+        "w_i2v",
+        1
+      ],
+      "latent_image": [
+        "w_sample_high",
+        0
+      ],
+      "start_at_step": 2,
+      "end_at_step": 4,
+      "return_with_leftover_noise": "disable"
+    }
+  },
+  "w_decode": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "w_sample_low",
+        0
+      ],
+      "vae": [
+        "w_vae",
+        0
+      ]
+    }
+  },
+  "v_create": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": [
+        "r_run",
+        0
+      ],
+      "fps": 32.0
+    }
+  },
+  "v_save": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": [
+        "v_create",
+        0
+      ],
+      "filename_prefix": "buzzedit_broll_hq_vsr",
+      "format": "mp4",
+      "codec": "h264"
+    }
+  },
+  "z_up": {
+    "class_type": "LatentUpscaleBy",
+    "inputs": {
+      "samples": [
+        "z_sample",
+        0
+      ],
+      "upscale_method": "bislerp",
+      "scale_by": 1.5
+    }
+  },
+  "z_sample2": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "z_shift",
+        0
+      ],
+      "positive": [
+        "z_pos",
+        0
+      ],
+      "negative": [
+        "z_neg",
+        0
+      ],
+      "latent_image": [
+        "z_up",
+        0
+      ],
+      "seed": 42,
+      "steps": 4,
+      "cfg": 1,
+      "sampler_name": "res_multistep",
+      "scheduler": "simple",
+      "denoise": 0.4
+    }
+  },
+  "u_vsr": {
+    "class_type": "FlashVSRNode",
+    "inputs": {
+      "frames": [
+        "w_decode",
+        0
+      ],
+      "model": "FlashVSR-v1.1",
+      "mode": "tiny",
+      "scale": 2,
+      "tiled_vae": true,
+      "tiled_dit": true,
+      "unload_dit": true,
+      "seed": 42
+    }
+  },
+  "u_scale": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": [
+        "u_vsr",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "width": 1920,
+      "height": 1080,
+      "crop": "center"
+    }
+  },
+  "r_model": {
+    "class_type": "FrameInterpolationModelLoader",
+    "inputs": {
+      "model_name": "rife_v4.26.safetensors"
+    }
+  },
+  "r_run": {
+    "class_type": "FrameInterpolate",
+    "inputs": {
+      "interp_model": [
+        "r_model",
+        0
+      ],
+      "images": [
+        "u_scale",
+        0
+      ],
+      "multiplier": 2
+    }
+  }
+}

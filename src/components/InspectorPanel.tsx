@@ -8,6 +8,7 @@ import {
   useElectron, MEDIA_FILTERS, AtmosphereEffect,
   ClipChroma, ClipColor, ClipTransform, ColorWheel, FontFamily, PresetCatalogue,
   StyleProfile, StyleApplyParts, TextStyle,
+  getAudioMaster, updateAudioMaster, setClipFlags, AudioMaster,
 } from '../hooks/api';
 import {
   ColorField, PresetChips, Row, Section, Slider, toHex,
@@ -43,6 +44,33 @@ const KEY_PRESETS: { id: string; label: string; color: string }[] = [
   { id: 'green', label: 'Green screen', color: '#00ff00' },
   { id: 'blue', label: 'Blue screen', color: '#0000ff' },
 ];
+
+const AUDIO_MASTER_DEFAULTS: AudioMaster = {
+  voice_gain_db: 0, voice_enhance: 'auto', voice_denoise: 0, voice_deess: 0, voice_compress: 0,
+  voice_eq_preset: '', voice_saturation: 0, voice_reverb: '', loudness_lufs: null, true_peak_db: -1.5,
+} as AudioMaster;
+
+/** One-click voice chains, in the language a producer would ask for. */
+const MASTER_PRESETS: Record<string, Record<string, any>> = {
+  clean: { voice_enhance: 'auto', voice_denoise: 0.4, voice_eq_preset: 'clean' },
+  podcast: { voice_eq_preset: 'podcast', voice_compress: 0.5, loudness_lufs: -16 },
+  rap_vocal: { voice_eq_preset: 'rap_vocal', voice_compress: 0.8, voice_saturation: 0.3, loudness_lufs: -14 },
+  broadcast: { voice_eq_preset: 'broadcast', voice_compress: 0.6, loudness_lufs: -14 },
+  reset: {
+    voice_gain_db: 0, voice_enhance: 'auto', voice_denoise: 0, voice_deess: 0, voice_compress: 0,
+    voice_eq_preset: '', voice_saturation: 0, voice_reverb: '', loudness_lufs: null,
+  },
+};
+
+/** dB <-> linear gain, clamped to what the compiler's volume filter accepts. */
+const dbFromVolume = (volume: number) => 20 * Math.log10(Math.max(0.0001, volume ?? 1));
+const volumeFromDb = (db: number) => Math.max(0, Math.min(4, Math.pow(10, db / 20)));
+
+/** 0 reads as "auto" on the knockout size slider; anything real is at least 40px. */
+const clampFontSize = (v: number): number => {
+  const r = Math.round(v);
+  return r <= 20 ? 0 : Math.max(40, r);
+};
 
 // -- small controls ---------------------------------------------------------
 
@@ -199,12 +227,38 @@ export default function InspectorPanel() {
   const [draftChroma, setDraftChroma] = useState<ClipChroma | null>(null);
   const [draftStyle, setDraftStyle] = useState<TextStyle | null>(null);
   const [draftContent, setDraftContent] = useState<string | null>(null);
+  const [draftClipAudio, setDraftClipAudio] = useState<Record<string, any> | null>(null);
   const timer = useRef<any>(null);
 
   useEffect(() => {
     setDraftTransform(null); setDraftColor(null); setDraftChroma(null);
-    setDraftStyle(null); setDraftContent(null);
+    setDraftStyle(null); setDraftContent(null); setDraftClipAudio(null);
   }, [selectedClipId]);
+
+  // Whole-programme voice chain: loaded lazily so a project with nothing
+  // selected never pays for it, and reloaded whenever the Audio section is
+  // opened or the project underneath it changes.
+  const [audioSectionOpen, setAudioSectionOpen] = useState(false);
+  const [masterData, setMasterData] = useState<AudioMaster | null>(null);
+  const [audioCatalogue, setAudioCatalogue] = useState<{ eq_presets: string[]; reverbs: string[]; enhance_modes: string[] }>(
+    { eq_presets: [], reverbs: [], enhance_modes: [] },
+  );
+  const [draftMaster, setDraftMaster] = useState<Record<string, any> | null>(null);
+
+  const loadAudioMaster = useCallback(() => {
+    if (!projectId) return;
+    getAudioMaster(projectId).then((res) => {
+      setMasterData(res.audio_master);
+      setAudioCatalogue({
+        eq_presets: res.eq_presets || [], reverbs: res.reverbs || [], enhance_modes: res.enhance_modes || [],
+      });
+      setDraftMaster(null);
+    }).catch(() => {});
+  }, [projectId]);
+
+  useEffect(() => {
+    if (audioSectionOpen) loadAudioMaster();
+  }, [audioSectionOpen, loadAudioMaster]);
 
   const storedTransform: ClipTransform = {
     ...DEFAULT_TRANSFORM,
@@ -258,6 +312,59 @@ export default function InspectorPanel() {
     setDraftStyle({ ...style, ...updates });
     schedule(() => updateTextClip(projectId, selectedClipId, { style: updates }));
   }, [projectId, selectedClipId, style, schedule]);
+
+  // A1 is the transcript-built voice track and V1 the programme picture; both
+  // get rebuilt from the transcript, which is why A1's own gain/fades are not
+  // trustworthy to keep locally and route to the whole-programme chain instead.
+  const itemTrack = (item?.track || '').toString();
+  const isATrack = !!item && !isText && !isAdjustment && /^A/i.test(itemTrack);
+  const isV1Clip = !!item && !isText && !isAdjustment && itemTrack.toUpperCase() === 'V1';
+  // V1's sound IS the A1 voice, so a V1 clip gets the same programme-level controls.
+  const isA1Clip = (isATrack && itemTrack.toUpperCase() === 'A1') || isV1Clip;
+  const showAudioSection = isATrack || isV1Clip;
+
+  const storedClipAudio = {
+    volume: item?.volume ?? 1, mute: !!item?.mute, loop: !!item?.loop,
+    audio_fade_in: item?.audio_fade_in ?? 0, audio_fade_out: item?.audio_fade_out ?? 0, duck: item?.duck ?? 0,
+  };
+  const clipAudio = { ...storedClipAudio, ...(draftClipAudio || {}) };
+
+  // `schedule` keeps only the last call, so pending patches are accumulated
+  // here and sent together — otherwise two quick edits would drop the first.
+  const pendingClipAudio = useRef<Record<string, any>>({});
+  const pendingMaster = useRef<Record<string, any>>({});
+  useEffect(() => { pendingClipAudio.current = {}; }, [selectedClipId]);
+
+  const patchClipAudio = useCallback((updates: Record<string, any>) => {
+    if (!projectId || !selectedClipId) return;
+    setDraftClipAudio((d) => ({ ...(d || {}), ...updates }));
+    pendingClipAudio.current = { ...pendingClipAudio.current, ...updates };
+    schedule(() => {
+      const batch = pendingClipAudio.current;
+      pendingClipAudio.current = {};
+      return setClipFlags(projectId, selectedClipId, batch as any);
+    });
+  }, [projectId, selectedClipId, schedule]);
+
+  const master: AudioMaster = { ...AUDIO_MASTER_DEFAULTS, ...(masterData || {}), ...(draftMaster || {}) };
+
+  const patchMaster = useCallback((updates: Record<string, any>) => {
+    if (!projectId) return;
+    setDraftMaster((d) => ({ ...(d || {}), ...updates }));
+    pendingMaster.current = { ...pendingMaster.current, ...updates };
+    schedule(() => {
+      const batch = pendingMaster.current;
+      pendingMaster.current = {};
+      return updateAudioMaster(projectId, batch);
+    });
+  }, [projectId, schedule]);
+
+  const applyMasterPreset = useCallback((id: string) => {
+    const updates = MASTER_PRESETS[id];
+    if (!updates || !projectId) return;
+    setDraftMaster((d) => ({ ...(d || {}), ...updates }));
+    run(() => updateAudioMaster(projectId, updates));
+  }, [projectId, run]);
 
   const applyColorPreset = useCallback((id: string) => {
     if (!projectId) return;
@@ -697,6 +804,97 @@ export default function InspectorPanel() {
         </Section>
       )}
 
+      {showAudioSection && (
+        <Section title="Audio (this clip)" defaultOpen={false}
+          onToggle={(open) => setAudioSectionOpen(open)}>
+          <Slider label="Gain"
+            value={isA1Clip ? master.voice_gain_db : dbFromVolume(clipAudio.volume)}
+            min={-24} max={isA1Clip ? 24 : 12} step={0.5}
+            onChange={(v) => (isA1Clip
+              ? patchMaster({ voice_gain_db: v })
+              : patchClipAudio({ volume: volumeFromDb(v) }))}
+            format={(v) => `${v > 0 ? '+' : ''}${v.toFixed(1)} dB`} />
+          {!isA1Clip && (
+            <>
+              <Slider label="Fade in" value={clipAudio.audio_fade_in} min={0} max={5} step={0.05}
+                onChange={(v) => patchClipAudio({ audio_fade_in: v })} format={(v) => `${v.toFixed(2)}s`} />
+              <Slider label="Fade out" value={clipAudio.audio_fade_out} min={0} max={5} step={0.05}
+                onChange={(v) => patchClipAudio({ audio_fade_out: v })} format={(v) => `${v.toFixed(2)}s`} />
+              <Slider label="Duck under voice" value={clipAudio.duck} min={0} max={1} step={0.02}
+                onChange={(v) => patchClipAudio({ duck: v })} format={(v) => `${Math.round(v * 100)}%`}
+                hint="How hard the A1 voice pushes this down while somebody is speaking." />
+              <Row label="Loop">
+                <input type="checkbox" checked={clipAudio.loop}
+                  onChange={(e) => patchClipAudio({ loop: e.target.checked })} />
+              </Row>
+            </>
+          )}
+          <Row label="Mute">
+            <input type="checkbox" checked={clipAudio.mute}
+              onChange={(e) => patchClipAudio({ mute: e.target.checked })} />
+          </Row>
+          {isA1Clip && (
+            <div className="text-xs text-muted" style={{ marginBottom: 6 }}>
+              This track is rebuilt from the transcript, so its own gain and fades don't
+              stick — Gain above edits the whole programme's voice chain instead.
+            </div>
+          )}
+
+          <div className="insp-group-title">Voice processing (whole programme)</div>
+          <PresetChips
+            items={[
+              { id: 'clean', label: 'Clean' },
+              { id: 'podcast', label: 'Podcast' },
+              { id: 'rap_vocal', label: 'Rap vocals' },
+              { id: 'broadcast', label: 'Broadcast' },
+              { id: 'reset', label: 'Reset' },
+            ]}
+            onPick={applyMasterPreset}
+          />
+          <Row label="Clean / Enhance">
+            <select value={master.voice_enhance}
+              onChange={(e) => patchMaster({ voice_enhance: e.target.value })}>
+              {audioCatalogue.enhance_modes.length === 0 && <option>{master.voice_enhance}</option>}
+              {audioCatalogue.enhance_modes.map((m) => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </Row>
+          <Slider label="Noise reduction" value={master.voice_denoise} min={0} max={1}
+            onChange={(v) => patchMaster({ voice_denoise: v })} format={(v) => `${Math.round(v * 100)}%`} />
+          <Slider label="De-ess" value={master.voice_deess} min={0} max={1}
+            onChange={(v) => patchMaster({ voice_deess: v })} format={(v) => `${Math.round(v * 100)}%`} />
+          <Slider label="Compressor" value={master.voice_compress} min={0} max={1}
+            onChange={(v) => patchMaster({ voice_compress: v })} format={(v) => `${Math.round(v * 100)}%`} />
+          <Row label="EQ preset">
+            <select value={master.voice_eq_preset}
+              onChange={(e) => patchMaster({ voice_eq_preset: e.target.value })}>
+              <option value="">None</option>
+              {audioCatalogue.eq_presets.map((p) => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </Row>
+          <Slider label="Saturation" value={master.voice_saturation} min={0} max={1}
+            onChange={(v) => patchMaster({ voice_saturation: v })} format={(v) => `${Math.round(v * 100)}%`} />
+          <Row label="Reverb">
+            <select value={master.voice_reverb}
+              onChange={(e) => patchMaster({ voice_reverb: e.target.value })}>
+              <option value="">None</option>
+              {audioCatalogue.reverbs.map((r) => <option key={r} value={r}>{r}</option>)}
+            </select>
+          </Row>
+          <Row label="Normalise">
+            <input type="checkbox" checked={master.loudness_lufs != null}
+              onChange={(e) => patchMaster({ loudness_lufs: e.target.checked ? (master.loudness_lufs ?? -14) : null })} />
+          </Row>
+          {master.loudness_lufs != null && (
+            <>
+              <Slider label="LUFS target" value={master.loudness_lufs} min={-24} max={-9} step={0.5}
+                onChange={(v) => patchMaster({ loudness_lufs: v })} format={(v) => `${v.toFixed(1)} LUFS`} />
+              <Slider label="True peak" value={master.true_peak_db} min={-3} max={-0.1} step={0.1}
+                onChange={(v) => patchMaster({ true_peak_db: v })} format={(v) => `${v.toFixed(1)} dBTP`} />
+            </>
+          )}
+        </Section>
+      )}
+
       <Section title={item && !isText && !isAdjustment ? 'Transition into this clip' : 'Transitions'}
         defaultOpen={false}>
         <div className="text-xs text-muted" style={{ marginBottom: 6 }}>
@@ -741,6 +939,9 @@ export default function InspectorPanel() {
             ? `Generated over every layer below ${item.track}, for as long as this clip runs.`
             : 'Generated over the finished picture — no stock footage needed.'}
         </div>
+        <div className="text-xs text-muted" style={{ marginBottom: 6 }}>
+          Only visible in FX preview mode and in the final render.
+        </div>
         {presets && (
           <PresetChips items={presets.effect} onPick={(id) =>
             projectId && run(() => addEffect(projectId, id, {}, effectOwner))} />
@@ -748,35 +949,79 @@ export default function InspectorPanel() {
 
         {effects.length === 0 ? (
           <div className="text-xs text-muted">No effects yet — pick one above.</div>
-        ) : effects.map((effect, index) => (
-          <div key={index} className="insp-effect">
-            <div className="insp-effect-head">
-              <span className="insp-effect-name">{effect.type.replace('_', ' ')}</span>
-              <label className="text-xs text-muted" style={{ display: 'flex', gap: 4 }}>
-                <input type="checkbox" checked={effect.enabled}
-                  onChange={(e) => projectId && run(() =>
-                    updateEffect(projectId, index, { enabled: e.target.checked }, effectOwner))} />
-                on
-              </label>
-              <button className="btn btn-xs btn-danger" title="Remove"
-                onClick={() => projectId && run(() => removeEffect(projectId, index, effectOwner))}>✕</button>
+        ) : effects.map((effect, index) => {
+          const extra: Record<string, any> = (effect as any).extra || {};
+          const hasText = typeof extra.text === 'string';
+          const isKnockout = effect.type === 'knockout';
+          const hasEditableColor = effect.type === 'behind_head' || effect.type === 'annotation'
+            || effect.type === 'newspaper_sweep';
+          const defaultColor = effect.type === 'behind_head' ? '#ffffff'
+            : effect.type === 'annotation' ? '#ff3b30' : '#ffe23a';
+          return (
+            <div key={index} className="insp-effect">
+              <div className="insp-effect-head">
+                <span className="insp-effect-name">
+                  {isKnockout ? 'Knockout text — the video fills the letters' : effect.type.replace(/_/g, ' ')}
+                </span>
+                <label className="text-xs text-muted" style={{ display: 'flex', gap: 4 }}>
+                  <input type="checkbox" checked={effect.enabled}
+                    onChange={(e) => projectId && run(() =>
+                      updateEffect(projectId, index, { enabled: e.target.checked }, effectOwner))} />
+                  on
+                </label>
+                <button className="btn btn-xs btn-danger" title="Remove"
+                  onClick={() => projectId && run(() => removeEffect(projectId, index, effectOwner))}>✕</button>
+              </div>
+              <Slider label="Amount" value={effect.intensity} min={0} max={1}
+                onChange={(v) => projectId && schedule(() =>
+                  updateEffect(projectId, index, { intensity: v }, effectOwner))}
+                format={(v) => `${Math.round(v * 100)}%`} />
+              <Slider label="Speed" value={effect.speed} min={0.2} max={3}
+                onChange={(v) => projectId && schedule(() =>
+                  updateEffect(projectId, index, { speed: v }, effectOwner))}
+                format={(v) => `${v.toFixed(1)}×`} />
+              {(effect.type === 'sunlight' || effect.type === 'light_leak') && (
+                <ColorField label="Tint" value={toHex(effect.color || '#ffcc88')}
+                  allowAlpha={false}
+                  onChange={(v) => projectId && schedule(() => updateEffect(
+                    projectId, index, { color: `0x${v.replace('#', '').toUpperCase()}FF` }, effectOwner))} />
+              )}
+              {hasText && (
+                <Row label="Text">
+                  <input type="text" key={`text-${index}`} defaultValue={extra.text}
+                    onBlur={(e) => {
+                      const v = e.target.value;
+                      if (v !== extra.text && projectId) run(() =>
+                        updateEffect(projectId, index, { extra: { text: v } }, effectOwner));
+                    }}
+                    onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }} />
+                </Row>
+              )}
+              {isKnockout && (
+                <>
+                  <ColorField label="Plate colour" value={toHex(extra.plate_color || '#000000')}
+                    allowAlpha={false}
+                    onChange={(v) => projectId && schedule(() =>
+                      updateEffect(projectId, index, { extra: { plate_color: v } }, effectOwner))} />
+                  <Slider label="Text size" value={extra.font_size ?? 0} min={0} max={600} step={1}
+                    onChange={(v) => {
+                      if (!projectId) return;
+                      const clamped = clampFontSize(v);
+                      schedule(() => updateEffect(
+                        projectId, index, { extra: { font_size: clamped === 0 ? null : clamped } }, effectOwner));
+                    }}
+                    format={(v) => (v <= 20 ? 'auto' : `${Math.round(v)}px`)} />
+                </>
+              )}
+              {hasEditableColor && (
+                <ColorField label="Colour" value={toHex(extra.color || defaultColor)}
+                  allowAlpha={false}
+                  onChange={(v) => projectId && schedule(() =>
+                    updateEffect(projectId, index, { extra: { color: v } }, effectOwner))} />
+              )}
             </div>
-            <Slider label="Amount" value={effect.intensity} min={0} max={1}
-              onChange={(v) => projectId && schedule(() =>
-                updateEffect(projectId, index, { intensity: v }, effectOwner))}
-              format={(v) => `${Math.round(v * 100)}%`} />
-            <Slider label="Speed" value={effect.speed} min={0.2} max={3}
-              onChange={(v) => projectId && schedule(() =>
-                updateEffect(projectId, index, { speed: v }, effectOwner))}
-              format={(v) => `${v.toFixed(1)}×`} />
-            {(effect.type === 'sunlight' || effect.type === 'light_leak') && (
-              <ColorField label="Tint" value={toHex(effect.color || '#ffcc88')}
-                allowAlpha={false}
-                onChange={(v) => projectId && schedule(() => updateEffect(
-                  projectId, index, { color: `0x${v.replace('#', '').toUpperCase()}FF` }, effectOwner))} />
-            )}
-          </div>
-        ))}
+          );
+        })}
       </Section>
 
       <Section title="Cinematic framing" defaultOpen={false}>

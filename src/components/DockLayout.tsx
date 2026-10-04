@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  useLayoutStore, DockZone, PanelId, PanelPlacement, PANEL_TABS, PANEL_TITLES, ZoneSizes,
+  useLayoutStore, DockZone, FloatRect, PanelId, PanelPlacement, PANEL_TABS, PANEL_TITLES, ZoneSizes,
 } from '../hooks/layout';
 
 /**
@@ -133,7 +133,7 @@ function ZonePanel({ zone, ids, content }: ZonePanelProps) {
     <section className="dock-panel">
       <header className={`dock-panel-bar ${locked ? 'locked' : ''} ${tabbed ? 'tabbed' : ''}`}>
         {tabbed ? (
-          <div className="dock-tabs">
+          <div className="dock-tabs" onWheel={scrollTabs}>
             {ids.map((id) => (
               <DockTab key={id} id={id} zone={zone}
                 active={id === activeId} onSelect={() => setActive(zone, id)} />
@@ -147,6 +147,17 @@ function ZonePanel({ zone, ids, content }: ZonePanelProps) {
       <div className="dock-panel-body">{content[activeId]}</div>
     </section>
   );
+}
+
+/**
+ * The tab strip scrolls sideways with its scrollbar hidden, so in a narrow
+ * zone the last tabs sat past the right edge where a plain mouse wheel could
+ * not reach them. Map the vertical wheel onto the strip.
+ */
+function scrollTabs(e: React.WheelEvent<HTMLDivElement>) {
+  const strip = e.currentTarget;
+  if (strip.scrollWidth <= strip.clientWidth) return;
+  strip.scrollLeft += e.deltaY || e.deltaX;
 }
 
 function SoloTitle({ id }: { id: PanelId }) {
@@ -169,8 +180,14 @@ function DockTab({ id, active, onSelect }: {
 }) {
   const { locked } = useLayoutStore();
   const beginDrag = useDockDrag(id);
+  const ref = useRef<HTMLButtonElement>(null);
+  // Keep the active tab in view when the strip is scrolled or squeezed.
+  useEffect(() => {
+    if (active) ref.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [active]);
   return (
     <button
+      ref={ref}
       className={`dock-tab ${active ? 'active' : ''}`}
       onClick={onSelect}
       onPointerDown={beginDrag}
@@ -182,9 +199,15 @@ function DockTab({ id, active, onSelect }: {
 }
 
 /** A floating panel: drag by the title bar, resize from the bottom-right corner. */
-function FloatingPanel({ id, children }: { id: PanelId; children: React.ReactNode }) {
+function FloatingPanel({ id, bounds, children }: {
+  id: PanelId; bounds: Bounds | null; children: React.ReactNode;
+}) {
   const { panels, locked, setRect, setPlacement, setDragging, dragging } = useLayoutStore();
   const rect = panels[id].rect;
+  // Draw the panel inside the window even when the stored rect came from a
+  // larger window. Only the drawn rect is clamped, so growing the window again
+  // puts the panel back where it was left.
+  const shown = bounds ? fitRect(rect, bounds) : rect;
   // While being dragged the panel must not intercept hit-testing: the drop
   // target is resolved with elementFromPoint, and a panel that follows the
   // cursor is always the topmost element under it, so every drop landed on
@@ -196,9 +219,9 @@ function FloatingPanel({ id, children }: { id: PanelId; children: React.ReactNod
     if (locked) return;
     e.preventDefault();
     (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
-    drag.current = { x: e.clientX, y: e.clientY, rect: { ...rect }, mode };
+    drag.current = { x: e.clientX, y: e.clientY, rect: { ...shown }, mode };
     if (mode === 'move') setDragging(id);
-  }, [id, locked, rect, setDragging]);
+  }, [id, locked, shown, setDragging]);
 
   useEffect(() => {
     if (!drag.current) return;
@@ -241,7 +264,7 @@ function FloatingPanel({ id, children }: { id: PanelId; children: React.ReactNod
   return (
     <div
       className={`dock-floating ${isDragging ? 'dragging' : ''}`}
-      style={{ left: rect.x, top: rect.y, width: rect.width, height: rect.height }}
+      style={{ left: shown.x, top: shown.y, width: shown.width, height: shown.height }}
     >
       <section className="dock-panel floating">
         <header className={`dock-panel-bar ${locked ? 'locked' : ''}`}
@@ -261,17 +284,98 @@ function FloatingPanel({ id, children }: { id: PanelId; children: React.ReactNod
   );
 }
 
+interface Bounds { width: number; height: number }
+
+/** Narrowest the centre (preview) may get before the side zones give way. */
+const MIN_CENTRE_W = 320;
+/** Shortest the top row may get before the bottom zone gives way. */
+const MIN_CENTRE_H = 180;
+/** A side or bottom zone is not squeezed below this while there is room. */
+const MIN_FITTED = 140;
+/** Width of one splitter. */
+const SPLITTER = 4;
+
+/**
+ * Fit the stored zone sizes into the space the window actually has.
+ *
+ * Side zones are fixed-width, so in a small or restored window they used to
+ * keep their full size and push the right-hand zone off the edge. Here they
+ * shrink proportionally until the centre keeps its minimum. The store is left
+ * alone, so maximising again restores the layout exactly.
+ */
+function fitSizes(sizes: ZoneSizes, bounds: Bounds | null,
+  has: { left: boolean; right: boolean; bottom: boolean }): ZoneSizes {
+  if (!bounds || bounds.width === 0) return sizes;
+  let { left, right, bottom } = sizes;
+  const l = has.left ? left : 0;
+  const r = has.right ? right : 0;
+  const splitters = (has.left ? SPLITTER : 0) + (has.right ? SPLITTER : 0);
+  const room = bounds.width - splitters - MIN_CENTRE_W;
+  if (l + r > room && l + r > 0) {
+    const scale = Math.max(0, room) / (l + r);
+    left = Math.max(MIN_FITTED, Math.floor(l * scale));
+    right = Math.max(MIN_FITTED, Math.floor(r * scale));
+    // Even the minimums do not fit: the centre gives up its minimum too,
+    // but the sides still never run past the edge.
+    const total = (has.left ? left : 0) + (has.right ? right : 0);
+    const hardRoom = bounds.width - splitters - 80;
+    if (total > hardRoom && total > 0) {
+      const squeeze = Math.max(0, hardRoom) / total;
+      left = Math.floor(left * squeeze);
+      right = Math.floor(right * squeeze);
+    }
+  }
+  if (has.bottom && bounds.height > 0) {
+    const roomH = bounds.height - SPLITTER - MIN_CENTRE_H;
+    if (bottom > roomH) bottom = Math.max(Math.min(MIN_FITTED, bottom), Math.floor(roomH));
+    bottom = Math.min(bottom, Math.max(0, bounds.height - SPLITTER - 60));
+  }
+  return { left, right, bottom };
+}
+
+/** Keep a floating rect inside the dock area, shrinking it if it must. */
+function fitRect(rect: FloatRect, bounds: Bounds): FloatRect {
+  const width = Math.min(rect.width, Math.max(200, bounds.width));
+  const height = Math.min(rect.height, Math.max(120, bounds.height));
+  const x = Math.max(0, Math.min(rect.x, bounds.width - width));
+  const y = Math.max(0, Math.min(rect.y, bounds.height - height));
+  return { x, y, width, height };
+}
+
+/** Track an element's size; null until the first measurement. */
+function useBounds() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [bounds, setBounds] = useState<Bounds | null>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const measure = () => {
+      const width = el.clientWidth;
+      const height = el.clientHeight;
+      setBounds((b) => (b && b.width === width && b.height === height ? b : { width, height }));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, bounds] as const;
+}
+
 /** Draggable divider between two zones. */
-function Splitter({ axis, zone, invert }: {
-  axis: 'x' | 'y'; zone: keyof ZoneSizes; invert?: boolean;
+function Splitter({ axis, zone, size, invert }: {
+  axis: 'x' | 'y'; zone: keyof ZoneSizes; size: number; invert?: boolean;
 }) {
-  const { sizes, setZoneSize, locked } = useLayoutStore();
+  const { setZoneSize, locked } = useLayoutStore();
   const start = useRef<{ pos: number; size: number } | null>(null);
 
   const begin = (e: React.PointerEvent) => {
     if (locked) return;
     e.preventDefault();
-    start.current = { pos: axis === 'x' ? e.clientX : e.clientY, size: sizes[zone] };
+    // Start from the size actually on screen: in a narrow window the zone is
+    // drawn smaller than its stored size, and starting from the stored one
+    // would make the first pixel of a drag jump.
+    start.current = { pos: axis === 'x' ? e.clientX : e.clientY, size };
     const onMove = (ev: PointerEvent) => {
       if (!start.current) return;
       const delta = (axis === 'x' ? ev.clientX : ev.clientY) - start.current.pos;
@@ -298,7 +402,8 @@ export interface DockLayoutProps {
 }
 
 export default function DockLayout({ panels: content }: DockLayoutProps) {
-  const { panels, sizes, dragging } = useLayoutStore();
+  const { panels, sizes: stored, dragging } = useLayoutStore();
+  const [rootRef, bounds] = useBounds();
 
   const inZone = (zone: DockZone) =>
     (Object.keys(panels) as PanelId[]).filter(
@@ -310,6 +415,11 @@ export default function DockLayout({ panels: content }: DockLayoutProps) {
   const right = inZone('right');
   const centre = inZone('center');
   const bottom = inZone('bottom');
+
+  const showLeft = left.length > 0 || !!dragging;
+  const showRight = right.length > 0 || !!dragging;
+  const showBottom = bottom.length > 0 || !!dragging;
+  const sizes = fitSizes(stored, bounds, { left: showLeft, right: showRight, bottom: showBottom });
 
   const renderZone = (zone: DockZone, ids: PanelId[]) => (
     <div className={`dock-zone dock-zone-${zone} ${dragging ? 'targetable' : ''}`}
@@ -329,22 +439,22 @@ export default function DockLayout({ panels: content }: DockLayoutProps) {
   );
 
   return (
-    <div className="dock-root">
+    <div className="dock-root" ref={rootRef}>
       <div className="dock-row">
-        {(left.length > 0 || dragging) && renderZone('left', left)}
-        {(left.length > 0 || dragging) && <Splitter axis="x" zone="left" />}
+        {showLeft && renderZone('left', left)}
+        {showLeft && <Splitter axis="x" zone="left" size={sizes.left} />}
 
         {renderZone('center', centre)}
 
-        {(right.length > 0 || dragging) && <Splitter axis="x" zone="right" invert />}
-        {(right.length > 0 || dragging) && renderZone('right', right)}
+        {showRight && <Splitter axis="x" zone="right" size={sizes.right} invert />}
+        {showRight && renderZone('right', right)}
       </div>
 
-      {(bottom.length > 0 || dragging) && <Splitter axis="y" zone="bottom" invert />}
-      {(bottom.length > 0 || dragging) && renderZone('bottom', bottom)}
+      {showBottom && <Splitter axis="y" zone="bottom" size={sizes.bottom} invert />}
+      {showBottom && renderZone('bottom', bottom)}
 
       {floating.map((id) => (
-        <FloatingPanel key={id} id={id}>{content[id]}</FloatingPanel>
+        <FloatingPanel key={id} id={id} bounds={bounds}>{content[id]}</FloatingPanel>
       ))}
     </div>
   );

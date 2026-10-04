@@ -119,7 +119,7 @@ export default function Header({ onReset }: Props) {
         <MenuBar />
         {project && (
           <div className="header-project">
-            <span className="project-name">{project.name}</span>
+            <span className="project-name" title={project.name}>{project.name}</span>
             <span className={`badge badge-${project.status}`}>{project.status}</span>
             {isProcessing && (
               <span className="processing-indicator animate-pulse">Processing...</span>
@@ -128,15 +128,14 @@ export default function Header({ onReset }: Props) {
         )}
       </div>
 
-      <div className="header-actions" style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+      <div className="header-actions">
         {project && (
-          <label style={{ display: 'flex', alignItems: 'center', gap: 4 }} title="Output resolution">
-            <span className="text-xs text-muted">Resolution</span>
+          <label className="header-resolution" title="Output resolution">
+            <span className="text-xs text-muted header-label">Resolution</span>
             <select
               className="btn btn-sm"
               value={currentResolution}
               onChange={(e) => handleResolutionChange(e.target.value)}
-              style={{ padding: '4px 8px' }}
             >
               {RESOLUTION_PRESETS.some(p => p.value === currentResolution)
                 ? null
@@ -154,21 +153,24 @@ export default function Header({ onReset }: Props) {
             disabled={saveState === 'saving'}
             title="Save project"
           >
-            {saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved ✓' : '💾 Save'}
+            {saveState === 'saving' ? '…' : saveState === 'saved' ? '✓' : '💾'}
+            <span className="header-label">
+              {saveState === 'saving' ? 'Saving' : saveState === 'saved' ? 'Saved' : 'Save'}
+            </span>
           </button>
         )}
         {outputPath && (
           <button className="btn btn-sm btn-success" onClick={handleOpenOutput} title={`Open last render: ${outputPath}`}>
-            ▶ Open Output
+            ▶<span className="header-label">Open Output</span>
           </button>
         )}
         {project && <LayoutMenu />}
-        <button className="btn btn-sm btn-secondary" onClick={() => openPrefs('general')} title="Preferences & Settings">
-          ⚙️ Settings
+        <button className="btn btn-sm btn-secondary header-optional" onClick={() => openPrefs('general')} title="Preferences & Settings">
+          ⚙️<span className="header-label">Settings</span>
         </button>
         {project && (
-          <button className="btn btn-sm" onClick={onReset} title="New Project">
-            New Project
+          <button className="btn btn-sm header-optional" onClick={onReset} title="New Project">
+            ＋<span className="header-label">New Project</span>
           </button>
         )}
       </div>

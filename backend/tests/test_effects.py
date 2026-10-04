@@ -119,22 +119,32 @@ def test_zoom_out_animation_prescales_so_zoompan_never_goes_below_one():
     # zoom 1x -> 2x from there.
     chain = _joined(build_canvas_transform(
         Transform(scale=0.5, scale_end=1.0), 1920, 1080, 31, 30))
-    # The animated path supersamples 3x on a 1080p canvas before zoompan
-    # (pre-scale = canvas * base * 3, pad = canvas * 3) so the crop rounds at a
-    # third of the error — base here is 0.5, so pre = 1920*0.5*3, 1080*0.5*3.
-    assert "scale=2880:1620:force_original_aspect_ratio=decrease:flags=lanczos" in chain
-    assert "pad=5760:3240" in chain
+    # Even a fast move takes the 2x floor (at 1x the integer crop shimmers):
+    # pre-scale = canvas * base (0.5) * 2, pad = canvas * 2.
+    assert "scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos" in chain
+    assert "pad=3840:2160" in chain
     # Progress is smoothstep-eased: p*p*(3-2p) with p = on/30.
     assert "z='1+(1)*(on/30)*(on/30)*(3-2*(on/30))'" in chain
 
 
 def test_zoom_supersample_is_capped_so_4k_does_not_explode():
-    # A 3x intermediate on a 4K canvas would be 11520 wide — too heavy — so the
-    # supersample is held to 2x there (7680) while 1080p still gets 3x.
-    hd = _joined(build_canvas_transform(Transform(scale=1.0, scale_end=1.5), 1920, 1080, 31, 30))
+    # A slow push (5% over 10s) judders at 1x, so it gets the full 3x on 1080p;
+    # a 3x intermediate on a 4K canvas would be 11520 wide — too heavy — so the
+    # supersample is held to 2x there (7680).
+    slow = Transform(scale=1.0, scale_end=1.05)
+    hd = _joined(build_canvas_transform(slow, 1920, 1080, 300, 30))
     assert "pad=5760:3240" in hd                      # 1920*3
-    uhd = _joined(build_canvas_transform(Transform(scale=1.0, scale_end=1.5), 3840, 2160, 31, 30))
+    uhd = _joined(build_canvas_transform(slow, 3840, 2160, 300, 30))
     assert "pad=7680:4320" in uhd                      # 3840*2, not *3
+
+
+def test_fast_zooms_take_the_2x_floor_and_slow_ones_the_full_3x():
+    # Supersampling costs its square in pixels, so fast moves stop at the 2x
+    # floor that hides the crop-size shimmer; slow moves get the full 3x.
+    fast = _joined(build_canvas_transform(Transform(scale=1.0, scale_end=1.3), 1920, 1080, 25, 25))
+    assert "pad=3840:2160" in fast
+    slow = _joined(build_canvas_transform(Transform(scale=1.0, scale_end=1.05), 1920, 1080, 250, 25))
+    assert "pad=5760:3240" in slow
 
 
 def test_animated_expressions_are_quoted():

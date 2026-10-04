@@ -1,0 +1,31 @@
+{
+ "result": {
+  "wrongly_removed_s": 19.0,
+  "missed_s": 31.9,
+  "caught_pct": 71.3,
+  "cuts": 73,
+  "recording": "raat3baje_ep1",
+  "run": 0,
+  "mode": "full",
+  "examples": true,
+  "seconds": 213.9,
+  "calls": 6,
+  "tokens_in": 199389,
+  "tokens_out": 55349,
+  "usd": 1.905,
+  "groups": 40,
+  "drops": 9,
+  "trims": 239,
+  "refused": 0,
+  "utterances": 472,
+  "runs": 3,
+  "unanimous": 62,
+  "disputed": 3,
+  "second_opinion_removed": 2,
+  "restored_by_content_check": 1,
+  "final_read_removed": 2,
+  "final_read_restored": 3
+ },
+ "answer": null,
+ "refused": []
+}

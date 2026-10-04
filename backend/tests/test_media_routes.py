@@ -217,6 +217,51 @@ def test_dropping_a_video_with_sound_pairs_it_onto_a1(client, samples):
     assert audio["timeline_start_frame"] == video["timeline_start_frame"]
 
 
+def test_the_first_drop_starts_the_timeline_with_sound_linked(client, samples):
+    pid = _new_project(client, samples["talking"])
+    res = client.post(f"/api/timeline/{pid}/add_media",
+                      json={"path": str(samples["talking"]), "timeline_start_frame": 90})
+    items = res.json()["timeline"]["items"]
+    video = next(i for i in items if i["track"] == "V1")
+    audio = next(i for i in items if i["track"] == "A1")
+    assert video["timeline_start_frame"] == audio["timeline_start_frame"] == 0
+    assert video["link_id"] and video["link_id"] == audio["link_id"]
+    assert set(res.json()["item_ids"]) == {video["id"], audio["id"]}
+
+
+def test_an_overlay_video_brings_its_sound_linked_on_an_audio_lane(client, samples):
+    pid = _new_project(client, samples["talking"])
+    client.post(f"/api/timeline/{pid}/add_media", json={"path": str(samples["talking"])})
+    res = client.post(f"/api/timeline/{pid}/add_media",
+                      json={"path": str(samples["talking"]), "track": "V2",
+                            "timeline_start_frame": 15})
+    items = res.json()["timeline"]["items"]
+    video = next(i for i in items if i["track"] == "V2")
+    audio = next(i for i in items if i["track"] == "A2")
+    assert video["timeline_start_frame"] == audio["timeline_start_frame"] == 15
+    assert video["link_id"] == audio["link_id"]
+
+    moved = client.post(f"/api/timeline/{pid}/clip/move",
+                        json={"item_id": video["id"], "timeline_start_frame": 30}).json()
+    audio_after = next(i for i in moved["timeline"]["items"] if i["id"] == audio["id"])
+    assert audio_after["timeline_start_frame"] == 30
+
+
+def test_replace_restores_a_snapshot_with_a_newer_revision(client, samples):
+    pid = _new_project(client, samples["silent"])
+    first = client.post(f"/api/timeline/{pid}/add_media", json={"path": str(samples["silent"])})
+    snapshot = first.json()["timeline"]
+    second = client.post(f"/api/timeline/{pid}/add_media",
+                         json={"path": str(samples["still"]), "timeline_start_frame": 30})
+    later_revision = second.json()["timeline"]["revision"]
+
+    res = client.post(f"/api/timeline/{pid}/replace", json={"timeline": snapshot})
+    assert res.status_code == 200, res.text
+    restored = res.json()["timeline"]
+    assert len(restored["items"]) == len(snapshot["items"])
+    assert restored["revision"] > later_revision
+
+
 def test_a_silent_video_gets_no_audio_clip(client, samples):
     pid = _new_project(client, samples["silent"])
     res = client.post(f"/api/timeline/{pid}/add_media",

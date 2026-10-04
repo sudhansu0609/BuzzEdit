@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from config import DATA_DIR, OUTPUT_DIR, PROJECTS_DIR
 from utils.power import PowerManager
+from runtime import sentinel_priority
 from agents.edit_agent import EditAgent
 
 logger = logging.getLogger(__name__)
@@ -204,7 +205,10 @@ class JobScheduler:
                 logger.info(f"Scheduler: Processing job {job['id']} for project {job['project_id']}")
 
                 try:
-                    await self._process_job(job)
+                    # While a job runs, the backend and ComfyUI outrank
+                    # background work in Sentinel (runtime/sentinel_priority.py).
+                    with sentinel_priority.job():
+                        await self._process_job(job)
                     job["status"] = "completed"
                     job["progress"] = 1.0
                 except Exception as e:
@@ -241,14 +245,39 @@ class JobScheduler:
         job_settings = job.get("settings", {})
         report = lambda fraction, message="": self._progress(job, fraction, message)
 
+        if job.get("job_type") == "presentation_render":
+            # Only the render of a pass that already saved its timeline -- the
+            # retry after a render that died. See director.rerender_presented.
+            from presentation.director import rerender_presented
+            from runtime import gpu_handover
+            try:
+                result = await rerender_presented(project_id, progress_cb=report,
+                                                  output_dir=job_output_dir)
+            finally:
+                await gpu_handover.offload_all(f"re-render {project_id} finished")
+            job["result"] = {
+                "output_directory": str(job_output_dir),
+                "report": result.model_dump(),
+                "output_path": result.output_path,
+            }
+            return
+
         if job.get("job_type") == "presentation":
             # The full overnight pass: reads the transcript, generates and places
             # B-roll, zooms, pop-ups, captions and a thumbnail, then renders.
             from presentation import PresentationSettings, run_presentation_pass
+            from presentation.models import settings_sources_for
+            from store.app_settings import apply_presentation_overrides
 
-            settings = PresentationSettings(**job_settings)
+            # BuzzEdit-side overrides beat whatever BuzzcafStudio sent, applied
+            # fresh here (not just at enqueue time) so a delayed overnight job
+            # picks up an override changed after it was queued.
+            merged_settings, override_fields = apply_presentation_overrides(job_settings)
+            settings = PresentationSettings(**merged_settings).resolve_density()
+            settings_sources = settings_sources_for(job_settings, override_fields, settings)
             result = await run_presentation_pass(
-                project_id, settings, progress_cb=report, output_dir=job_output_dir)
+                project_id, settings, progress_cb=report, output_dir=job_output_dir,
+                settings_sources=settings_sources)
             job["result"] = {
                 "output_directory": str(job_output_dir),
                 "report": result.model_dump(),

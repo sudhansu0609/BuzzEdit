@@ -38,14 +38,33 @@ _ZOOM_SS_BASE = 3
 _ZOOM_SS_MAX_EDGE = 7680
 
 
-def _zoom_ss(canvas_w: int, canvas_h: int, base_scale: float) -> int:
+# The rounding step is one input pixel; the judder it causes is that step
+# relative to how far the window moves per frame. A move of >= this many output
+# pixels per frame at the chosen factor keeps a 1px step to <=20% speed ripple;
+# the measured judder was a ~25% spike on SLOW moves. Fast moves -- a typical
+# 10-20% punch over 1-2s travels 5-10px/frame -- need little or no
+# supersampling, and 3x on every one was ~9x the pixel work for nothing.
+_ZOOM_SS_MIN_TRAVEL_PX = 15.0
+# Never below this for an animated zoom: at 1x the window's integer crop size
+# changes aspect by a pixel every few frames, which on a face reads as a
+# shimmer however fast the move. 2x keeps that under half a pixel.
+_ZOOM_SS_FLOOR = 2
+
+
+def _zoom_ss(canvas_w: int, canvas_h: int, base_scale: float,
+             travel_px_per_frame: Optional[float] = None) -> int:
     """Supersampling factor for a zoom on this canvas, capped by intermediate size.
 
     `base_scale` is the pre-scale the move starts from (<=1 for a push-in), so the
     cap is measured against the frame zoompan actually receives, not the canvas.
+    `travel_px_per_frame` (average window-edge travel in output pixels) picks
+    the smallest factor that still hides the rounding; None keeps the base.
     """
     long_edge = max(canvas_w, canvas_h) * max(0.05, base_scale)
     ss = _ZOOM_SS_BASE
+    if travel_px_per_frame is not None and travel_px_per_frame > 0:
+        needed = int(math.ceil(_ZOOM_SS_MIN_TRAVEL_PX / travel_px_per_frame))
+        ss = max(_ZOOM_SS_FLOOR, min(_ZOOM_SS_BASE, needed))
     while ss > 1 and long_edge * ss > _ZOOM_SS_MAX_EDGE:
         ss -= 1
     return ss
@@ -468,7 +487,15 @@ def build_canvas_transform(
     # instead of shake. Lanczos on the upscale keeps the picture sharp.
     base = min(scale_start, scale_end, 1.0)
     base = max(0.05, base)
-    ss = _zoom_ss(canvas_w, canvas_h, base)
+    # Average travel of the crop window's edge per output frame: the zoom's
+    # change of window width plus the pan's slide, both in output pixels.
+    frames = max(1, duration_frames - 1)
+    zoom_travel = canvas_w * abs(1.0 / max(1e-3, scale_start / base)
+                                 - 1.0 / max(1e-3, scale_end / base)) / 2.0
+    pan_travel = max(abs(pan_x_end - pan_x_start) * canvas_w,
+                     abs(pan_y_end - pan_y_start) * canvas_h) / 2.0 * (1.0 - base / max(scale_start, scale_end, base))
+    ss = _zoom_ss(canvas_w, canvas_h, base,
+                  travel_px_per_frame=(zoom_travel + pan_travel) / frames)
     pre_w, pre_h = _even(canvas_w * base * ss), _even(canvas_h * base * ss)
     filters.append(f"scale={pre_w}:{pre_h}:force_original_aspect_ratio=decrease:flags=lanczos")
     filters.append(f"pad={canvas_w * ss}:{canvas_h * ss}:(ow-iw)/2:(oh-ih)/2:color=black")

@@ -69,6 +69,36 @@ def _seed_media_pool(project: Project, video_path: str, original_path: str, disp
     except Exception:
         pass  # an empty library is a cosmetic loss, never a failed import
 
+def _disk_full(e: OSError) -> bool:
+    # ENOSPC, or Windows' ERROR_DISK_FULL (112) / ERROR_HANDLE_DISK_FULL (39).
+    return e.errno == 28 or getattr(e, "winerror", None) in (39, 112) or "not enough space" in str(e).lower()
+
+
+def place_source(src: Path, dest: Path) -> str:
+    """Put the recording at `dest`: a hard link when it is on the same drive
+    (instant, and no second copy of a multi-GB take -- re-imports used to fill
+    the disk), else a copy. Nothing in BuzzEdit writes into the source file,
+    and removing the project removes only its own name for it. A copy checks
+    the free space first and never leaves a partial file behind."""
+    try:
+        dest.hardlink_to(src)
+        return "linked"
+    except OSError:
+        pass   # another drive, a filesystem without hard links, or not allowed
+    size = src.stat().st_size
+    free = shutil.disk_usage(str(dest.parent)).free
+    if free < size + 512 * 1024 * 1024:
+        raise OSError(28, f"Not enough space on {dest.anchor or dest.parent} to copy the recording: "
+                          f"it needs {size / 1e9:.1f} GB, {free / 1e9:.1f} GB is free. "
+                          "Free some space (or keep recordings on the same drive as BuzzEdit) and try again.")
+    try:
+        shutil.copy(str(src), str(dest))
+    except OSError as e:
+        dest.unlink(missing_ok=True)
+        raise OSError(e.errno, f"Failed to copy the recording: {e}") from e
+    return "copied"
+
+
 @router.post("/import_path", response_model=Project)
 async def import_video_path(body: PathImportRequest):
     src_path = Path(body.path)
@@ -80,9 +110,9 @@ async def import_video_path(body: PathImportRequest):
     dest_video_path = PROJECTS_DIR / f"{project_id}_source{file_ext}"
 
     try:
-        shutil.copy(str(src_path), str(dest_video_path))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to copy video file: {str(e)}")
+        place_source(src_path, dest_video_path)
+    except OSError as e:
+        raise HTTPException(status_code=507 if _disk_full(e) else 500, detail=str(e))
 
     try:
         video_info = get_video_info(str(dest_video_path))
@@ -114,16 +144,22 @@ async def list_media(
 ):
     """The project's media library — everything available to drag onto the timeline."""
     p_data = _load(project_id)
-    media = media_pool.decorate(project_id, p_data.get("media_pool", []))
+    pool = p_data.setdefault("media_pool", [])
+    # Backfill anything the timeline uses that never went through an explicit
+    # import (a clip dragged onto a track, or media a generation pass wrote
+    # straight in) so the library shows everything the project actually plays.
+    if media_pool.sync_from_timeline(pool, p_data.get("timeline")):
+        project_store.save_project(project_id, p_data)
+    media = media_pool.decorate(project_id, pool)
     if kind:
         media = [m for m in media if m.get("kind") == kind]
     if q:
         needle = q.lower()
         media = [m for m in media if needle in str(m.get("name", "")).lower()]
     counts: Dict[str, int] = {"video": 0, "audio": 0, "image": 0}
-    for entry in p_data.get("media_pool", []):
+    for entry in pool:
         counts[entry.get("kind", "video")] = counts.get(entry.get("kind", "video"), 0) + 1
-    return {"media": media, "counts": counts, "total": len(p_data.get("media_pool", []))}
+    return {"media": media, "counts": counts, "total": len(pool)}
 
 
 @router.post("/{project_id}/media/import")

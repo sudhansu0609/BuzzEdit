@@ -16,7 +16,7 @@ import subprocess
 import pytest
 
 from backend.render import transitions
-from backend.render.atmosphere import build_aspect_bars, build_effect
+from backend.render.atmosphere import available, build_aspect_bars, build_effect
 from backend.render.compiler import FilterGraphCompiler
 from backend.timeline import build_timeline_from_transcript, clip_ops
 from backend.timeline.schema import AtmosphereEffect, SourceFile, Timeline, Transition
@@ -227,6 +227,30 @@ def test_a_disabled_effect_is_left_out():
     assert "blend=all_mode=screen" not in _graph(timeline)
 
 
+def test_redaction_grows_a_black_bar_across_the_window():
+    chain = _effect_chain("redaction")
+    assert "overlay=x='" in chain                     # slid per frame, not a static drawbox
+    assert "min(1" in chain and "t/5)" in chain      # grows over the 5s window
+    assert "c=black" in chain
+
+
+def test_spotlight_vignettes_and_dims_the_frame():
+    chain = _effect_chain("spotlight")
+    assert "vignette=" in chain
+    assert "eq=brightness=" in chain
+
+
+def test_strobe_gates_a_white_flash():
+    chain = _effect_chain("strobe")
+    assert "color=white" in chain
+    assert "enable=" in chain and "mod(t*" in chain
+
+
+def test_available_lists_the_new_treatments():
+    ids = {entry["id"] for entry in available()}
+    assert {"redaction", "spotlight", "strobe"} <= ids
+
+
 # --- cinematic bars -------------------------------------------------------
 
 def test_letterbox_keeps_the_output_resolution():
@@ -348,3 +372,31 @@ def test_an_adjustment_layer_changes_only_its_own_stretch_of_the_programme(tmp_p
     assert saturation_at(3.0) < 5, "the adjustment layer did not reach the picture"
     assert saturation_at(1.0) > 40, "colour was drained before the layer starts"
     assert saturation_at(5.0) > 40, "colour was drained after the layer ends"
+
+
+@pytest.mark.parametrize("kind", ["shutter", "redaction", "flash", "strobe", "spotlight", "shake"])
+def test_no_effect_emits_an_eval_option(kind):
+    """FFmpeg 8.1's drawbox has no `eval` option: one `eval=frame` in the graph
+    failed a whole render ("Option not found") at the end of a 4-hour job."""
+    assert "eval=" not in _effect_chain(kind)
+
+
+def test_render_errors_report_ffmpegs_diagnostic_line_not_the_graph_tail():
+    from render.runner import summarize_ffmpeg_error
+    stderr = ("[fc#0 @ 0x1] Error applying option 'eval' to filter 'drawbox': Option not found\n"
+              + "x" * 2000 + "\nError : Option not found\n")
+    summary = summarize_ffmpeg_error(stderr)
+    assert "drawbox': Option not found" in summary
+    assert "xxxxx" not in summary
+
+
+def test_loudness_measurement_runs_only_the_audio_part_of_the_graph():
+    from render.audio import audio_subgraph
+    graph = ("[0:v]trim=start=0:end=2,setpts=PTS-STARTPTS,zoompan=z=1.1[v1_0];"
+             "[0:a]atrim=start=0:end=2,asetpts=PTS-STARTPTS[a1_0];"
+             "[1:a]volume=0.2[mus];"
+             "[a1_0][mus]amix=inputs=2[mix_a];"
+             "[v1_0]drawtext=text=x[text_v]")
+    sub = audio_subgraph(graph, "[mix_a]")
+    assert "zoompan" not in sub and "drawtext" not in sub
+    assert "[a1_0][mus]amix" in sub and "[1:a]volume" in sub

@@ -111,6 +111,38 @@ def _load_waveform(audio_path: str):
     return torch.from_numpy(audio).unsqueeze(0)
 
 
+# The model's frame stride is 320 samples (20 ms); chunks and their overlap are whole frames.
+_STRIDE = 320
+_CHUNK_SAMPLES = 1500 * _STRIDE      # 30 s
+_PAD_SAMPLES = 50 * _STRIDE          # 1 s of context either side, discarded
+
+
+def _emission(model, waveform, device: str):
+    """Frame log-probabilities for the whole waveform, computed 30 s at a time.
+
+    One forward pass over a whole recording grows with its length: a 28-minute
+    take filled the 16 GB card, Windows spilled the rest into shared system memory,
+    and the machine ran out of RAM. Each chunk gets 1 s of context either side,
+    which is dropped again, so the joined emission matches a single pass to within
+    a frame at each seam; the alignment itself still runs once, over everything.
+    """
+    import torch
+    total = waveform.size(1)
+    if total <= _CHUNK_SAMPLES + 2 * _PAD_SAMPLES:
+        emission, _ = model(waveform.to(device))
+        return emission
+    pieces = []
+    for start in range(0, total, _CHUNK_SAMPLES):
+        a = max(0, start - _PAD_SAMPLES)
+        b = min(total, start + _CHUNK_SAMPLES + _PAD_SAMPLES)
+        chunk_emission, _ = model(waveform[:, a:b].to(device))
+        lead = (start - a) // _STRIDE
+        keep = (min(total, start + _CHUNK_SAMPLES) - start) // _STRIDE
+        pieces.append(chunk_emission[:, lead:lead + keep].detach())
+        del chunk_emission
+    return torch.cat(pieces, dim=1)
+
+
 def align_words(
     audio_path: str,
     words: List[Dict[str, Any]],
@@ -152,7 +184,7 @@ def align_words(
 
         waveform = _load_waveform(audio_path)
         with torch.inference_mode():
-            emission, _ = model(waveform.to(device))
+            emission = _emission(model, waveform, device)
             if emission.size(1) < len(tokens):
                 logger.warning("Forced alignment skipped: %d tokens for %d frames.",
                                len(tokens), emission.size(1))
@@ -191,6 +223,76 @@ def align_words(
     logger.info("Forced alignment: %d/%d words re-timed (%d moved >0.25s).",
                 len(alignable), len(words), moved)
     return words
+
+
+def align_in_windows(
+    audio_path: str,
+    words: List[Dict[str, Any]],
+    windows: List[tuple],
+    device: str = "cuda",
+) -> int:
+    """Align, in place, the words whose midpoint falls in each (start, end) window to that
+    window's audio alone. Returns how many words were re-timed. Never raises.
+
+    For words added after the main alignment (gap recovery): aligning the whole recording
+    again to place a few dozen words costs the full pass a second time — on a 28-minute
+    recording that pushed the GPU into Windows' shared memory and the machine out of RAM.
+    A hole is a few seconds of speech, and its words belong inside it.
+    """
+    if not words or not windows or not audio_path or not align_available():
+        return 0
+    model, dictionary = _ensure_model(device)
+    if model is None:
+        return 0
+    try:
+        import torch
+        from torchaudio.functional import forced_align, merge_tokens
+        waveform = _load_waveform(audio_path)
+    except Exception as e:
+        logger.warning("Windowed alignment unavailable (%s).", e)
+        return 0
+
+    retimed = 0
+    for start_s, end_s in windows:
+        inside = [w for w in words
+                  if start_s <= (float(w.get("start", 0.0)) + float(w.get("end", 0.0))) / 2 <= end_s
+                  and _roman(w, dictionary)]
+        if not inside:
+            continue
+        a = max(0, int(start_s * _SAMPLE_RATE))
+        b = min(waveform.size(1), int(end_s * _SAMPLE_RATE))
+        try:
+            tokens: List[int] = []
+            lengths: List[int] = []
+            for w in inside:
+                ids = [dictionary[c] for c in _roman(w, dictionary)]
+                tokens.extend(ids)
+                lengths.append(len(ids))
+            with torch.inference_mode():
+                emission = _emission(model, waveform[:, a:b], device)
+                if emission.size(1) < len(tokens):
+                    continue
+                targets = torch.tensor([tokens], dtype=torch.int32, device=device)
+                aligned, scores = forced_align(emission, targets, blank=0)
+                spans = merge_tokens(aligned[0], scores[0].exp())
+            if len(spans) != len(tokens):
+                continue
+            seconds_per_frame = (b - a) / emission.size(1) / _SAMPLE_RATE
+        except Exception as e:
+            logger.debug("Window %.1f-%.1fs not aligned: %s", start_s, end_s, e)
+            continue
+        cursor = 0
+        for w, length in zip(inside, lengths):
+            group = spans[cursor:cursor + length]
+            cursor += length
+            if not group:
+                continue
+            ws = start_s + group[0].start * seconds_per_frame
+            we = start_s + group[-1].end * seconds_per_frame
+            w["start"], w["end"] = round(ws, 3), round(max(we, ws + 0.02), 3)
+            w["timing_aligned"] = True
+            retimed += 1
+    return retimed
 
 
 def _norm(text: str) -> str:

@@ -1,6 +1,7 @@
 import sys
 import logging
 from pathlib import Path
+from typing import Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -48,6 +49,22 @@ def _withdraw_ledger_entry() -> None:
         logger.info("Withdrew %s from the port ledger.", APP_NAME)
     except Exception as exc:  # a stale entry is bad; a crash on the way out is worse
         logger.warning("Could not withdraw %s from the port ledger: %s", APP_NAME, exc)
+
+
+def _ledger_held_by_another(port: int, answers_as_buzzedit) -> Optional[str]:
+    """The health URL of another BuzzEdit that holds the ledger entry and is
+    still serving, or None when this backend may publish.
+
+    A second backend (a dev run, a test) must not take the entry from a live
+    one: the Studio follows the ledger, and a render it enqueued on such a
+    backend died with it while the live BuzzEdit never saw the job."""
+    import buzzcaf_ports
+
+    held = buzzcaf_ports.entry(APP_NAME) or {}
+    held_health = str(held.get("health") or "")
+    if held_health and held.get("port") != port and answers_as_buzzedit(held_health):
+        return held_health
+    return None
 
 
 @asynccontextmanager
@@ -110,6 +127,11 @@ from routes import (
     style,
     presentation,
     script,
+    glossary,
+    kept_words,
+    stock,
+    music,
+    eyecontact,
 )
 
 app.include_router(health.router, prefix="/api", tags=["health"])
@@ -129,7 +151,12 @@ app.include_router(llm.router, prefix="/api/llm", tags=["llm"])
 app.include_router(presets.router, prefix="/api/presets", tags=["presets"])
 app.include_router(style.router, prefix="/api/style", tags=["style"])
 app.include_router(presentation.router, prefix="/api/presentation", tags=["presentation"])
+app.include_router(music.router, prefix="/api/music", tags=["music"])
 app.include_router(script.router, prefix="/api/projects", tags=["script"])
+app.include_router(glossary.router, prefix="/api/glossary", tags=["glossary"])
+app.include_router(kept_words.router, prefix="/api/projects", tags=["projects"])
+app.include_router(stock.router, prefix="/api/settings", tags=["stock"])
+app.include_router(eyecontact.router, prefix="/api/eyecontact", tags=["eyecontact"])
 
 @app.get("/")
 async def root():
@@ -206,9 +233,16 @@ def _serve() -> None:
             # Not the lifespan hook: uvicorn runs lifespan startup *before* it
             # binds the socket, and an entry written before the socket opens is
             # a promise nobody can keep.
+            global _owns_ledger_entry
             deadline = time.monotonic() + 30.0
             while time.monotonic() < deadline:
                 if server.started and answers_as_buzzedit(health):
+                    held_health = _ledger_held_by_another(port, answers_as_buzzedit)
+                    if held_health:
+                        _owns_ledger_entry = False
+                        logger.warning("Not publishing %s -> %s: the BuzzEdit at %s is live and keeps the "
+                                       "port ledger entry.", APP_NAME, port, held_health)
+                        return
                     buzzcaf_ports.publish(
                         APP_NAME, port, health, {"comfyui": comfyui_port()},
                     )

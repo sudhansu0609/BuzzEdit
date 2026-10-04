@@ -87,8 +87,13 @@ class GPUBroker:
             free_vram = self.get_free_vram_mb()
             logger.info(f"Current free VRAM: {free_vram:.0f} MB.")
 
-            if free_vram < required_vram_mb:
-                # Try freeing ComfyUI memory
+            # ComfyUI asking for the card must NOT make ComfyUI unload: the VRAM
+            # "in use" is its own models from the previous job, which the next
+            # job reuses. Freeing them here made every image and every clip
+            # reload ~6-20GB of weights from disk -- a 5s turbo image took 35s
+            # and each Wan clip spent minutes loading. Only another tenant
+            # (Whisper, the LLM, the matte) needs ComfyUI to let go.
+            if free_vram < required_vram_mb and tenant_name != "comfyui":
                 await self.release_comfyui_vram()
                 await asyncio.sleep(0.5)
 

@@ -33,7 +33,8 @@ export default function LayoutMenu() {
         {locked ? '🔒' : '🔓'}
       </button>
       <button className="btn btn-sm" onClick={() => setOpen((v) => !v)} title="Workspace layout">
-        ▦ Layout{hidden.length > 0 ? ` (${hidden.length} hidden)` : ''}
+        ▦<span className="header-label">Layout</span>
+        {hidden.length > 0 && <span className="header-label">({hidden.length} hidden)</span>}
       </button>
 
       {open && (

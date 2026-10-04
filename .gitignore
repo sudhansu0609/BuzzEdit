@@ -28,3 +28,15 @@ data/geo/
 
 # Dressed FX previews are a rebuildable cache, never source.
 data/output/
+
+# Answer-key audio and transcripts are rebuilt from the recordings (tools/autocut_truth.py,
+# tools/editor_bench.py); the keys themselves (data/eval/*.json) are small and kept.
+data/eval/cache/
+
+# Generated media, benchmarks and caches (rebuildable, hundreds of MB)
+data/audio_gen/
+data/bench/
+data/cache/
+data/music/
+text_*.txt
+backend/text_*.txt

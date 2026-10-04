@@ -40,12 +40,20 @@ from config import (
 logger = logging.getLogger(__name__)
 
 # Every key a ComfyUI save node may publish its results under. `images` is
-# SaveImage/PreviewImage; the rest come from the video nodes (VHS_VideoCombine,
-# SaveVideo). `animated` is deliberately NOT here: in history it is a list of
-# booleans (`"animated": [true]`) marking sibling `images` entries as animated,
-# not a list of files — reading it as one crashed every Wan video generation
-# with "'bool' object has no attribute 'get'".
-OUTPUT_KEYS = ("images", "gifs", "videos")
+# SaveImage/PreviewImage; the video nodes (VHS_VideoCombine, SaveVideo) publish
+# `gifs`/`videos`; `audio` is SaveAudio/SaveAudioMP3/SaveAudioOpus (the text-
+# to-audio "audio" role) — same {filename, subfolder, type} entry shape as
+# `images`, just under its own key, so leaving it out meant a finished Stable
+# Audio Open job reported "produced no readable outputs" every time even
+# though ComfyUI's own history had the file right there under "audio".
+# `animated` is deliberately NOT here: in history it is a list of booleans
+# (`"animated": [true]`) marking sibling `images` entries as animated, not a
+# list of files — reading it as one crashed every Wan video generation with
+# "'bool' object has no attribute 'get'".
+OUTPUT_KEYS = ("images", "gifs", "videos", "audio")
+# How long a running job may see "connection refused" before it is given up:
+# nothing is listening, so the job died with the process.
+REFUSED_GIVE_UP_S = 20
 
 
 class ComfyUIClient:
@@ -65,6 +73,41 @@ class ComfyUIClient:
 
     def is_connected(self, timeout: float = 10.0) -> bool:
         return self.connection_status(timeout)[0]
+
+    def watch_events(self, on_event, stop, ready=None) -> None:
+        """Relay ComfyUI's websocket events for our client_id -- `executing`
+        (which node runs), `progress` (sampler step value/max) -- to
+        `on_event(type, data)` until `stop` (a threading.Event) is set.
+
+        Progress is best-effort: no websocket means no events, never an error;
+        the HTTP history poll still decides when the job is done. `ready` is
+        set once the socket is open (or has failed), so the caller can queue
+        the prompt without missing its first events.
+        """
+        url = self.server_url.replace("https://", "wss://").replace("http://", "ws://")
+        try:
+            from websockets.sync.client import connect
+            with connect(f"{url}/ws?clientId={urllib.parse.quote(self.client_id)}",
+                         open_timeout=5, max_size=None) as ws:
+                if ready is not None:
+                    ready.set()
+                while not stop.is_set():
+                    try:
+                        message = ws.recv(timeout=0.5)
+                    except TimeoutError:
+                        continue
+                    if not isinstance(message, str):
+                        continue   # binary preview frames
+                    try:
+                        event = json.loads(message)
+                        on_event(event.get("type"), event.get("data") or {})
+                    except Exception as e:
+                        logger.debug("Ignoring ComfyUI event: %s", e)
+        except Exception as e:
+            logger.info("No ComfyUI progress events (%s); the job still runs", e)
+        finally:
+            if ready is not None:
+                ready.set()
 
     def _probe(self, url: str, timeout: float) -> tuple[bool, str]:
         try:
@@ -98,7 +141,10 @@ class ComfyUIClient:
         ok, reason = self._probe(self.server_url, timeout)
         if ok:
             return True, ""
-        alternate = self._find_elsewhere(min(timeout, 5.0))
+        # Short per-port timeout: a refused local port costs ~2 s on Windows
+        # (it retries the SYN), and the scan covers 20 of them -- at the old 5 s
+        # cap one "is it up?" took ~43 s and a submission's retries ~8 minutes.
+        alternate = self._find_elsewhere(min(timeout, 0.5))
         if alternate:
             logger.info("ComfyUI found at %s (configured %s is down); switching",
                         alternate, self.server_url)
@@ -170,6 +216,70 @@ class ComfyUIClient:
             logger.error(f"Failed to queue prompt in ComfyUI: {e}")
             raise RuntimeError(f"ComfyUI queue prompt failed: {e}")
 
+    def _post_quiet(self, path: str, body: Dict[str, Any], timeout: float = 30) -> bool:
+        req = urllib.request.Request(
+            f"{self.server_url}{path}",
+            data=json.dumps(body).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout):
+                return True
+        except Exception as e:
+            logger.warning("ComfyUI %s failed: %s", path, e)
+            return False
+
+    def upload_image(self, path: str, timeout: float = 60) -> str:
+        """`POST /upload/image` -- put a local picture into ComfyUI's input
+        folder and return the name a `LoadImage` node takes. Raises on failure.
+
+        Used to start an image-to-video clip from the still the image phase
+        already made, instead of re-generating a first frame inside the video
+        graph (which also kept the image model resident beside Wan)."""
+        source = Path(path)
+        boundary = f"----buzzedit{int(time.time() * 1000)}"
+        head = (f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="image"; filename="{source.name}"\r\n'
+                f"Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
+        tail = (f"\r\n--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="overwrite"\r\n\r\ntrue'
+                f"\r\n--{boundary}--\r\n").encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.server_url}/upload/image", data=head + source.read_bytes() + tail,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            answer = json.loads(resp.read().decode("utf-8"))
+        name = answer.get("name") or source.name
+        subfolder = answer.get("subfolder") or ""
+        return f"{subfolder}/{name}" if subfolder else name
+
+    def recover(self, prompt_id: Optional[str] = None) -> bool:
+        """Clear the way after a failed or timed-out job.
+
+        A job that timed out on OUR side keeps running on ComfyUI's, and every
+        later prompt queues behind it -- which turned one slow Wan clip into a
+        chain of 30-minute timeouts. So: drop it from the queue, interrupt
+        whatever is executing, and ask ComfyUI to unload models and free VRAM
+        so the next job starts from a clean card.
+        """
+        if prompt_id:
+            self._post_quiet("/queue", {"delete": [prompt_id]})
+        # Recent ComfyUI interrupts only the named prompt; older builds ignore
+        # the body and interrupt whatever is running.
+        self._post_quiet("/interrupt", {"prompt_id": prompt_id} if prompt_id else {})
+        return self._post_quiet("/free", {"unload_models": True, "free_memory": True})
+
+    def has_node(self, class_type: str, timeout: float = 15) -> bool:
+        """Whether this ComfyUI has a node class installed (a custom node that
+        failed to load is simply absent from /object_info)."""
+        try:
+            url = f"{self.server_url}/object_info/{urllib.parse.quote(class_type)}"
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                return class_type in json.loads(resp.read().decode('utf-8'))
+        except Exception as e:
+            logger.info("ComfyUI node check for %s failed: %s", class_type, e)
+            return False
+
     def get_history(self, prompt_id: str) -> Dict[str, Any]:
         """History for one prompt, or {} if it has not appeared yet.
 
@@ -226,17 +336,30 @@ class ComfyUIClient:
                         poll_interval: float = 2.0) -> List[str]:
         """Block until the prompt finishes; return the files it produced."""
         start_time = time.time()
+        refused_since: Optional[float] = None
 
         while time.time() - start_time < timeout:
             try:
                 history = self.get_history(prompt_id)
             except ConnectionError as e:
-                # Almost always ComfyUI blocked loading the model for THIS job.
-                # Keep waiting — the overall `timeout` still bounds the whole thing.
+                # A timeout is almost always ComfyUI blocked loading the model for
+                # THIS job: keep waiting, the overall `timeout` bounds it. A
+                # refused connection means nothing is listening any more -- the
+                # process died and this job died with it, so do not sit out the
+                # full timeout for it.
+                text = str(e)
+                if "10061" in text or "refused" in text.lower():
+                    refused_since = refused_since or time.time()
+                    if time.time() - refused_since >= REFUSED_GIVE_UP_S:
+                        raise ConnectionError(
+                            f"ComfyUI stopped while job {prompt_id} ran (connection refused)") from e
+                else:
+                    refused_since = None
                 logger.info("ComfyUI busy/unreachable while job %s runs (%s); still waiting",
                             prompt_id, e)
                 time.sleep(poll_interval)
                 continue
+            refused_since = None
             if prompt_id in history:
                 outputs = history[prompt_id].get('outputs', {})
                 files: List[str] = []

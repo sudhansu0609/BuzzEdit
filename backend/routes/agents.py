@@ -1,6 +1,8 @@
+import asyncio
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Any, Dict, Optional
 from config import PROJECTS_DIR, OUTPUT_DIR
 from store.project_store import ProjectStore
 from models import Project
@@ -99,3 +101,85 @@ async def generate_captions(req: AgentJobRequest):
         return {"status": "completed", "output_video": res_video}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────── BuzzcafAI bridge: plan visuals ───────────────────────
+
+
+class PlanVisualsRequest(BaseModel):
+    project_id: str
+    brand: str
+
+
+def _transcript_plain_text(p_data: Dict[str, Any]) -> str:
+    """Plain spoken text reconstructed from a project's transcript.
+
+    `transcript` on the stored project dict is either a full
+    `{segments, language, duration}` object (what this backend writes) or a
+    bare list of segments (what the frontend sometimes persists -- see
+    `models.Project._coerce_transcript`); accept either rather than 500ing.
+    """
+    transcript = p_data.get("transcript")
+    if isinstance(transcript, dict):
+        segments = transcript.get("segments") or []
+    elif isinstance(transcript, list):
+        segments = transcript
+    else:
+        segments = []
+    return " ".join(str(s.get("text", "")) for s in segments if isinstance(s, dict)).strip()
+
+
+@router.post("/plan_visuals")
+async def plan_visuals(req: PlanVisualsRequest):
+    """Ask BuzzcafAI to plan the visuals for this project's script or
+    transcript, then apply the annotated script it hands back the same way
+    `PUT /api/projects/{id}/script` does -- so the normal presentation pass
+    can run immediately afterwards with no extra step from the caller.
+    """
+    p_data = project_store.get_project(req.project_id)
+    if not p_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    transcript_text = ((p_data.get("script") or {}).get("text") or "").strip()
+    if not transcript_text:
+        transcript_text = _transcript_plain_text(p_data)
+    if not transcript_text:
+        raise HTTPException(status_code=400, detail="No transcript or script text yet -- transcribe first.")
+
+    from integrations.buzzcaf_client import plan_visuals as buzzcaf_plan_visuals, BuzzcafUnavailable
+
+    try:
+        result = await asyncio.to_thread(buzzcaf_plan_visuals, transcript_text, req.brand)
+    except BuzzcafUnavailable as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BuzzcafAI could not plan visuals: {e}")
+
+    annotated_script = result.get("annotated_script") or ""
+    if not annotated_script.strip():
+        raise HTTPException(status_code=502, detail="BuzzcafAI returned an empty annotated script.")
+
+    if not p_data.get("timeline"):
+        raise HTTPException(status_code=422, detail="Transcribe the recording before planning visuals.")
+
+    from presentation.script import apply_project_script
+    from timeline.schema import Timeline
+
+    timeline = Timeline.model_validate(p_data["timeline"])
+    record = apply_project_script(p_data, timeline, text=annotated_script)
+    if record is None:
+        raise HTTPException(status_code=422, detail="Nothing to align the annotated script to.")
+    p_data["timeline"] = timeline.model_dump()
+    project_store.save_project(req.project_id, p_data)
+
+    return {
+        "status": "applied",
+        "settings": result.get("settings"),
+        "visual_plan": result.get("visual_plan"),
+        "skipped_beats": result.get("skipped_beats"),
+        "script": {
+            "text": record.get("text", ""),
+            "directives": [{"kind": d["kind"], "arg": d["arg"], "at": d["at"]} for d in (record.get("directives") or [])],
+            "paragraphs": len(record.get("paragraphs") or []),
+        },
+    }

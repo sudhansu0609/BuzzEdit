@@ -294,6 +294,8 @@ input:focus, textarea:focus, select:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
   height: 48px;
   padding: 0 16px;
   background: var(--bg-secondary);
@@ -319,11 +321,14 @@ input:focus, textarea:focus, select:focus {
   display: flex;
   align-items: center;
   gap: 16px;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 .logo {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 .logo-text {
   font-weight: 600;
@@ -333,10 +338,17 @@ input:focus, textarea:focus, select:focus {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
+.header-project > * { flex-shrink: 0; }
 .project-name {
   font-size: 13px;
   color: var(--text-secondary);
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .processing-indicator {
   font-size: 12px;
@@ -346,10 +358,51 @@ input:focus, textarea:focus, select:focus {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
+.header-actions .btn { gap: 4px; }
+.header-resolution {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.header-resolution select { padding: 4px 8px; max-width: 170px; }
 .window-controls {
   display: flex;
   gap: 8px;
+  flex-shrink: 0;
+}
+
+/* Narrow / restored window: header actions drop their text and keep the icon
+   (each button keeps its tooltip), so nothing is pushed past the window edge. */
+@media (max-width: 1440px) {
+  .header-actions .header-label { display: none; }
+  .header-resolution select { max-width: 120px; }
+}
+@media (max-width: 1100px) {
+  .logo-text { display: none; }
+  .header-left { gap: 10px; }
+  .header .badge { display: none; }
+}
+@media (max-width: 900px) {
+  .header { padding: 0 8px; gap: 8px; }
+  .header-project { display: none; }
+  .header-resolution select { max-width: 90px; }
+  .menubar-btn { padding: 6px 7px; }
+}
+/* Half-screen and smaller (the window's floor is 640px). The menus would
+   otherwise run under the action buttons. Settings and New Project go —
+   both are in the File menu — and everything else tightens. */
+@media (max-width: 820px) {
+  .header-optional { display: none; }
+  .header-left,
+  .header-actions { gap: 6px; }
+  .menubar { margin-left: 0; }
+  /* Beats the compact-density padding rule further down. */
+  :root .header .menubar .menubar-btn { padding: 6px 5px; }
+  .header-resolution select { max-width: 72px; padding: 4px; }
+  .window-controls { gap: 4px; }
 }
 .window-btn {
   width: 24px;
@@ -516,15 +569,19 @@ input:focus, textarea:focus, select:focus {
 }
 
 /* Toolbar */
+/* Wraps onto a second row in a narrow preview instead of clipping the
+   right-hand controls (Auto Edit, the sliders, Hide Transcript…). */
 .toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  padding: 12px 16px;
+  padding: 10px 12px;
   background: var(--bg-secondary);
   border-top: 1px solid var(--border);
   flex-shrink: 0;
 }
+.toolbar > * { flex-shrink: 0; white-space: nowrap; }
 .toolbar-spacer {
   flex: 1;
 }
@@ -1193,6 +1250,32 @@ input:focus, textarea:focus, select:focus {
   flex: 1;
 }
 
+/* Studio job banner — a different project rendering for BuzzcafStudio */
+.studio-job-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.studio-job-banner-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+  animation: studio-job-pulse 1.6s ease-in-out infinite;
+}
+@keyframes studio-job-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.studio-job-banner-text { flex: 1; }
+.studio-job-banner-text strong { color: var(--text-primary); }
+
 /* Processing Overlay */
 .processing-overlay {
   position: fixed;
@@ -1500,14 +1583,16 @@ input:focus, textarea:focus, select:focus {
 }
 .media-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
 }
 .media-head-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
-  flex-shrink: 0;
+  min-width: 0;
 }
 .media-toolbar {
   display: flex;
@@ -1631,6 +1716,201 @@ input:focus, textarea:focus, select:focus {
   background: rgba(0, 0, 0, 0.72);
   color: #fff;
   pointer-events: none;
+}
+.media-generated-badge {
+  position: absolute;
+  bottom: 4px;
+  left: 4px;
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(88, 101, 242, 0.85);
+  color: #fff;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  pointer-events: none;
+}
+.media-eye-badge {
+  position: absolute;
+  bottom: 4px;
+  right: 4px;
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(46, 160, 67, 0.88);
+  color: #fff;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  pointer-events: none;
+}
+.media-eye-progress {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 6px;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 10px;
+  text-align: center;
+}
+.media-eye-progress-bar {
+  width: 85%;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.2);
+  overflow: hidden;
+}
+.media-eye-progress-bar > div {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.4s;
+}
+.eye-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+.eye-dialog {
+  width: 340px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  display: flex;
+  gap: 16px;
+  padding: 16px;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+}
+.eye-dialog-title {
+  font-weight: 600;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.eye-dialog label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.eye-dialog-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.eye-dialog.wide {
+  width: 1100px;
+}
+.eye-dialog-settings {
+  width: 308px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.eye-dialog-preview {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.eye-preview-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.eye-preview-progress {
+  z-index: 2;
+  border-radius: 6px;
+  font-size: 12px;
+}
+.eye-preview-error {
+  color: #f87171;
+  word-break: break-word;
+}
+.eye-preview-stale {
+  color: #fbbf24;
+}
+.eye-compare {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.eye-compare-stage {
+  position: relative;
+  width: 100%;
+  max-height: calc(100vh - 160px);
+  background: #000;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.eye-compare-stage.split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+}
+.eye-compare-cell {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+.eye-compare-stage.split .eye-compare-cell {
+  position: relative;
+  inset: auto;
+}
+.eye-compare-cell.hidden {
+  visibility: hidden;
+}
+.eye-compare-cell video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  cursor: zoom-in;
+  transition: transform 0.15s;
+}
+.eye-compare-label {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 11px;
+  pointer-events: none;
+}
+.eye-compare-label.after {
+  background: var(--accent);
+}
+.eye-compare-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.eye-compare-controls input[type=range] {
+  flex: 1;
+}
+.eye-compare-modes {
+  display: flex;
+  gap: 4px;
 }
 .media-actions {
   position: absolute;
@@ -1922,7 +2202,9 @@ input:focus, textarea:focus, select:focus {
 
 /* A zone holding several panels shows them as tabs instead. The strip scrolls
    rather than wrapping: a wrapped strip changes the panel's header height as
-   the zone is resized, and the body jumps under the cursor mid-drag. */
+   the zone is resized, and the body jumps under the cursor mid-drag.
+   Tabs shrink (with an ellipsis; the full name is in the tooltip) before the
+   strip has to scroll, so in a narrow zone every tab stays reachable. */
 .dock-panel-bar.tabbed { cursor: default; padding-left: 4px; }
 .dock-tabs {
   flex: 1;
@@ -1934,7 +2216,10 @@ input:focus, textarea:focus, select:focus {
 }
 .dock-tabs::-webkit-scrollbar { display: none; }
 .dock-tab {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-width: 36px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding: 3px 9px;
   border: none;
   border-radius: 4px 4px 0 0;
@@ -1979,6 +2264,24 @@ input:focus, textarea:focus, select:focus {
   overflow: hidden;
 }
 .dock-panel-body > * { flex: 1; min-height: 0; }
+/* Panel contents must shrink with their zone. Flex and grid children default
+   to min-width:auto, so a select, input or nowrap button kept its content
+   width and ran past the panel's right edge in a narrow window (Agents and
+   Export clipped even at 900px). Buttons wrap their label instead. */
+.dock-panel-body select,
+.dock-panel-body textarea,
+.dock-panel-body input:not([type="checkbox"]):not([type="radio"]):not([type="color"]) {
+  min-width: 0;
+  max-width: 100%;
+}
+.dock-panel-body .panel-content .btn,
+.dock-panel-body .inspector .btn {
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+}
+.dock-panel-body .insp-control { flex-wrap: wrap; }
+.dock-panel-body .timeline-header > div { flex-wrap: wrap; }
 
 .dock-menu {
   position: absolute;
@@ -2293,6 +2596,7 @@ input:focus, textarea:focus, select:focus {
 .menubar {
   display: flex;
   align-items: stretch;
+  flex-shrink: 0;
   margin-left: 8px;
   -webkit-app-region: no-drag;
 }
@@ -2485,6 +2789,21 @@ input:focus, textarea:focus, select:focus {
   margin-bottom: 10px;
 }
 .pref-status .dot { width: 9px; height: 9px; border-radius: 50%; }
+
+.lock-toggle {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  border-radius: var(--radius);
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.lock-toggle.active {
+  background: var(--accent);
+  color: var(--accent-ink, #fff);
+  border-color: var(--accent);
+}
 .dot.ok { background: var(--success); }
 .dot.warn { background: var(--warning); }
 .dot.bad { background: var(--danger); }
@@ -2845,3 +3164,192 @@ input:focus, textarea:focus, select:focus {
   letter-spacing: 0.05em;
   text-transform: uppercase;
 }
+
+/* F1: playhead follow mode */
+.timeline-follow {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.timeline-follow select {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 11px;
+  padding: 2px 4px;
+}
+
+/* F2: the marked in/out range, waiting on "Cut range" */
+.mark-range-band {
+  background: rgba(250, 204, 21, 0.16);
+  border-left: 1px solid rgba(250, 204, 21, 0.6);
+  border-right: 1px solid rgba(250, 204, 21, 0.6);
+}
+
+/* F4: small chips summarising a clip's dressing — zoom, fade, grade, effects —
+   the only place any of that is visible before render. */
+.clip-chips {
+  display: flex;
+  gap: 2px;
+}
+.clip-chip {
+  padding: 0 4px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 9px;
+  line-height: 1.5;
+  white-space: nowrap;
+  opacity: 0.9;
+}
+
+/* F3: transcript search + replace */
+.transcript-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 10px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.transcript-search-input {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  padding: 3px 7px;
+  min-width: 140px;
+}
+.transcript-search-count {
+  min-width: 46px;
+}
+.transcript-replaced-msg {
+  color: var(--success);
+}
+/* A search hit, word view. */
+.transcript-word.is-match {
+  box-shadow: inset 0 0 0 1px var(--warning);
+}
+.transcript-word.is-current-match {
+  background: rgba(250, 204, 21, 0.35);
+}
+/* A search hit, segment view — the textarea it renders into can't host an
+   inline highlight, so the whole row lights up instead. */
+.transcript-segment.has-match {
+  box-shadow: inset 3px 0 0 var(--warning);
+}
+.transcript-segment.current-match {
+  background: rgba(250, 204, 21, 0.12);
+}
+
+/* ==========================================================================
+   Timeline: right-click menu, box select, snap guide, rename dialog
+   ========================================================================== */
+
+/* The Edit and Timeline menus are long now; keep them inside the window. */
+.menu-dropdown { max-height: calc(100vh - 60px); overflow-y: auto; }
+
+.ctx-menu {
+  position: fixed;
+  min-width: 250px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  padding: 4px;
+  z-index: 3000;
+  user-select: none;
+}
+.ctx-submenu { position: absolute; left: 100%; top: -5px; margin-left: 2px; }
+.ctx-row { position: relative; }
+.ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  padding: 6px 10px 6px 4px;
+  font-size: 13px;
+  text-align: left;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.ctx-item:hover:not(:disabled) { background: var(--accent); color: var(--accent-ink, #fff); }
+.ctx-item:disabled { color: var(--text-muted); cursor: default; }
+.ctx-item.danger:not(:disabled) { color: #f87171; }
+.ctx-item.danger:hover:not(:disabled) { background: var(--danger); color: #fff; }
+.ctx-check { width: 14px; text-align: center; flex: none; }
+.ctx-label { flex: 1; white-space: nowrap; }
+.ctx-chord {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace;
+  padding-left: 20px;
+}
+.ctx-item:hover:not(:disabled) .ctx-chord { color: rgba(255, 255, 255, 0.85); }
+.ctx-sep { height: 1px; background: var(--border); margin: 4px 6px; }
+
+.timeline-marquee {
+  position: absolute;
+  border: 1px solid var(--accent);
+  background: rgba(59, 130, 246, 0.15);
+  pointer-events: none;
+  z-index: 6;
+}
+.timeline-snap-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 1px dashed #facc15;
+  pointer-events: none;
+  z-index: 6;
+}
+.timeline-clip.dragging { opacity: 0.85; box-shadow: 0 0 0 1px #facc15; }
+.clip-link { margin-right: 3px; font-size: 9px; opacity: 0.9; }
+.timeline-notice {
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+.btn.btn-toggle-on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink, #fff); }
+
+.timeline-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3000;
+}
+.timeline-dialog {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: 16px;
+  width: min(360px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.timeline-dialog-title { font-size: 14px; font-weight: 600; }
+.timeline-dialog input {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  color: var(--text-primary);
+  padding: 6px 8px;
+  font-size: 13px;
+}
+.timeline-dialog-actions { display: flex; justify-content: flex-end; gap: 6px; }

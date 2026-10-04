@@ -48,12 +48,42 @@ const COMFY_CODE = process.env.COMFY_CODE || 'C:/Users/singh/ComfyUI-Installs/Co
 const COMFY_DATA = process.env.COMFY_DATA || 'C:/Users/singh/Documents/ComfyUI';
 const COMFY_PYTHON = process.env.COMFY_PYTHON || path.join(COMFY_DATA, '.venv', 'Scripts', 'python.exe');
 
+// Started for a background render (Buzzcaf Studio sets BUZZEDIT_HEADLESS=1 when
+// it auto-launches us), the window is created but never shown: the tray icon's
+// "Show" -- or a click on it -- brings it up if anyone wants to look.
+const HEADLESS = process.env.BUZZEDIT_HEADLESS === '1' || process.argv.includes('--headless');
+
+// Backend and ComfyUI output used to go only to this process's console, which
+// nobody sees under the silent launcher -- a render that died left no trace of
+// FFmpeg's stderr anywhere. Append it to logs\backend.log as well.
+const backendLogPath = path.join(__dirname, '../logs/backend.log');
+let backendLogStream = null;
+function logLine(prefix, data) {
+  const text = `${prefix}${data}`;
+  if (prefix.startsWith('Backend err') || prefix.startsWith('ComfyUI err')) console.error(text);
+  else console.log(text);
+  try {
+    if (!backendLogStream) {
+      fs.mkdirSync(path.dirname(backendLogPath), { recursive: true });
+      backendLogStream = fs.createWriteStream(backendLogPath, { flags: 'a' });
+    }
+    const stamp = new Date().toISOString();
+    backendLogStream.write(`${stamp} ${text}${text.endsWith('\n') ? '' : '\n'}`);
+  } catch (err) {
+    // Logging must never take the app down.
+  }
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
-    minWidth: 1000,
-    minHeight: 700,
+    show: !HEADLESS,
+    // Low enough for a half-screen snap on a 1080p display (960px) — with the
+    // old 1000px floor Windows let the window run past the screen edge and its
+    // right side was cut off. The layout fits itself down to this size.
+    minWidth: 640,
+    minHeight: 480,
     frame: false,
     backgroundColor: '#0f0f0f',
     webPreferences: {
@@ -159,12 +189,43 @@ async function startComfyUI(adopt) {
       windowsHide: true,
     },
   );
-  comfyProcess.stdout?.on('data', (d) => console.log(`ComfyUI: ${d}`));
-  comfyProcess.stderr?.on('data', (d) => console.error(`ComfyUI err: ${d}`));
-  comfyProcess.on('close', (code) => {
-    console.log(`ComfyUI exited with code ${code}`);
-    comfyProcess = null;
+  const child = comfyProcess;
+  child.stdout?.on('data', (d) => logLine('ComfyUI: ', d));
+  child.stderr?.on('data', (d) => logLine('ComfyUI err: ', d));
+  child.on('close', (code, signal) => {
+    logLine('ComfyUI: ', `exited with code ${code}${signal ? ` (signal ${signal})` : ''}`);
+    if (comfyProcess === child) comfyProcess = null;
+    // Nothing stops ComfyUI on purpose except quitting the app, so any other
+    // exit is a crash (or a sleep/wake that took the GPU context with it). A
+    // production waiting on it would otherwise sit out a timeout per asset.
+    if (!quitting) scheduleComfyRestart();
   });
+}
+
+// Restarts after an unexpected exit: a short pause (the port and the GPU need
+// a moment), then again with a longer one, giving up after a few attempts in a
+// short window so a ComfyUI that cannot start does not loop forever.
+const COMFY_RESTART_DELAYS_MS = [5000, 15000, 60000];
+const COMFY_RESTART_WINDOW_MS = 10 * 60 * 1000;
+let comfyRestarts = [];
+let comfyRestartTimer = null;
+
+function scheduleComfyRestart() {
+  if (comfyRestartTimer || comfyProcess) return;
+  const now = Date.now();
+  comfyRestarts = comfyRestarts.filter((t) => now - t < COMFY_RESTART_WINDOW_MS);
+  if (comfyRestarts.length >= COMFY_RESTART_DELAYS_MS.length) {
+    logLine('ComfyUI err: ', `crashed ${comfyRestarts.length} times in 10 minutes -- not restarting again; restart BuzzEdit`);
+    return;
+  }
+  const delay = COMFY_RESTART_DELAYS_MS[comfyRestarts.length];
+  comfyRestarts.push(now);
+  logLine('ComfyUI: ', `restarting in ${delay / 1000}s (attempt ${comfyRestarts.length})`);
+  comfyRestartTimer = setTimeout(() => {
+    comfyRestartTimer = null;
+    if (quitting || comfyProcess) return;
+    startComfyUI(false).catch((err) => logLine('ComfyUI err: ', `restart failed: ${err}`));
+  }, delay);
 }
 
 async function startBackend(adopt) {
@@ -211,11 +272,11 @@ async function startBackend(adopt) {
     });
 
     backendProcess.stdout?.on('data', (data) => {
-      console.log(`Backend: ${data}`);
+      logLine('Backend: ', data);
     });
 
     backendProcess.stderr?.on('data', (data) => {
-      console.error(`Backend err: ${data}`);
+      logLine('Backend err: ', data);
     });
 
     backendProcess.on('close', (code) => {
@@ -319,6 +380,10 @@ app.whenReady().then(async () => {
 
 function stopBackend() {
   const pending = [];
+  if (comfyRestartTimer) {
+    clearTimeout(comfyRestartTimer);
+    comfyRestartTimer = null;
+  }
   if (backendProcess && backendProcess.pid) {
     // Kill the whole tree — the python launcher may have spawned children
     // (e.g. uvicorn workers) that would otherwise keep the port held.
@@ -348,6 +413,34 @@ app.on('before-quit', (event) => {
     .catch((err) => console.warn('Teardown problem:', err))
     .finally(() => app.quit());
 });
+
+// Started headless by the desktop Studio (BUZZCAF_STUDIO_PID): live only as
+// long as it does. The Studio stops us when it closes normally, but a crash, a
+// killed process or a closed console runs no cleanup, and this BuzzEdit would
+// then hold Whisper, the aligner and ComfyUI's models on the GPU with nobody
+// left to use them. `process.kill(pid, 0)` only tests that the pid exists (it
+// never signals on Windows); EPERM means it exists and is someone else's.
+const STUDIO_PID = Number(process.env.BUZZCAF_STUDIO_PID || 0);
+const STUDIO_POLL_MS = 3000;
+
+function studioAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+if (HEADLESS && STUDIO_PID > 0) {
+  const watch = setInterval(() => {
+    if (quitting || studioAlive(STUDIO_PID)) return;
+    clearInterval(watch);
+    console.log(`Buzzcaf Studio (pid ${STUDIO_PID}) is gone; quitting the headless BuzzEdit it started.`);
+    app.quit();
+  }, STUDIO_POLL_MS);
+  watch.unref();
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

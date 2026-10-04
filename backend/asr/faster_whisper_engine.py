@@ -23,6 +23,17 @@ def _forced_alignment_enabled() -> bool:
         return True
 
 
+def _gap_recovery_enabled() -> bool:
+    """Whether to decode again the speech the main pass left without words (see
+    gap_recovery.py). On by default; the `gap_recovery` app setting turns it off."""
+    try:
+        from store.app_settings import AppSettings
+        value = AppSettings().get("gap_recovery")
+        return True if value is None else bool(value)
+    except Exception:
+        return True
+
+
 def register_cuda_dll_directories():
     """Register CUDA DLL directories on Windows for CTranslate2 / faster-whisper."""
     if sys.platform != "win32":
@@ -101,6 +112,69 @@ def choose_language(pooled: dict) -> str:
     return best
 
 
+# Whisper's `initial_prompt` biases decoding toward words it contains, which is
+# exactly what the user's own script vocabulary (proper nouns, brand names,
+# loanwords) is for. Bounded well under Whisper's own ~224-token prompt window
+# so it never gets silently truncated mid-word.
+_MAX_INITIAL_PROMPT_TOKENS = 200
+
+
+def _build_initial_prompt(vocabulary: Optional[List[str]]) -> Optional[str]:
+    """Join `vocabulary` into a whitespace-separated prompt, capped at
+    `_MAX_INITIAL_PROMPT_TOKENS` words. `None` (Whisper's own default) when
+    there is nothing to bias with."""
+    if not vocabulary:
+        return None
+    words = [str(w).strip() for w in vocabulary if str(w or "").strip()]
+    if not words:
+        return None
+    return " ".join(words[:_MAX_INITIAL_PROMPT_TOKENS])
+
+
+# A segment is "broken" -- worth one more decode -- when it is a real
+# hallucination loop: the same few words over and over. Whisper's own test
+# (zlib compression ratio > 2.4) cannot be used: Devanagari is 3 bytes a
+# character and compresses far better than Latin text, so 26 of 36 perfectly
+# normal segments of a real Hinglish take "failed" it -- which is also why
+# Whisper's built-in temperature fallback re-decoded nearly everything and a
+# 13:50 take took 20 minutes. Low confidence alone is no reason either: it is
+# normal for Hinglish and retrying it bought nothing.
+RETRY_TEMPERATURES = (0.2, 0.4, 0.6)
+LOOP_MIN_WORDS = 12
+LOOP_MAX_DISTINCT_SHARE = 0.3
+
+
+def _is_broken(segment) -> bool:
+    words = (getattr(segment, "text", "") or "").split()
+    if len(words) < LOOP_MIN_WORDS:
+        return False
+    return len(set(words)) / len(words) < LOOP_MAX_DISTINCT_SHARE
+
+
+def _retry_broken_segments(model, audio_path: str, segments: list, language, task, prompt) -> list:
+    """Re-decode just the broken segments at a little temperature and keep a
+    retry only when it is no longer broken. Everything else is untouched."""
+    broken = {i for i, seg in enumerate(segments) if _is_broken(seg)}
+    if not broken:
+        return segments
+    logger.info("Whisper: retrying %d of %d segments that decoded badly", len(broken), len(segments))
+    fixed: list = []
+    for index, seg in enumerate(segments):
+        if index not in broken:
+            fixed.append(seg)
+            continue
+        try:
+            retry = list(model.transcribe(
+                audio_path, language=language, task=task, word_timestamps=True,
+                vad_filter=False, condition_on_previous_text=False, initial_prompt=prompt,
+                temperature=RETRY_TEMPERATURES, clip_timestamps=[float(seg.start), float(seg.end)])[0])
+        except Exception as e:
+            logger.debug("Segment retry at %.1fs failed: %s", seg.start, e)
+            retry = []
+        fixed.extend(retry if retry and not any(_is_broken(r) for r in retry) else [seg])
+    return fixed
+
+
 class FasterWhisperEngine:
     _instance: Optional["FasterWhisperEngine"] = None
 
@@ -110,6 +184,7 @@ class FasterWhisperEngine:
             cls._instance.model = None
             cls._instance.model_device = None
             cls._instance.model_size = "large-v3"
+            cls._instance.last_gap_report = None
         return cls._instance
 
     def load_model(self, device: str = "cuda", compute_type: str = "float16") -> WhisperModel:
@@ -183,9 +258,14 @@ class FasterWhisperEngine:
         audio_path: str,
         language: Optional[str],
         task: str = "transcribe",
+        vocabulary: Optional[List[str]] = None,
+        glossary: Optional[Dict[str, str]] = None,
     ) -> tuple[List[Dict[str, Any]], str]:
         """Run one Whisper pass. `language=None` auto-detects the spoken language;
         `task="translate"` produces English regardless of source language.
+        `vocabulary` (Latin words from the user's script) both biases decoding
+        via `initial_prompt` and feeds the post-decode Hinglish romanizer;
+        `glossary` (channel spelling overrides) only feeds the romanizer.
         Returns (words, detected_language)."""
         # Measured on a 195s Hinglish recording from this repo (words / p90 word
         # duration / words over 1s, where a real spoken word is 0.2-0.5s):
@@ -203,6 +283,14 @@ class FasterWhisperEngine:
             # atypical opening (music, English greeting) mislabels the whole
             # file. Detect over several windows spread through the recording.
             language = self._detect_language_pooled(model, audio_path)
+        # One deterministic greedy-beam pass (temperature 0), then a retry of
+        # only the segments that came out broken. Whisper's default fallback
+        # re-decodes any doubtful segment at rising temperatures; on Hinglish
+        # that fired constantly -- measured on 180 s of a real recording: 220 s
+        # and a different transcript every run, against 34 s and an identical
+        # one at temperature 0 with the same word count. The full 13:50 take
+        # went from 20 minutes to about 2.5.
+        prompt = _build_initial_prompt(vocabulary)
         segments, info = model.transcribe(
             audio_path,
             language=language,
@@ -210,29 +298,33 @@ class FasterWhisperEngine:
             word_timestamps=True,
             vad_filter=False,
             condition_on_previous_text=False,
+            initial_prompt=prompt,
+            temperature=0.0,
         )
+        segments = _retry_broken_segments(model, audio_path, list(segments), language, task, prompt)
         detected = getattr(info, "language", language) or "en"
         # Only romanize the transcribe pass. The translate pass already emits
         # English (Latin) text, which must not be run through the Indic cleanup.
         romanize = task == "transcribe" and is_transliterable(detected)
-        extracted_words: List[Dict[str, Any]] = []
-        for seg in segments:
-            if seg.words:
-                for w in seg.words:
-                    native = w.word
-                    # word == the primary display token. For non-Latin languages
-                    # this becomes the Hinglish (romanized) form so captions and
-                    # the timeline read in Latin letters; for English it is a
-                    # no-op passthrough.
-                    hinglish = to_hinglish(native, detected) if romanize else native
-                    extracted_words.append({
-                        "word": hinglish,
-                        "word_native": native,
-                        "hinglish": hinglish,
-                        "start": w.start,
-                        "end": w.end,
-                        "probability": w.probability
-                    })
+
+        def make_word(w) -> Dict[str, Any]:
+            native = w.word
+            # word == the primary display token. For non-Latin languages this
+            # becomes the Hinglish (romanized) form so captions and the timeline
+            # read in Latin letters; for English it is a no-op passthrough.
+            hinglish = (to_hinglish(native, detected, vocabulary=vocabulary, glossary=glossary)
+                        if romanize else native)
+            return {
+                "word": hinglish,
+                "word_native": native,
+                "hinglish": hinglish,
+                "start": w.start,
+                "end": w.end,
+                "probability": w.probability,
+            }
+
+        extracted_words: List[Dict[str, Any]] = [
+            make_word(w) for seg in segments for w in (seg.words or [])]
 
         # Replace Whisper's unreliable word times with acoustically-aligned ones.
         # Whisper's cross-attention timestamps drift by many seconds on this
@@ -241,14 +333,44 @@ class FasterWhisperEngine:
         # deterministic and accurate; it is optional and degrades to the Whisper
         # timings when its model is not installed. Only the transcribe pass — the
         # translate pass is English text we never cut on.
-        if task == "transcribe" and extracted_words and _forced_alignment_enabled():
+        aligning = task == "transcribe" and _forced_alignment_enabled()
+
+        def align(words_in: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             try:
                 from .forced_align import align_words
-                extracted_words = align_words(
-                    audio_path, extracted_words, detected,
-                    device=self.model_device or "cuda")
+                return align_words(audio_path, words_in, detected, device=self.model_device or "cuda")
             except Exception as e:
                 logger.warning("Forced-alignment step errored (%s); using Whisper timings.", e)
+                return words_in
+
+        if aligning and extracted_words:
+            extracted_words = align(extracted_words)
+        if task == "transcribe":
+            self.last_gap_report = None
+        # Speech the main pass skipped (a repeated take, a restart) is decoded again on
+        # its own, then everything is aligned together: the aligner fits the whole
+        # transcript to the whole recording, so a hole bends the words around it.
+        if task == "transcribe" and extracted_words and _gap_recovery_enabled():
+            from .gap_recovery import recover_gaps
+            try:
+                import torch
+                torch.cuda.empty_cache()        # the aligner's cache, before Whisper decodes again
+            except Exception:
+                pass
+            extracted_words, self.last_gap_report = recover_gaps(
+                model, audio_path, extracted_words, detected, make_word, initial_prompt=prompt)
+            if aligning and self.last_gap_report.get("recovered_words"):
+                # Only the recovered words, each against its own hole's audio. Aligning the
+                # whole recording a second time doubled the pass and, on a 28-minute file,
+                # spilled the GPU into shared memory until the machine ran out of RAM.
+                try:
+                    from .forced_align import align_in_windows
+                    recovered = [w for w in extracted_words if w.get("recovered")]
+                    align_in_windows(audio_path, recovered, self.last_gap_report.get("gap_list") or [],
+                                     device=self.model_device or "cuda")
+                except Exception as e:
+                    logger.warning("Aligning recovered words errored (%s); keeping Whisper timings.", e)
+                extracted_words.sort(key=lambda w: float(w.get("start") or 0.0))
         return extracted_words, detected
 
     def _detect_language_pooled(self, model: WhisperModel, audio_path: str) -> Optional[str]:
@@ -291,17 +413,18 @@ class FasterWhisperEngine:
         return decided
 
     def _transcribe_with_fallback(
-        self, audio_path: str, language: Optional[str], task: str = "transcribe"
+        self, audio_path: str, language: Optional[str], task: str = "transcribe",
+        vocabulary: Optional[List[str]] = None, glossary: Optional[Dict[str, str]] = None,
     ) -> tuple[List[Dict[str, Any]], str]:
         """Load the model (CUDA, then CPU int8 on failure) and run one pass."""
         model = self.load_model(device="cuda", compute_type="float16")
         try:
-            return self._do_transcribe(model, audio_path, language, task)
+            return self._do_transcribe(model, audio_path, language, task, vocabulary, glossary)
         except Exception as e:
             logger.warning(f"faster-whisper CUDA execution error ({e}). Retrying on CPU (int8)...")
             self.model = None
             model = self.load_model(device="cpu", compute_type="int8")
-            return self._do_transcribe(model, audio_path, language, task)
+            return self._do_transcribe(model, audio_path, language, task, vocabulary, glossary)
 
     async def preload_async(self) -> None:
         """Load the model without transcribing, so a caller can show a distinct
@@ -322,7 +445,9 @@ class FasterWhisperEngine:
     async def transcribe_words_async(
         self,
         audio_path: str,
-        language: Optional[str] = None
+        language: Optional[str] = None,
+        vocabulary: Optional[List[str]] = None,
+        glossary: Optional[Dict[str, str]] = None,
     ) -> tuple[List[Dict[str, Any]], str]:
         """Transcribe and report the language that was used.
 
@@ -332,6 +457,11 @@ class FasterWhisperEngine:
         `en` pass does not transcribe it — it paraphrases it into English. That
         produced a timeline whose "words" were English translation tokens with no
         relationship to the audio, which is why cuts landed in arbitrary places.
+
+        `vocabulary` (Latin words from the user's script) biases decoding via
+        `initial_prompt` and helps the Hinglish romanizer restore English
+        loanwords Whisper wrote out in Devanagari; `glossary` (channel spelling
+        overrides, already merged) only affects the romanizer.
         """
         await gpu_broker.acquire_lease("faster_whisper", required_vram_mb=3000.0)
         try:
@@ -341,14 +471,17 @@ class FasterWhisperEngine:
             # last phase looking dead for the entire transcription. to_thread keeps
             # the loop live so progress and cancellation still flow.
             return await asyncio.to_thread(
-                self._transcribe_with_fallback, audio_path, language, "transcribe")
+                self._transcribe_with_fallback, audio_path, language, "transcribe",
+                vocabulary, glossary)
         finally:
             await gpu_broker.release_lease("faster_whisper")
 
     async def transcribe_audio_async(
         self,
         audio_path: str,
-        language: Optional[str] = None
+        language: Optional[str] = None,
+        vocabulary: Optional[List[str]] = None,
+        glossary: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Transcribe audio with CUDA acceleration and automatic CPU fallback.
@@ -356,13 +489,15 @@ class FasterWhisperEngine:
         forcing English. Words are returned in the native script with an added
         romanized `hinglish` field; `word` holds the romanized form.
         """
-        words, _ = await self.transcribe_words_async(audio_path, language)
+        words, _ = await self.transcribe_words_async(audio_path, language, vocabulary, glossary)
         return words
 
     async def transcribe_full_async(
         self,
         audio_path: str,
-        language: Optional[str] = None
+        language: Optional[str] = None,
+        vocabulary: Optional[List[str]] = None,
+        glossary: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Full transcription for the transcript panel: native words (with Hinglish),
@@ -377,7 +512,8 @@ class FasterWhisperEngine:
             # decode block, and running them inline freezes the server for the
             # whole pass.
             words, detected = await asyncio.to_thread(
-                self._transcribe_with_fallback, audio_path, language, "transcribe")
+                self._transcribe_with_fallback, audio_path, language, "transcribe",
+                vocabulary, glossary)
             native_text = " ".join(w["word_native"] for w in words).strip()
             hinglish_text = " ".join(w["hinglish"] for w in words).strip()
 
@@ -399,6 +535,7 @@ class FasterWhisperEngine:
                 "native_text": native_text,
                 "hinglish_text": hinglish_text,
                 "english_text": english_text,
+                "gap_recovery": getattr(self, "last_gap_report", None),
             }
         finally:
             await gpu_broker.release_lease("faster_whisper")

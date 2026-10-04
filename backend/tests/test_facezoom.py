@@ -186,7 +186,8 @@ def test_re_running_replaces_the_previous_punches():
     punches = [WindowZoom(start_s=5.0, end_s=6.5, depth=0.15)]
     for _ in range(3):
         apply_zooms(timeline, [], punches, {})
-    assert len([i for i in timeline.items if i.origin == "autozoom"]) == 1
+    # One punch is an ease-in, a hold and an ease-out layer.
+    assert len([i for i in timeline.items if i.origin == "autozoom"]) == 3
 
 
 def test_a_move_drifts_toward_the_face_rather_than_starting_on_it():
@@ -232,3 +233,33 @@ def test_a_job_waits_until_its_time():
 def test_an_unreadable_start_time_runs_rather_than_waiting_forever():
     assert resolve_start_at("half past bananas") is None
     assert _is_due({"start_at": "not a date"}) is True
+
+
+def test_a_punch_eases_in_holds_and_eases_back_out_without_a_jump():
+    """The old punch ended at 1+depth and the next frame was back at 1.0x --
+    the jolt that read as jitter. The pieces must join edge to edge at the
+    same scale and end where the shot started."""
+    timeline = _timeline()
+    apply_zooms(timeline, [], [WindowZoom(start_s=5.0, end_s=6.6, depth=0.2)], {})
+    layers = sorted((i for i in timeline.items if i.origin == "autozoom"),
+                    key=lambda i: i.timeline_start_frame)
+    assert len(layers) == 3
+    for a, b in zip(layers, layers[1:]):
+        assert a.timeline_end_frame == b.timeline_start_frame
+        a_end = a.transform.scale_end if a.transform.scale_end is not None else a.transform.scale
+        assert a_end == pytest.approx(b.transform.scale)
+    assert layers[0].transform.scale == pytest.approx(1.0)
+    assert layers[1].transform.scale == pytest.approx(1.2)
+    assert layers[-1].transform.scale_end == pytest.approx(1.0)
+
+
+def test_one_long_take_gets_no_whole_programme_drift():
+    """A precut recording is one V1 segment; a segment move across all of it
+    was invisible motion, a softer picture, and the costliest render chain."""
+    from presentation.facezoom import MAX_ZOOM_SEGMENT_SECONDS, plan_zooms
+    from presentation.models import PresentationSettings, Program, ProgramSegment
+    program = Program(duration_s=473.0, fps=25.0, segments=[ProgramSegment(
+        item_id="v1", tl_start_s=0.0, tl_end_s=473.0, source_start_frame=0, source_end_frame=11825)],
+        words=[])
+    segment_zooms, _ = plan_zooms(program, PresentationSettings(), [], 1, {})
+    assert 473.0 > MAX_ZOOM_SEGMENT_SECONDS and segment_zooms == []

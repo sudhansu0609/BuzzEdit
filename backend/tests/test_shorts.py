@@ -89,3 +89,18 @@ def test_shorts_are_the_best_topics_clipped_to_the_limit_and_never_the_cta():
     start, end, _ = picked[0]
     assert end - start <= shorts.SHORT_MAX_S + 0.5
     assert shorts.pick_shorts(topics, program, 0) == []
+
+
+def test_a_long_topic_keeps_its_conclusion_and_ends_on_a_sentence():
+    from presentation.models import ProgramWord, Program as _Program
+    # 90 s topic, one word per second, a sentence ending every 10th word.
+    words = [ProgramWord(text=f"w{i}." if i % 10 == 9 else f"w{i}", tl_start_s=float(i),
+                         tl_end_s=i + 0.8, source_start_frame=i * 30) for i in range(90)]
+    program = _Program(words=words, duration_s=95.0, fps=30.0)
+    topics = [Topic(start_s=0, end_s=88.5, topic="long", priority=0.9)]
+    (start, end, _), = shorts.pick_shorts(topics, program, 1)
+    assert end - start <= shorts.SHORT_MAX_S + 0.5
+    # Runs on past the topic edge to finish the last sentence (word 89 ends at 89.8).
+    assert end == pytest.approx(89.8 + 0.3, abs=0.01)
+    # Trimmed from the front, at a sentence start (a multiple of 10 s).
+    assert round(start + 0.1) % 10 == 0

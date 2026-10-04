@@ -238,6 +238,63 @@ def import_paths(
     return added, skipped
 
 
+def sync_from_timeline(pool: List[Dict[str, Any]],
+                      timeline_dict: Optional[Dict[str, Any]]) -> bool:
+    """Backfill the library with every source the timeline actually plays.
+
+    A clip dragged straight onto a track, or a source a generation pass wrote in
+    directly, never goes through `import_paths` — so the library could show
+    less than the project actually uses. Reads straight off the timeline's own
+    `SourceFile` entries (no ffprobe: they were already probed once to get in).
+    The first source is the project's own recording (`build_timeline_from_transcript`
+    seeds it alone, before anything else is ever added) and is not tagged
+    `generated`; every other source reached the timeline some other way.
+
+    Returns whether anything was added.
+    """
+    sources = (timeline_dict or {}).get("sources") or {}
+    if not sources:
+        return False
+    known = _existing_sources(pool)
+    primary_id = next(iter(sources), None)
+    added = False
+
+    for source_id, source in sources.items():
+        path = source.get("path") if isinstance(source, dict) else None
+        if not path or str(path).lower() in known:
+            continue
+        candidate = Path(path)
+        fps_num = source.get("fps_num") or 30
+        fps_den = source.get("fps_den") or 1
+        try:
+            size = candidate.stat().st_size
+        except Exception:
+            size = 0
+
+        entry = {
+            "id": f"media_{uuid.uuid4().hex[:8]}",
+            "name": candidate.name,
+            "path": str(path),
+            "source_path": str(path),
+            "kind": source.get("kind") or "video",
+            "duration": source.get("duration_seconds") or 0.0,
+            "width": source.get("width") or 0,
+            "height": source.get("height") or 0,
+            "fps": round(float(fps_num) / float(fps_den), 3) if fps_den else 0.0,
+            "has_audio": source.get("has_audio", True),
+            "size_bytes": size,
+            "linked": True,
+        }
+        if source_id != primary_id:
+            entry["generated"] = True
+
+        pool.append(entry)
+        known.add(str(path).lower())
+        added = True
+
+    return added
+
+
 def decorate(project_id: str, pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Add view-only fields (`missing`, `has_thumb`) without touching stored state."""
     decorated = []

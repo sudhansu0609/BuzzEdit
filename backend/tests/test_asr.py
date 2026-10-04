@@ -53,7 +53,7 @@ async def test_transcription_runs_off_the_event_loop(monkeypatch):
     import time
     from backend.asr.faster_whisper_engine import whisper_engine
 
-    def blocking_decode(audio_path, language, task):
+    def blocking_decode(audio_path, language, task, vocabulary=None, glossary=None):
         time.sleep(0.3)   # stand-in for a real decode
         return ([{"word": "hi", "word_native": "hi", "hinglish": "hi",
                   "start": 0.0, "end": 0.5, "probability": 1.0}], "en")

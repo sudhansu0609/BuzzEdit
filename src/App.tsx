@@ -4,11 +4,13 @@ import { uploadVideo, importVideoPath, getProject } from './hooks/api';
 import { useElectron } from './hooks/api';
 import { useAutoSave, useSessionRecovery } from './hooks/useAutoSave';
 import { useShortcuts } from './hooks/shortcuts';
+import { useTimelineHistoryTracking } from './hooks/history';
 import { useCommand } from './hooks/commands';
 import Header from './components/Header';
 import UploadScreen from './components/UploadScreen';
 import Workspace from './components/Workspace';
 import ProcessingOverlay from './components/ProcessingOverlay';
+import StudioJobBanner from './components/StudioJobBanner';
 import { MEDIA_DND_TYPE } from './components/MediaPool';
 
 // Internal drags (media-pool item -> timeline lane) must not trigger the
@@ -22,6 +24,7 @@ function App() {
 
   useAutoSave();
   useShortcuts();
+  useTimelineHistoryTracking();
   const { recoverSession } = useSessionRecovery();
 
   useEffect(() => {
@@ -165,6 +168,7 @@ function App() {
     >
       {dragOver && <div className="drop-overlay" />}
       <Header onReset={handleReset} />
+      <StudioJobBanner />
       {!project ? (
         <UploadScreen onFile={handleFile} onPick={handlePickFile} onOpenProject={handleOpenProject} />
       ) : (

@@ -15,14 +15,16 @@ the fluency pass is built on: a missed opportunity is a blemish, a wrong cutaway
 over the speaker's face is a defect.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
 import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+from . import character as character_mod
 from . import genre as genre_mod
-from .models import BEAT_KINDS, Beat, Program, PresentationSettings, ShotPlan, Topic
+from .models import BEAT_KINDS, Beat, Character, Program, PresentationSettings, ShotPlan, Topic
 from .program import transcript_lines
 
 logger = logging.getLogger("presentation.shotplan")
@@ -134,6 +136,21 @@ BEAT_SYSTEM = (
 )
 
 
+THUMBNAIL_CONCEPT_SYSTEM = (
+    "You design the YouTube thumbnail for this video. Read the transcript excerpts and "
+    "the topic list, work out the ONE core idea or payoff the whole video is about, and "
+    "answer with exactly two lines:\n"
+    "TITLE: at most five words, in the language the speaker is using, in capitals, no "
+    "punctuation. It names that core idea and must promise only what the video actually "
+    "delivers -- never invent a claim the transcript does not make, never a generic "
+    "phrase that would fit any video.\n"
+    "SCENE: one sentence for an image generator: a single clear subject doing something "
+    "that shows that core idea literally (the specific objects, place and emotion the "
+    "speaker talks about), close framing, strong contrast. No text, no letters, no logos "
+    "in the scene -- the title is added on top later.\n"
+    "Answer with the two lines only."
+)
+
 THUMBNAIL_TITLE_SYSTEM = (
     "Write a YouTube thumbnail title for this video: at most five words, in the "
     "language the speaker is using, in capitals, no punctuation. It must promise what "
@@ -206,6 +223,13 @@ BEAT_SCHEMA = {
     },
 }
 
+# BEAT_SCHEMA plus the per-beat main-character flag, sent only when the story
+# has a lead -- a video without one keeps the plain schema.
+BEAT_SCHEMA_WITH_CHARACTER = json.loads(json.dumps(BEAT_SCHEMA))
+_beat_item = BEAT_SCHEMA_WITH_CHARACTER["schema"]["properties"]["beats"]["items"]
+_beat_item["properties"]["shows_main_character"] = {"type": "boolean"}
+_beat_item["required"].append("shows_main_character")
+
 # (system_prompt, user_prompt, schema) -> the model's text
 AskJson = Callable[..., Awaitable[Optional[str]]]
 
@@ -250,6 +274,30 @@ async def _ask(ask: AskJson, system: str, user: str,
         return await ask(system, user, schema)
     except TypeError:
         return await ask(system, user)
+
+
+# How many planning calls run at once. The calls within one pass are
+# independent (each topic batch, each scene to vary); run one after another
+# they were ~12 round trips and 4+ minutes of the pass. Four matches LM
+# Studio's default parallel slots and is well inside a remote API's limits.
+PLAN_CALL_CONCURRENCY = 4
+
+
+async def _ask_all(ask: AskJson, calls: List[Tuple[str, str, Any]],
+                   limit: int = PLAN_CALL_CONCURRENCY) -> List[Optional[str]]:
+    """Every (system, user, schema) call at most `limit` at a time; answers
+    in call order, None where a call raised."""
+    gate = asyncio.Semaphore(max(1, limit))
+
+    async def one(system: str, user: str, schema: Any) -> Optional[str]:
+        async with gate:
+            try:
+                return await _ask(ask, system, user, schema)
+            except Exception as e:
+                logger.warning("Planning call failed (%s)", e)
+                return None
+
+    return list(await asyncio.gather(*(one(*call) for call in calls)))
 
 
 def _clean_prompt(text: Optional[str]) -> Optional[str]:
@@ -355,6 +403,19 @@ def sanitize_beats(beats: List[Beat], program: Program,
         if beat.kind == "chart" and not (beat.data.get("values") and beat.data.get("labels")):
             dropped.append({"topic": beat.topic, "reason": "chart with no data"})
             continue
+        if beat.kind == "newspaper" and not settings.newspapers:
+            dropped.append({"topic": beat.topic, "reason": "newspapers are switched off"})
+            continue
+        if beat.kind == "newspaper" and not (beat.data.get("headline") or (beat.text or "").strip()):
+            dropped.append({"topic": beat.topic, "reason": "newspaper with no headline"})
+            continue
+        if beat.kind == "case_file" and not settings.case_files:
+            dropped.append({"topic": beat.topic, "reason": "case files are switched off"})
+            continue
+        if beat.kind == "case_file" and not (
+                beat.data.get("fields") or beat.data.get("title") or (beat.text or "").strip()):
+            dropped.append({"topic": beat.topic, "reason": "case file with no content"})
+            continue
         if beat.is_text and not (beat.text or "").strip():
             dropped.append({"topic": beat.topic, "reason": f"{beat.kind} with no text"})
             continue
@@ -362,6 +423,108 @@ def sanitize_beats(beats: List[Beat], program: Program,
         candidates.append(beat)
 
     return candidates, dropped
+
+
+# --- claim beats that read as a newspaper clipping ---------------------------
+#
+# Newspapers used to come only from entities.py's dated-event beats. Genres
+# whose text-fx palette reaches for a highlighter sweep (text_fx.palette_for)
+# read a claim, a stat or a quote as a clipping too, so some of those cards
+# become full-frame newspaper cutaways instead — the highlighter sweep then
+# has something to land on beyond the handful of dated events.
+_CLAIM_KINDS: Tuple[str, ...] = ("stat_callout", "quote_card", "definition_card")
+_CLAIM_CUE_RE = re.compile(
+    r"\b(research|study|studies|studied|report|reports|reported|according to|"
+    r"survey|surveys|scientists?|researchers?)\b", re.IGNORECASE)
+NEWSPAPER_CONVERT_SECONDS = 4.5
+
+
+def _claim_worthy(beat: Beat) -> bool:
+    """A stat/quote/definition beat that reads as an assertion worth clipping:
+    a quote always does, a stat always does (it is a number by definition),
+    otherwise it needs a number or a research/report cue of its own — or an
+    explicit `data["claim"]` flag from whatever wrote the beat."""
+    if beat.kind not in _CLAIM_KINDS:
+        return False
+    if beat.kind in ("quote_card", "stat_callout"):
+        return True
+    text = f"{beat.text or ''} {beat.subtext or ''}"
+    if re.search(r"\d", text) or _CLAIM_CUE_RE.search(text):
+        return True
+    return bool(isinstance(beat.data, dict) and beat.data.get("claim"))
+
+
+def _newspaper_fields(beat: Beat) -> Dict[str, Optional[str]]:
+    """Headline + a short highlight phrase, both drawn from the beat's own
+    spoken text. The highlight must land inside a single wrapped headline
+    line (presentation.newspaper.render_newspaper) to get a highlight box at
+    all, so it stays to the phrase's first few words rather than the whole
+    thing."""
+    phrase = (beat.text or beat.topic or "").strip().strip("“”\"'").strip()
+    words = phrase.split()
+    headline = " ".join(words[:9]).upper() if words else "BREAKING NEWS"
+    highlight = " ".join(words[:4]) if words else None
+    return {"headline": headline, "highlight": highlight}
+
+
+def newspaper_conversion_gap_s(settings: PresentationSettings) -> float:
+    """The minimum spacing this pass enforces between newspaper cutaways it
+    creates: one every 90s at calm/balanced density, one every 45s at
+    busy/max — mirroring the busy/max split PresentationSettings.crowd_gap_s
+    already makes, just at a newspaper's much coarser scale."""
+    if (settings.density or "").strip().lower() in ("busy", "max"):
+        return 45.0
+    return 90.0
+
+
+def convert_claims_to_newspapers(beats: List[Beat], program: Program,
+                                 settings: PresentationSettings, genre: str,
+                                 genre_secondary: Optional[str] = None) -> List[Beat]:
+    """Some claim/stat/quote beats become newspaper cutaways instead of text
+    cards, in the genres whose blended text-fx palette includes
+    "newspaper_highlight" (presentation.text_fx.palette_for — primary genre at
+    weight 3, `genre_secondary` at weight 1). A no-op everywhere else, and
+    when `settings.newspapers` is off.
+
+    Density-capped (`newspaper_conversion_gap_s`) and additionally spaced at
+    least `settings.crowd_gap_s` from any newspaper beat already in the plan —
+    a run of claims must not turn into a flip-book of clippings.
+    """
+    if not settings.newspapers or not beats:
+        return beats
+    from . import text_fx as text_fx_mod
+    palette = text_fx_mod.palette_for(genre, genre_secondary)
+    if not any(style == "newspaper_highlight" for style, _weight in palette):
+        return beats
+
+    min_gap = max(newspaper_conversion_gap_s(settings), settings.crowd_gap_s)
+    placed_times = sorted(b.start_s for b in beats if b.kind == "newspaper")
+
+    out: List[Beat] = []
+    for beat in sorted(beats, key=lambda b: b.start_s):
+        if beat.kind == "newspaper" or not _claim_worthy(beat) or not (beat.text or "").strip():
+            out.append(beat)
+            continue
+        if any(abs(beat.start_s - t) < min_gap for t in placed_times):
+            out.append(beat)
+            continue
+        fields = _newspaper_fields(beat)
+        if not fields["highlight"]:
+            out.append(beat)
+            continue
+        end_s = min(program.duration_s, beat.start_s + NEWSPAPER_CONVERT_SECONDS)
+        if end_s <= beat.start_s:
+            out.append(beat)
+            continue
+        data = dict(beat.data or {})
+        data.update(headline=fields["headline"], highlight=fields["highlight"])
+        out.append(beat.model_copy(update={
+            "kind": "newspaper", "end_s": end_s, "text": fields["headline"],
+            "subtext": None, "data": data, "priority": max(beat.priority, 0.72),
+        }))
+        placed_times.append(beat.start_s)
+
+    return out
 
 
 def dedup_beats(candidates: List[Beat]) -> Tuple[List[Beat], List[Dict[str, str]]]:
@@ -386,6 +549,40 @@ def dedup_beats(candidates: List[Beat]) -> Tuple[List[Beat], List[Dict[str, str]
             continue
         unique.append(beat)
     return unique, dropped
+
+
+def _ensure_coverage_candidates(unique: List[Beat], program: Program,
+                                settings: PresentationSettings, genre: str,
+                                genre_secondary: Optional[str] = None) -> List[Beat]:
+    """Top up cutaway candidates so there is enough screen time on offer to
+    spend the whole coverage budget: beats x avg seconds >= coverage x
+    duration. However correctly the budget itself is sized, it can only ever
+    keep what it is offered — an LLM plan that proposes too few beats still
+    ships under target no matter how generous the budget math is.
+    """
+    budget = settings.broll_budget_seconds(program.duration_s)
+    have = sum((b.planned_duration_s or min(settings.broll_seconds_max, b.duration_s))
+              for b in unique if b.is_cutaway)
+    if have >= budget:
+        return unique
+    filler = fallback_plan(program, settings, genre, genre_secondary)
+    if not filler:
+        return unique
+    covered = [(b.start_s, b.end_s) for b in unique if b.is_cutaway]
+    extra: List[Beat] = []
+    for beat in filler:
+        if any(beat.start_s < e and s < beat.end_s for s, e in covered):
+            continue
+        # Never outrank what the model itself proposed — this is a top-up for
+        # unclaimed seconds, not a competitor for the budget's best slots.
+        beat = beat.model_copy(update={"priority": min(beat.priority, 0.35),
+                                       "origin": "fallback"})
+        extra.append(beat)
+        covered.append((beat.start_s, beat.end_s))
+    if extra:
+        logger.info("Shot plan: %d filler beats added to reach the coverage budget",
+                    len(extra))
+    return unique + extra
 
 
 def budget_beats(unique: List[Beat], program: Program,
@@ -423,6 +620,11 @@ def budget_beats(unique: List[Beat], program: Program,
         # It is exempt from the coverage budget and keeps only the minimum
         # on-camera gap; it still cannot sit on top of another cutaway.
         requested = beat.origin == "script"
+        # A direction that timed itself (`seconds=`) runs exactly that long and
+        # may sit back to back with the next one: the caller already spaced them.
+        held = requested and bool(beat.data.get("hold")) and bool(beat.planned_duration_s)
+        if held:
+            planned = beat.planned_duration_s
         if not requested and spent + planned > budget + 0.001:
             dropped.append({"topic": beat.topic, "reason": "over the coverage budget"})
             continue
@@ -430,7 +632,7 @@ def budget_beats(unique: List[Beat], program: Program,
             dropped.append({"topic": beat.topic, "reason": "over the cutaway budget"})
             continue
         if _too_close(beat, planned, kept_cutaways,
-                      settings.min_oncamera_gap_s if requested else gap):
+                      0.0 if held else settings.min_oncamera_gap_s if requested else settings.crowd_gap_s):
             dropped.append({"topic": beat.topic, "reason": "too close to another cutaway"})
             continue
         kept_cutaways.append(beat.model_copy(update={"planned_duration_s": round(planned, 3)}))
@@ -479,7 +681,7 @@ def balance_video_share(beats: List[Beat], settings: PresentationSettings) -> Li
 
     # Demote the model's excess, least-important first. The tolerance keeps a
     # plan that is already roughly right from churning.
-    ceiling = min(0.5, share + 0.05)
+    ceiling = min(1.0, share + 0.05)
     # Stage directions name their kind ([broll:] is a still, [video:] a clip)
     # and are neither promoted nor demoted; maps and charts are drawn locally
     # and have no video form.
@@ -626,12 +828,14 @@ async def describe_paragraphs(topics: List[Topic], ask: AskJson,
         return topics
     system = PARAGRAPH_SYSTEM + genre_mod.genre_block(genre)
     out = [t.model_copy() for t in topics]
-    for start in range(0, len(out), TOPIC_BATCH):
-        batch = out[start:start + TOPIC_BATCH]
+    starts = list(range(0, len(out), TOPIC_BATCH))
+    calls = []
+    for start in starts:
         listing = "\n".join(
-            f"{start + i}. {t.summary[:500]}" for i, t in enumerate(batch))
-        answer = await _ask(ask, system, f"Paragraphs:\n{listing}\n\nTopics:",
-                            PARAGRAPH_SCHEMA)
+            f"{start + i}. {t.summary[:500]}" for i, t in enumerate(out[start:start + TOPIC_BATCH]))
+        calls.append((system, f"Paragraphs:\n{listing}\n\nTopics:", PARAGRAPH_SCHEMA))
+    answers = await _ask_all(ask, calls)
+    for start, answer in zip(starts, answers):
         parsed = first_json_object(answer or "")
         if not parsed:
             continue
@@ -656,19 +860,29 @@ async def describe_paragraphs(topics: List[Topic], ask: AskJson,
 
 
 async def write_beats(topics: List[Topic], ask: AskJson,
-                      genre: str = "general") -> List[Beat]:
-    """Turn topics into on-screen beats with generation prompts."""
+                      genre: str = "general",
+                      genre_secondary: Optional[str] = None,
+                      character: Optional[Character] = None) -> List[Beat]:
+    """Turn topics into on-screen beats with generation prompts. With a main
+    character, each beat also says whether it shows them."""
     beats: List[Beat] = []
     by_topic = {t.topic.lower(): t for t in topics}
 
     system = BEAT_SYSTEM + genre_mod.genre_block(genre)
-    for start in range(0, len(topics), TOPIC_BATCH):
-        batch = topics[start:start + TOPIC_BATCH]
+    schema = BEAT_SCHEMA
+    if character is not None:
+        system += character_mod.beat_block(character)
+        schema = BEAT_SCHEMA_WITH_CHARACTER
+    starts = list(range(0, len(topics), TOPIC_BATCH))
+    calls = []
+    for start in starts:
         listing = "\n".join(
             f"{i + 1}. {t.topic} | {t.summary} | suggested visual: {t.visual}"
-            for i, t in enumerate(batch))
-        answer = await _ask(ask, system, f"Topics:\n{listing}\n\nBeats:",
-                            BEAT_SCHEMA)
+            for i, t in enumerate(topics[start:start + TOPIC_BATCH]))
+        calls.append((system, f"Topics:\n{listing}\n\nBeats:", schema))
+    answers = await _ask_all(ask, calls)
+    for start, answer in zip(starts, answers):
+        batch = topics[start:start + TOPIC_BATCH]
         parsed = first_json_object(answer or "")
         if not parsed:
             logger.warning("Beats: no usable answer for topics %d-%d",
@@ -701,16 +915,18 @@ async def write_beats(topics: List[Topic], ask: AskJson,
                 # asked for it, but a local model forgets, and one off-mood
                 # picture in a horror edit reads as a mistake.
                 image_prompt=genre_mod.apply_look(
-                    raw.get("image_prompt") or topic.visual or None, genre),
-                video_prompt=genre_mod.apply_look(raw.get("video_prompt"), genre),
+                    raw.get("image_prompt") or topic.visual or None, genre, genre_secondary),
+                video_prompt=genre_mod.apply_look(raw.get("video_prompt"), genre, genre_secondary),
                 popup_text=raw.get("popup_text"),
                 negative_prompt=genre_mod.apply_negative(
                     str(raw.get("negative_prompt")
-                        or "text, watermark, logo, deformed hands, blurry"), genre),
+                        or "text, watermark, logo, deformed hands, blurry"),
+                    genre, genre_secondary),
                 style_hint=(str(raw.get("style_hint", "photoreal")).strip().lower()
                             if str(raw.get("style_hint", "")).strip().lower()
                             in ("photoreal", "illustration", "diagram", "abstract")
                             else "photoreal"),
+                shows_character=bool(character is not None and raw.get("shows_main_character") is True),
             ))
     return beats
 
@@ -754,7 +970,8 @@ VARIATION_SCHEMA = {
 
 async def multiply_beats(beats: List[Beat], settings: PresentationSettings,
                          ask: Optional[AskJson],
-                         genre: str = "general") -> List[Beat]:
+                         genre: str = "general",
+                         genre_secondary: Optional[str] = None) -> List[Beat]:
     """Split each long cutaway topic into several distinct shots.
 
     One beat per topic is a hard ceiling near two cutaways a minute — a 60s
@@ -770,25 +987,37 @@ async def multiply_beats(beats: List[Beat], settings: PresentationSettings,
     # coverage. `floor` keeps every slice at least a full cell — a shorter slice
     # gets its length clamped back up past the gap and collides with its neighbour.
     cell = settings.avg_broll_seconds + settings.cutaway_gap_s
+
+    def slices_for(beat: Beat) -> int:
+        count = int(beat.duration_s // cell) if cell > 0 else 1
+        if not beat.is_cutaway or count < 2 or not beat.image_prompt:
+            return 0
+        return min(MAX_SHOT_SLICES, count)
+
+    to_vary = [b for b in beats if slices_for(b)]
+    answers: Dict[int, Optional[str]] = {}
+    if ask is not None and to_vary:
+        system = VARIATION_SYSTEM + genre_mod.genre_block(genre)
+        replies = await _ask_all(ask, [
+            (system, f"Scene: {b.image_prompt}\nN: {slices_for(b)}\n\nPrompts:", VARIATION_SCHEMA)
+            for b in to_vary])
+        answers = {id(b): reply for b, reply in zip(to_vary, replies)}
+
     out: List[Beat] = []
     for beat in beats:
         span = beat.duration_s
-        count = int(span // cell) if cell > 0 else 1
-        if not beat.is_cutaway or count < 2 or not beat.image_prompt:
+        count = slices_for(beat)
+        if not count:
             out.append(beat)
             continue
-        count = min(MAX_SHOT_SLICES, count)
         prompts: List[str] = []
         if ask is not None:
             try:
-                answer = await _ask(
-                    ask, VARIATION_SYSTEM + genre_mod.genre_block(genre),
-                    f"Scene: {beat.image_prompt}\nN: {count}\n\nPrompts:",
-                    VARIATION_SCHEMA)
+                answer = answers.get(id(beat))
                 parsed = first_json_object(answer or "") or {}
                 # Re-stamp the look: the model rewrites the scene and routinely
                 # drops the mood suffix the base prompt carried.
-                prompts = [_clean_prompt(genre_mod.apply_look(p, genre))
+                prompts = [_clean_prompt(genre_mod.apply_look(p, genre, genre_secondary))
                            for p in parsed.get("prompts", []) or []]
                 prompts = [p for p in prompts if p][:count]
             except Exception as e:
@@ -915,7 +1144,8 @@ def _keywords(words) -> str:
 
 
 def fallback_plan(program: Program, settings: PresentationSettings,
-                  genre: str = "general") -> List[Beat]:
+                  genre: str = "general",
+                  genre_secondary: Optional[str] = None) -> List[Beat]:
     """Beats without a language model: the loudest phrase in each window.
 
     Deliberately worse than the planned version and deliberately still
@@ -957,9 +1187,10 @@ def fallback_plan(program: Program, settings: PresentationSettings,
             priority=0.5,
             image_prompt=genre_mod.apply_look(
                 f"Cinematic documentary photograph representing {subject}, "
-                f"natural lighting, 35mm film still, shallow depth of field", genre),
+                f"natural lighting, 35mm film still, shallow depth of field",
+                genre, genre_secondary),
             negative_prompt=genre_mod.apply_negative(
-                "text, watermark, logo, deformed hands, blurry", genre),
+                "text, watermark, logo, deformed hands, blurry", genre, genre_secondary),
         ))
     return beats
 
@@ -982,10 +1213,21 @@ async def plan_shots(program: Program, settings: PresentationSettings,
     if genre is None:
         genre = await genre_mod.detect_genre(program, ask)
     genre = genre_mod.normalise(genre)
+    # The second genre, when the caller named one distinct from the primary —
+    # blended into the FX palette and B-roll style tags only; see genre.py.
+    genre_secondary = (genre_mod.normalise(settings.genre_secondary)
+                       if settings.genre_secondary else None)
+    if genre_secondary in (None, "general", genre):
+        genre_secondary = None
 
     beats: List[Beat] = []
     topics: List[Topic] = list(script_topics or [])
     source = "llm"
+    # A lead the caller named (or ruled out) wins over asking the model.
+    named = settings.main_character is not None
+    character: Optional[Character] = (
+        character_mod.from_settings(settings.main_character)
+        if named and settings.character_consistency else None)
 
     if ask is not None:
         try:
@@ -1001,8 +1243,10 @@ async def plan_shots(program: Program, settings: PresentationSettings,
                     await enrich(topics)
                 except Exception as e:
                     logger.warning("Topic enrichment failed (%s); acts unweighted", e)
+            if topics and not named and settings.character_consistency and settings.broll:
+                character = await character_mod.find_main_character(program, ask, topics)
             if topics:
-                beats = await write_beats(topics, ask, genre)
+                beats = await write_beats(topics, ask, genre, genre_secondary, character)
                 beats = _weigh_by_act(beats, topics)
         except Exception as e:
             logger.warning("Shot planning failed (%s); falling back to keywords", e)
@@ -1010,7 +1254,9 @@ async def plan_shots(program: Program, settings: PresentationSettings,
 
     if not beats:
         source = "fallback"
-        beats = fallback_plan(program, settings, genre)
+        if not named:
+            character = None    # nothing was tagged by the model
+        beats = fallback_plan(program, settings, genre, genre_secondary)
         if not topics:
             # Everything topic-based — chapters, moods, cards, transitions —
             # needs topics, and a night without the model used to get none.
@@ -1029,10 +1275,19 @@ async def plan_shots(program: Program, settings: PresentationSettings,
         # LLM beats need splitting into a sequence of shots.
         planned = [b for b in unique if b.origin == "llm"]
         others = [b for b in unique if b.origin != "llm"]
-        unique = await multiply_beats(planned, settings, ask, genre) + others
+        unique = await multiply_beats(planned, settings, ask, genre, genre_secondary) + others
+        # The model's own beats sometimes fall short of the seconds the
+        # coverage target asks for however well they are split — top up with
+        # keyword-derived filler in whatever time they left uncovered, so the
+        # budget below has enough candidates to actually spend on.
+        unique = _ensure_coverage_candidates(unique, program, settings, genre, genre_secondary)
     kept, budget_dropped = budget_beats(unique, program, settings)
     dropped = dropped + dup_dropped + budget_dropped
     kept = balance_video_share(kept, settings)
+    kept = character_mod.apply_to_beats(kept, character)
+    if character is not None:
+        logger.info("Shot plan: %d of %d beats show the main character (%s)",
+                    sum(b.shows_character for b in kept), len(kept), character.name)
 
     # The model plans pop-ups so rarely that a run with none is the normal case;
     # the topics themselves then supply one label each. Added after budgeting —
@@ -1056,7 +1311,8 @@ async def plan_shots(program: Program, settings: PresentationSettings,
     logger.info("Shot plan (%s, genre=%s): %d beats kept, %d dropped",
                 source, genre, len(kept), len(dropped))
     return ShotPlan(beats=kept, dropped=dropped, source=source, genre=genre,
-                    topics=topics)
+                    genre_secondary=genre_secondary or "", topics=topics,
+                    character=character)
 
 
 def _weigh_by_act(beats: List[Beat], topics: List[Topic]) -> List[Beat]:

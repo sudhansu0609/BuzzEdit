@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from config import FFMPEG_BIN
 from utils.proc import NO_WINDOW
 from timeline import clip_ops
+from timeline.presets import TEXT_ZONE_MAX_POS_Y
 from timeline.authoring import clear_generated
 from timeline.schema import SourceFile, Timeline, frame_to_time, time_to_frame
 
@@ -73,6 +74,8 @@ def place_pip(timeline: Timeline, program: Program, settings: PresentationSettin
                 key=lambda i: i.timeline_start_frame)
     count = 0
     for cut in cutaways:
+        if (cut.label or "").startswith("layout:"):
+            continue  # a designed layout has its own speaker slot
         seconds = frame_to_time(cut.duration_frames, fps_num, fps_den)
         if seconds < settings.pip_min_seconds:
             continue
@@ -147,7 +150,7 @@ def place_split_labels(timeline: Timeline, pairs: Sequence[Tuple[float, float, O
             item = clip_ops.add_text_item(
                 timeline, str(label), time_to_frame(start_s, fps_num, fps_den), frames,
                 track=SPLIT_LABEL_TRACK, preset="character_card",
-                style={"align": "center", "pos_x": pos_x, "pos_y": 0.72,
+                style={"align": "center", "pos_x": pos_x, "pos_y": TEXT_ZONE_MAX_POS_Y,
                        "animation": "slide-up"})
             item.origin = "split"
             item.label = f"split label: {label}"

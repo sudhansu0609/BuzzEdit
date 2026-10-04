@@ -221,7 +221,9 @@ def test_adjustment_treats_the_picture_only_inside_its_window():
     _, fc, vlabel, _ = FilterGraphCompiler(tl).compile()
     assert "split[adjbase_0][adjsrc_0]" in fc
     assert "saturation=0" in fc
-    assert "overlay=x=0:y=0:enable='between(t,2.000,5.000)'" in fc
+    assert "overlay=x=0:y=0:eof_action=pass:enable='between(t,2.000,5.000)'" in fc
+    # Only the window is processed, not the whole programme.
+    assert "trim=start=2.000:end=5.000" in fc
     assert vlabel == "[adj_0]"
 
 
@@ -275,7 +277,9 @@ def test_adjustment_opacity_is_the_strength_of_the_treatment():
     _, fc, _, _ = FilterGraphCompiler(tl).compile()
     assert "colorchannelmixer=aa=0.4" in fc
     # Opacity alone is not a geometry change, so no scale/pad/crop is emitted.
-    assert "pad=" not in fc
+    # No geometry pad (a `pad=W:H` after scale) -- `tpad=`, the time pad on the
+    # treated copy, is not one.
+    assert ",pad=" not in fc and "]pad=" not in fc
 
 
 def test_hiding_the_track_switches_the_adjustment_off():
@@ -285,3 +289,37 @@ def test_hiding_the_track_switches_the_adjustment_off():
     clip_ops.set_track_flags(tl, "V2", hidden=True)
     _, fc, _, _ = FilterGraphCompiler(tl).compile()
     assert "saturation=0" not in fc
+
+
+def _cut_timeline(segments):
+    src = SourceFile(id="src_main", path="C:/media/main.mp4", duration_seconds=600.0,
+                     width=1920, height=1080, fps_num=30, fps_den=1, kind="video")
+    items, t = [], 0
+    for n in range(segments):
+        s0 = n * 90                       # a 2s keep out of every 3s of source
+        for kind in ("V1", "A1"):
+            items.append(TimelineItem(id=f"{kind}_{n}", track=kind, source_id="src_main",
+                                      source_start_frame=s0, source_end_frame=s0 + 60,
+                                      timeline_start_frame=t, timeline_end_frame=t + 60,
+                                      origin="auto"))
+        t += 60
+    tl = Timeline(fps_num=30, fps_den=1, sources={"src_main": src}, items=items)
+    tl.recalculate_duration()
+    return tl
+
+
+def test_a_many_cut_edit_seeks_one_input_per_segment():
+    """150 trims off one decode ran at 0.28x realtime; seeked inputs keep the
+    cost proportional to the programme, not to the number of cuts."""
+    inputs, fc, _, _ = FilterGraphCompiler(_cut_timeline(20)).compile()
+    assert inputs.count("-ss") == 20                 # one per segment, shared by V1+A1
+    assert inputs[inputs.index("-ss") + 1] == "0.000"
+    assert "-threads" in inputs
+    assert "trim=start=" not in fc.split("[v1_19]")[0]   # V1 no longer trims the shared stream
+    assert "[1:v]trim=duration=2.000" in fc and "[1:a]atrim=duration=2.000" in fc
+
+
+def test_a_short_edit_keeps_the_single_shared_input():
+    inputs, fc, _, _ = FilterGraphCompiler(_cut_timeline(3)).compile()
+    assert "-ss" not in inputs
+    assert "[0:v]trim=start=0.000:end=2.000" in fc

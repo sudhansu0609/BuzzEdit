@@ -29,7 +29,7 @@ logger = logging.getLogger("presentation.workflows")
 
 MANIFEST_FILE = "manifest.json"
 
-ROLES = ("broll_image", "broll_video", "thumbnail", "graphic")
+ROLES = ("broll_image", "broll_video", "thumbnail", "graphic", "audio", "music")
 
 # Which settings key names the workflow for each role.
 SETTINGS_KEY = {
@@ -37,6 +37,13 @@ SETTINGS_KEY = {
     "broll_video": "workflow_broll_video",
     "thumbnail": "workflow_thumbnail",
     "graphic": "workflow_graphic",
+    # Text-to-audio (Stable Audio Open, ACE-Step, ...) — used by
+    # presentation.sound's "generated" SFX/music sourcing. No bundled default:
+    # there is no audio workflow shipped with the app, same as broll_video.
+    "audio": "workflow_audio",
+    # Text-to-music (ACE-Step): background beds, presentation.music_gen.
+    # Kept apart from "audio" so SFX stay on Stable Audio Open.
+    "music": "workflow_music",
 }
 
 # Used only when neither settings nor manifest say otherwise. `broll_video` and
@@ -55,33 +62,63 @@ _TEXT_CLASSES = ("CLIPTextEncode", "CLIPTextEncodeSDXL", "T5TextEncode",
 # tell us the workflow makes video rather than a still.
 _LATENT_HINTS = ("EmptyLatent", "EmptySD3Latent", "EmptyHunyuanLatentVideo",
                  "EmptyMochiLatentVideo", "WanImageToVideo", "EmptyCosmosLatentVideo")
+# Text-to-audio latents (Stable Audio Open, ACE-Step, ...) carry the clip
+# length as `seconds` rather than `length`/`num_frames`.
+_AUDIO_LATENT_HINTS = ("EmptyLatentAudio", "EmptyAceStepLatentAudio")
 # Node classes that write the result to disk.
 _SAVE_IMAGE = ("SaveImage", "Image Save", "SaveImageWebsocket")
 _SAVE_VIDEO = ("VHS_VideoCombine", "SaveAnimatedWEBP", "SaveAnimatedPNG",
                "SaveWEBM", "SaveVideo")
+_SAVE_AUDIO = ("SaveAudio", "SaveAudioMP3", "SaveAudioOpus", "VHS_AudioCombine")
+# Frame interpolators (RIFE and friends): each multiplies the frame count by its
+# `multiplier`, so the saved clip must play that much faster to keep its length.
+_INTERPOLATE_CLASSES = ("FrameInterpolate", "RIFE VFI", "FILM VFI")
+
+
+def frame_multiplier(graph: Dict[str, Any]) -> int:
+    """How many output frames the graph makes per generated frame."""
+    factor = 1
+    for node in graph.values():
+        if isinstance(node, dict) and node.get("class_type") in _INTERPOLATE_CLASSES:
+            try:
+                factor *= max(1, int((node.get("inputs") or {}).get("multiplier", 1)))
+            except (TypeError, ValueError):
+                pass
+    return factor
 
 
 class ResolvedWorkflow:
     """A workflow file plus the paths needed to fill it in."""
 
     def __init__(self, role: str, file: str, graph: Dict[str, Any],
-                 bindings: Dict[str, List[str]], output_kind: str):
+                 bindings: Dict[str, List[str]], output_kind: str,
+                 fallback: Optional["ResolvedWorkflow"] = None):
         self.role = role
         self.file = file
         self.graph = graph
         self.bindings = bindings
         self.output_kind = output_kind      # "image" | "video"
+        self.frame_multiplier = frame_multiplier(graph)
+        # The manifest's `fallback_file`: what to run instead when this graph
+        # fails on a missing node or model (an upgrade not installed yet).
+        self.fallback = fallback
 
     def build(self, positive: str, negative: str = "", width: int = 1920,
               height: int = 1080, seed: Optional[int] = None,
               length: Optional[int] = None, fps: Optional[int] = None,
               prefix: str = "buzzedit", steps: Optional[int] = None,
-              cfg: Optional[float] = None, model: Optional[str] = None) -> Dict[str, Any]:
+              cfg: Optional[float] = None, model: Optional[str] = None,
+              out_width: Optional[int] = None, out_height: Optional[int] = None) -> Dict[str, Any]:
         """A copy of the graph with this generation's values written into it.
 
         `steps`, `cfg` and `model` are optional overrides from the app settings:
         when None the workflow keeps its own value, so a user who leaves them
         blank gets exactly the workflow they configured.
+
+        `fps` is the rate the model generates at (what `length` was counted
+        in); a graph that interpolates frames saves at fps x its multiplier.
+        `out_width`/`out_height` are the delivered size when the graph upscales
+        after generating (`width`/`height` stay the generation size).
         """
         values = {
             "positive": positive,
@@ -94,13 +131,15 @@ class ResolvedWorkflow:
         if length is not None:
             values["length"] = length
         if fps is not None:
-            values["fps"] = fps
+            values["fps"] = fps * self.frame_multiplier
         if steps is not None:
             values["steps"] = steps
         if cfg is not None:
             values["cfg"] = cfg
         if model:
             values["model"] = model
+        if out_width and out_height:
+            values["out_width"], values["out_height"] = out_width, out_height
         return apply_bindings(self.graph, self.bindings, values)
 
 
@@ -166,6 +205,13 @@ def guess_bindings(graph: Dict[str, Any]) -> Dict[str, Any]:
                 bindings.setdefault("length", [node_id, "inputs", "num_frames"])
                 output_kind = "video"
 
+        if any(hint in class_type for hint in _AUDIO_LATENT_HINTS) and "seconds" in inputs:
+            # `length` doubles as "how long the clip should be" for the audio
+            # role too — build()'s caller passes whole seconds, same as it
+            # passes frames for video.
+            bindings.setdefault("length", [node_id, "inputs", "seconds"])
+            output_kind = "audio"
+
         if "seed" in inputs:
             bindings.setdefault("seed", [node_id, "inputs", "seed"])
         elif "noise_seed" in inputs:
@@ -194,6 +240,10 @@ def guess_bindings(graph: Dict[str, Any]) -> Dict[str, Any]:
                 bindings.setdefault("fps", [node_id, "inputs", "frame_rate"])
             elif "fps" in inputs:
                 bindings.setdefault("fps", [node_id, "inputs", "fps"])
+        elif class_type in _SAVE_AUDIO:
+            output_kind = "audio"
+            if "filename_prefix" in inputs:
+                bindings["prefix"] = [node_id, "inputs", "filename_prefix"]
         elif class_type in _SAVE_IMAGE and "filename_prefix" in inputs:
             bindings.setdefault("prefix", [node_id, "inputs", "filename_prefix"])
 
@@ -314,6 +364,18 @@ def resolve(role: str) -> Optional[ResolvedWorkflow]:
     if not file_name:
         return None
 
+    fallback_name = manifest.get("fallback_file")
+    fallback = (_bind(role, fallback_name, manifest)
+                if fallback_name and fallback_name != file_name else None)
+    resolved = _bind(role, file_name, manifest)
+    if resolved is None:
+        return fallback
+    resolved.fallback = fallback
+    return resolved
+
+
+def _bind(role: str, file_name: str, manifest: Dict[str, Any]) -> Optional[ResolvedWorkflow]:
+    """One workflow file, loaded and bound for a role."""
     try:
         graph = load_graph(file_name)
     except Exception as e:
@@ -354,6 +416,7 @@ def describe(file_name: str) -> Dict[str, Any]:
             "broll_video": "positive" in bindings and output_kind == "video",
             "thumbnail": "positive" in bindings and output_kind == "image",
             "graphic": "positive" in bindings and output_kind == "image",
+            "audio": "positive" in bindings and output_kind == "audio",
         },
     }
 

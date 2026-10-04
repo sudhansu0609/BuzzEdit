@@ -14,6 +14,7 @@ them at once is how an overnight job turns into an out-of-memory error at 3am.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import shutil
@@ -32,6 +33,7 @@ from . import captions as captions_stage
 from . import cards as cards_stage
 from . import composite as composite_stage
 from . import entities as entities_stage
+from . import graphics as graphics_stage
 from . import facezoom, look, placement
 from . import mood as mood_stage
 from . import script as script_stage
@@ -70,14 +72,105 @@ class _Stages:
             return default
 
 
-async def _llm_asker():
+# --- shot-plan checkpoint ----------------------------------------------------
+#
+# The shot plan is the pass's longest model work (~10 minutes of calls on a
+# long video), and the picture prompts it writes are the image cache's keys. A
+# retry after a failed render used to plan again from nothing: new wording,
+# so every picture already made missed the cache and was generated again. The
+# plan is saved beside the project and reused while its inputs are unchanged.
+SHOTPLAN_CHECKPOINT = "shotplan_checkpoint.json"
+# Settings that do not shape the plan: which model answered, and the image seed.
+_PLAN_IRRELEVANT = {"llm_api_key", "llm_base_url", "llm_model", "llm_provider", "seed"}
+
+
+def _shotplan_key(program, settings: PresentationSettings, genre: str,
+                  script_topics, extra_beats) -> str:
+    def dump(x):
+        if isinstance(x, (list, tuple)):
+            return [dump(i) for i in x]
+        return x.model_dump(mode="json") if hasattr(x, "model_dump") else x
+    blob = json.dumps({
+        "v": 1,
+        "program": dump(program),
+        "settings": settings.model_dump(mode="json", exclude=_PLAN_IRRELEVANT),
+        "genre": genre,
+        "script_topics": dump(script_topics),
+        "extra_beats": dump(extra_beats),
+    }, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
+def _load_shotplan(project_dir: Path, key: str):
+    """(ShotPlan, hook) saved for these exact inputs, or None."""
+    from .models import ShotPlan
+    from .structure import Hook
+    path = project_dir / SHOTPLAN_CHECKPOINT
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        if saved.get("key") != key:
+            return None
+        hook = saved.get("hook")
+        return (ShotPlan.model_validate(saved["plan"]),
+                Hook.model_validate(hook) if hook else None)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.warning("Ignoring an unreadable shot-plan checkpoint (%s)", e)
+        return None
+
+
+def _save_shotplan(project_dir: Path, key: str, plan, hook) -> None:
+    try:
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / SHOTPLAN_CHECKPOINT).write_text(json.dumps({
+            "key": key,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "plan": plan.model_dump(mode="json"),
+            "hook": hook.model_dump(mode="json") if hook is not None else None,
+        }, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning("Could not save the shot-plan checkpoint (%s)", e)
+
+
+def _remote_client_for(settings: Optional[PresentationSettings]):
+    """The Studio-supplied remote model for this job, or None for LM Studio."""
+    if settings is None or getattr(settings, "llm_provider", "auto") != "openai_compat":
+        return None
+    base_url = (getattr(settings, "llm_base_url", "") or "").strip()
+    if not base_url:
+        return None
+    from llm.client import RemoteChatClient
+    return RemoteChatClient(base_url, getattr(settings, "llm_api_key", "") or "",
+                            getattr(settings, "llm_model", "") or "")
+
+
+async def _llm_asker(settings: Optional[PresentationSettings] = None):
     """A JSON-asking callable bound to a model that is actually loaded, or None.
+
+    A job that names a remote endpoint (`settings.llm_provider ==
+    "openai_compat"`, sent by BuzzcafStudio for its Claude proxy) uses that
+    when it answers a probe -- no loading, no ejecting, and the slow
+    responsiveness gate below is skipped because it exists for local models
+    that can be present yet too slow to plan with. Otherwise, or when the
+    endpoint is down, the local LM Studio path applies.
 
     Readiness has to come from `ensure_ready`, which loads the preferred model
     and returns the id that is really serving. Asking `/v1/models` instead lists
     everything downloaded and happily names a model that cannot load — which is
     how the LLM layer once spent weeks never running at all.
     """
+    remote = _remote_client_for(settings)
+    if remote is not None:
+        model = await remote.ensure_ready()
+        if model:
+            logger.info("Planning passes on the remote model %r at %s", model, remote.base_url)
+
+            async def ask_remote(system_prompt: str, user_prompt: str, schema=None):
+                return await remote._chat_json(model, system_prompt, user_prompt, schema=schema)
+
+            return ask_remote
+        logger.warning("Remote model at %s not usable; falling back to LM Studio.", remote.base_url)
     try:
         from llm.client import lm_studio_client
         from llm.lm_launcher import ensure_ready
@@ -109,9 +202,34 @@ async def run_presentation_pass(
     settings: Optional[PresentationSettings] = None,
     progress_cb: Optional[Callable[[float, str], None]] = None,
     output_dir: Optional[Path] = None,
+    settings_sources: Optional[Dict[str, str]] = None,
+) -> PresentationReport:
+    """See `_run_presentation_pass`. Whatever happens, every model the pass
+    loaded (LLM, ComfyUI checkpoints, ASR) is offloaded when it ends -- the
+    GPU policy in runtime/gpu_handover.py."""
+    from runtime import gpu_handover
+    try:
+        return await _run_presentation_pass(project_id, settings, progress_cb,
+                                            output_dir, settings_sources)
+    finally:
+        await gpu_handover.offload_all(f"presentation pass {project_id} finished")
+
+
+async def _run_presentation_pass(
+    project_id: str,
+    settings: Optional[PresentationSettings] = None,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+    output_dir: Optional[Path] = None,
+    settings_sources: Optional[Dict[str, str]] = None,
 ) -> PresentationReport:
     """Dress a finished cut into a presentable video. Never raises for a missing
-    optional stage; raises only when the result could not be saved or rendered."""
+    optional stage; raises only when the result could not be saved or rendered.
+
+    `settings_sources`, when given, is recorded on the report as-is — it comes
+    from wherever `settings` itself was assembled (Studio's dict, BuzzEdit's
+    own overrides, the density preset, or a plain default); see
+    presentation.models.settings_sources_for.
+    """
     settings = settings or PresentationSettings()
     report_progress = progress_cb or (lambda fraction, message="": None)
     store = ProjectStore(base_dir=str(PROJECTS_DIR))
@@ -119,7 +237,8 @@ async def run_presentation_pass(
     report = PresentationReport(
         project_id=project_id,
         started_at=datetime.now().isoformat(),
-        settings=settings.model_dump(),
+        settings=settings.model_dump(exclude={"llm_api_key"}),
+        settings_sources=dict(settings_sources or {}),
     )
     stages = _Stages(report)
     seed = settings.seed if settings.seed is not None else seed_for(project_id)
@@ -131,6 +250,12 @@ async def run_presentation_pass(
 
     # --- the cut itself ----------------------------------------------------
     report_progress(0.02, "Preparing the edit")
+    # If the auto-edit has to run here, its pacing follows the genre (horror
+    # keeps its pauses), and a genre named for this pass is the one to use.
+    project_settings = data.get("settings") or {}
+    data["settings"] = project_settings
+    if settings.genre and not project_settings.get("genre"):
+        project_settings["genre"] = settings.genre
     timeline = await _ensure_timeline(data, store, project_id, stages)
     if timeline is None:
         raise RuntimeError("No timeline: the auto-edit has not run and could not be run")
@@ -156,7 +281,7 @@ async def run_presentation_pass(
     report_progress(0.10, "Reading the edit")
     program = build_program(timeline)
     directives: Dict[str, Any] = {"beats": [], "sfx": [], "title": None, "moods": {},
-                                  "music_mood": None}
+                                  "music_mood": None, "music_cues": [], "fx": []}
     script_topics: List = []
     if script_ctx.present:
         script_topics = script_stage.paragraph_topics(script_ctx, program)
@@ -172,7 +297,7 @@ async def run_presentation_pass(
 
     # --- B. the plan -------------------------------------------------------
     report_progress(0.13, "Working out what kind of video this is")
-    ask = await _llm_asker()
+    ask = await _llm_asker(settings)
     if ask is None:
         report.degraded.append("llm_unavailable")
     # The genre styles every generated prompt — a horror video gets horror
@@ -185,6 +310,13 @@ async def run_presentation_pass(
             "genre", genre_mod.detect_genre(program, ask), default="general")
     genre = genre_mod.normalise(genre)
     report.genre = genre
+    # The secondary genre is resolved again inside plan_shots (it needs the
+    # blend for the beats it writes); the report just needs the same name.
+    genre_secondary = (genre_mod.normalise(settings.genre_secondary)
+                       if settings.genre_secondary else None)
+    if genre_secondary in (None, "general", genre):
+        genre_secondary = None
+    report.genre_secondary = genre_secondary or ""
 
     report_progress(0.15, "Working out the topics")
     hook_box: Dict[str, Any] = {"hook": None}
@@ -195,17 +327,57 @@ async def run_presentation_pass(
         if settings.structure:
             hook_box["hook"] = await structure_stage.tag_structure(topics, program, ask, genre)
 
-    plan = await stages.run(
-        "shotplan", plan_shots(program, settings, ask, genre,
-                               script_topics=script_topics,
-                               extra_beats=directives["beats"],
-                               enrich=enrich if settings.structure else None),
-        default=None)
+    plan_key = _shotplan_key(program, settings, genre, script_topics, directives["beats"])
+    checkpoint = _load_shotplan(PROJECTS_DIR / project_id, plan_key)
+    if checkpoint is not None:
+        plan, hook_box["hook"] = checkpoint
+        logger.info("Reusing the saved shot plan (%d beats); the inputs are unchanged",
+                    len(plan.beats))
+        report.timings.append(StageTiming(stage="shotplan", seconds=0.0, ok=True,
+                                          note="reused the saved plan"))
+    else:
+        plan = await stages.run(
+            "shotplan", plan_shots(program, settings, ask, genre,
+                                   script_topics=script_topics,
+                                   extra_beats=directives["beats"],
+                                   enrich=enrich if settings.structure else None),
+            default=None)
+        # Only a real model plan is worth keeping: a keyword fallback (model
+        # down) should be replaced by a proper plan on the next run.
+        if plan is not None and plan.source == "llm" and plan.beats:
+            _save_shotplan(PROJECTS_DIR / project_id, plan_key, plan, hook_box["hook"])
     if plan is None:
         from .models import ShotPlan
         plan = ShotPlan(beats=[], source="none", genre=genre)
     # --- what the speaker names: cards and maps -----------------------------
     #
+    # The model passes that do not read each other's answers -- moods,
+    # the caption translation, the thumbnail title -- start now and run
+    # beside the entity pass instead of one after another (~70 s saved on a
+    # remote model). Each is awaited where its result is first needed.
+    mood_task = None
+    if settings.moods and plan.topics:
+        mood_task = asyncio.create_task(stages.run(
+            "moods",
+            mood_stage.tag_moods(plan.topics, program, ask, genre,
+                                 overrides=directives.get("moods") or {}),
+            default=None))
+    translate_task = None
+    if settings.captions and settings.captions_bilingual.lower() not in ("off", "none", ""):
+        from timeline.authoring import caption_script_for
+        if (settings.captions_bilingual.lower() == "on"
+                or caption_script_for(data.get("settings") or {}) == "native"):
+            translate_task = asyncio.create_task(stages.run(
+                "translate", captions_stage.translate_lines(program, ask), default=[]))
+    thumb_title: Optional[str] = directives.get("title")
+    thumb_scene: Optional[str] = None
+    thumb_task = None
+    if (settings.thumbnail or (settings.title and thumb_title is None)) and ask is not None:
+        thumb_task = asyncio.create_task(stages.run(
+            "thumbnail_title",
+            assets_stage.generate_thumbnail_concept(program, ask, plan.topics),
+            default=None))
+
     # One extraction over the topics (the model when it is up, patterns when
     # not) feeds every text card and every map. Validated like the model's
     # own beats, then merged into the plan so placement sees one list.
@@ -235,6 +407,14 @@ async def run_presentation_pass(
                 if not beat.id:
                     beat.id = f"e{index:02d}"
 
+    # Some claim/stat/quote beats become newspaper cutaways instead of text
+    # cards, in genres whose blended text-fx palette wants a highlighter
+    # sweep — a no-op everywhere else (shotplan.convert_claims_to_newspapers).
+    if plan.beats:
+        from .shotplan import convert_claims_to_newspapers
+        plan.beats = convert_claims_to_newspapers(plan.beats, program, settings, genre,
+                                                   genre_secondary)
+
     if settings.structure and plan.topics and not any(t.act for t in plan.topics):
         hook_box["hook"] = await stages.run(
             "structure", structure_stage.tag_structure(plan.topics, program, ask, genre),
@@ -244,13 +424,9 @@ async def run_presentation_pass(
     report.acts = [t.act or "" for t in sorted(plan.topics, key=lambda t: t.start_s)]
 
     # --- the emotional shape --------------------------------------------------
-    if settings.moods and plan.topics:
+    if mood_task is not None:
         report_progress(0.19, "Reading the mood of each part")
-        await stages.run(
-            "moods",
-            mood_stage.tag_moods(plan.topics, program, ask, genre,
-                                 overrides=directives.get("moods") or {}),
-            default=None)
+        await mood_task
         report.moods = [t.mood or "" for t in sorted(plan.topics, key=lambda t: t.start_s)]
 
     report.beats_planned = len(plan.beats)
@@ -265,16 +441,11 @@ async def run_presentation_pass(
     # Captions are generated after the model is ejected, so the translation is
     # asked for now, sentence by sentence, and attached to the cards later.
     translations: List[Tuple[float, float, str]] = []
-    if settings.captions and settings.captions_bilingual.lower() not in ("off", "none", ""):
-        from timeline.authoring import caption_script_for
-        wants = (settings.captions_bilingual.lower() == "on"
-                 or caption_script_for(data.get("settings") or {}) == "native")
-        if wants:
-            report_progress(0.195, "Translating the captions")
-            translations = await stages.run(
-                "translate", captions_stage.translate_lines(program, ask), default=[]) or []
-            if not translations:
-                translations = captions_stage.translations_from_transcript(data, program, timeline)
+    if translate_task is not None:
+        report_progress(0.195, "Translating the captions")
+        translations = await translate_task or []
+        if not translations:
+            translations = captions_stage.translations_from_transcript(data, program, timeline)
 
     # --- everything the language model is for, done in one go --------------
     #
@@ -282,12 +453,11 @@ async def run_presentation_pass(
     # used to be asked for at the very end — after ComfyUI had already run. That
     # meant the LLM had to stay resident through generation. Ask for it now, while
     # the model is already up, so nothing downstream needs it.
-    thumb_title: Optional[str] = directives.get("title")
-    if thumb_title is None and (settings.thumbnail or settings.title) and ask is not None:
+    if thumb_task is not None:
         report_progress(0.20, "Writing the thumbnail title")
-        thumb_title = await stages.run(
-            "thumbnail_title", assets_stage.generate_thumbnail_title(program, ask),
-            default=None)
+        concept = await thumb_task or {}
+        thumb_title = thumb_title or concept.get("title")
+        thumb_scene = concept.get("scene")
 
     # The listing — titles, description with chapters, tags — while the model
     # is still resident; chapters shift by the cold open's length once it is cut.
@@ -303,7 +473,7 @@ async def run_presentation_pass(
 
     # Persist the plan (prompts + title) so generation reads from a file rather
     # than from a model that is about to be unloaded — and so a run is inspectable.
-    _write_shot_plan(project_id, plan, thumb_title)
+    _write_shot_plan(project_id, plan, thumb_title, thumb_scene)
 
     # Eject the language model before ComfyUI starts. On a single card a resident
     # multi-GB LLM is exactly what makes image generation run out of memory, and
@@ -327,35 +497,56 @@ async def run_presentation_pass(
     generated: List = []
     if settings.broll and plan.beats:
         report_progress(0.25, "Generating pictures")
+        generation_stats: Dict[str, Any] = {}
         result = await stages.run(
             "assets",
             assets_stage.generate_assets(
                 plan.beats, PROJECTS_DIR / project_id, settings,
                 progress_cb=lambda f, m="": report_progress(0.25 + 0.35 * f, m),
                 seed_base=seed,
-                canvas_size=(timeline.width, timeline.height)),
+                canvas_size=(timeline.width, timeline.height),
+                stats=generation_stats,
+                character=plan.character),
             default=([], []))
+        report.generation = generation_stats
+        video_phase = generation_stats.get("video_phase") or {}
+        if video_phase.get("skipped_reason"):
+            report.degraded.append(f"video_broll: {video_phase['skipped_reason']}")
         generated, failures = result if result else ([], [])
-        report.assets_generated = sum(1 for a in generated if not a.cache_hit)
-        report.assets_cached = sum(1 for a in generated if a.cache_hit)
+        comfyui_made = [a for a in generated if getattr(a, "source", "generated") == "generated"]
+        report.assets_generated = sum(1 for a in comfyui_made if not a.cache_hit)
+        report.assets_cached = sum(1 for a in comfyui_made if a.cache_hit)
         report.assets_failed = failures
+        # Beats ComfyUI could not make that free stock (Pexels/Pixabay) filled
+        # instead — see presentation.stock. Empty unless allow_free_stock and a
+        # key were both configured for this project.
+        report.stock_used = [
+            {"beat_id": a.beat_id, "source": a.source, "url": a.stock_url or "",
+             "author": a.stock_author or ""}
+            for a in generated if getattr(a, "source", "generated") != "generated"
+        ]
 
     # --- C2. the pictures drawn here: maps and charts -------------------------
     #
     # No ComfyUI involved, so these run whether or not it is up, and they take
     # the same placement path as the generated B-roll.
     local_assets: List = []
-    if plan.beats and (settings.maps or settings.cards):
-        report_progress(0.60, "Drawing maps and charts")
+    designed = any(b.kind in graphics_stage.DRAWN_CUTAWAY_KINDS for b in plan.beats)
+    if plan.beats and (settings.maps or settings.cards or settings.newspapers
+                       or settings.case_files or designed):
+        report_progress(0.60, "Drawing maps, charts, newspapers and case files")
         drawn = await stages.run(
             "maps_charts",
             asyncio.to_thread(_draw_local_assets, plan.beats, PROJECTS_DIR / project_id,
-                              timeline.width, timeline.height, genre, settings),
+                              timeline.width, timeline.height, genre, settings, generated),
             default=([], []))
         local_assets, local_failures = drawn if drawn else ([], [])
         report.assets_failed = list(report.assets_failed) + list(local_failures)
     if local_assets:
-        generated = list(generated) + local_assets
+        # A drawn card replaces anything generated for the same beat (a
+        # source quote's background picture is inside the card already).
+        drawn_ids = {a.beat_id for a in local_assets}
+        generated = [a for a in generated if a.beat_id not in drawn_ids] + local_assets
 
     # --- D. placement ------------------------------------------------------
     report_progress(0.62, "Cutting in the B-roll")
@@ -367,9 +558,13 @@ async def run_presentation_pass(
                   program, settings, seed, rejected),
             default=0) or 0
     report.beats_placement_rejected = rejected
-    report.maps_placed = sum(
-        1 for i in timeline.items if i.origin == placement.BROLL_ORIGIN and i.source_id
-        and "maps" in Path(timeline.sources[i.source_id].path).parts)
+    def _placed_from(folder: str) -> int:
+        return sum(
+            1 for i in timeline.items if i.origin == placement.BROLL_ORIGIN and i.source_id
+            and folder in Path(timeline.sources[i.source_id].path).parts)
+    report.maps_placed = _placed_from("maps")
+    report.newspapers_placed = _placed_from("newspaper")
+    report.case_files_placed = _placed_from("dossier")
 
     busy = placement.broll_windows(timeline)
     report.coverage_target = settings.target_coverage
@@ -394,6 +589,45 @@ async def run_presentation_pass(
     elif broll_failed:
         report.degraded.append("popups_skipped_no_broll")
 
+    # --- face detection (early: cards' face-avoidance below and the text-fx
+    #     pass later both need it; "E. the zooms" further down reuses this
+    #     same dict instead of detecting a second time) ----------------------
+    face_anchors: Dict[str, Tuple[float, float]] = {}
+    if (settings.face_zoom or getattr(settings, "text_fx", True)) and source_video:
+        face_anchors = dict(await stages.run(
+            "face_detect", asyncio.to_thread(facezoom.detect_faces, source_video, program),
+            default={}) or {})
+
+    # --- designed graphics: the live speaker in each layout's slot, the
+    #     overlays on the speaker, and the AI disclosure tag -----------------
+    if plan.beats:
+        designed_counts: Dict[str, int] = {}
+        speakers = await stages.run(
+            "layout_speakers",
+            _sync(graphics_stage.place_layout_speakers, timeline, plan.beats, face_anchors),
+            default=0) or 0
+        if speakers:
+            designed_counts["speaker_slots"] = speakers
+        overlay_counts = await stages.run(
+            "overlays",
+            _sync(graphics_stage.place_overlays, timeline, plan.beats, program,
+                  PROJECTS_DIR / project_id, placement.broll_windows(timeline), face_anchors),
+            default={}) or {}
+        designed_counts.update(overlay_counts)
+        for beat_kind in graphics_stage.DRAWN_CUTAWAY_KINDS + ("canvas_card",):
+            placed_n = sum(1 for i in timeline.items
+                           if i.origin == placement.BROLL_ORIGIN and i.source_id
+                           and any(i.source_id.startswith(f"src_broll_{b.id}_")
+                                   for b in plan.beats if b.kind == beat_kind))
+            if placed_n:
+                designed_counts[beat_kind] = placed_n
+        report.designed_graphics = designed_counts
+    if getattr(settings, "ai_label", True) and generated:
+        ai_ids = [a.beat_id for a in generated
+                  if getattr(a, "source", "generated") == "generated" and a.workflow_file]
+        report.ai_labels = await stages.run(
+            "ai_labels", _sync(graphics_stage.place_ai_labels, timeline, ai_ids), default=0) or 0
+
     # --- text cards ----------------------------------------------------------
     if settings.cards and plan.beats:
         report_progress(0.66, "Placing the cards")
@@ -401,7 +635,7 @@ async def run_presentation_pass(
         placed_cards = await stages.run(
             "place_cards",
             _sync(cards_stage.place_cards, timeline, plan.beats, program, settings,
-                  genre, popup_windows),
+                  genre, genre_secondary, popup_windows, face_anchors),
             default={})
         report.cards_placed = placed_cards or {}
 
@@ -422,16 +656,10 @@ async def run_presentation_pass(
 
     # --- E. the zooms ------------------------------------------------------
     window_zoom_times: List[float] = []
-    face_anchors: Dict[str, Tuple[float, float]] = {}
     if settings.face_zoom:
         report_progress(0.70, "Finding the speaker")
-        anchors = {}
-        if source_video:
-            anchors = await stages.run(
-                "face_detect",
-                asyncio.to_thread(facezoom.detect_faces, source_video, program),
-                default={}) or {}
-        face_anchors = dict(anchors)
+        # Detected earlier, before the cards section, so it is not redone here.
+        anchors = face_anchors
         report.faces_detected_pct = (
             round(100.0 * len(anchors) / len(program.segments), 1)
             if program.segments else 0.0)
@@ -450,6 +678,8 @@ async def run_presentation_pass(
             default=(0, 0))
         report.zooms_segment, report.zooms_windowed = applied if applied else (0, 0)
         report.zooms_suppressed_by_broll = int(zoom_stats.get("suppressed") or 0)
+        report.zooms_punch_in = sum(1 for z in window_zooms if z.push_in)
+        report.zooms_punch_out = sum(1 for z in window_zooms if not z.push_in)
 
     # --- captions ----------------------------------------------------------
     if settings.captions:
@@ -500,6 +730,17 @@ async def run_presentation_pass(
             default="")
         report.atmosphere_applied = applied_effect or ""
 
+    # --- script-directed effects ------------------------------------------
+    #
+    # Effect windows the writer placed in the script ([fx: flicker], [atmos:
+    # fog], [grade: saturation=0.7]) become adjustment layers over the moment
+    # they were spoken. Replaced on every run; effects the user added stay.
+    if directives.get("fx"):
+        await stages.run(
+            "script_fx",
+            _sync(_apply_script_fx, timeline, directives.get("fx") or [], program),
+            default=0)
+
     # --- the cold open ------------------------------------------------------
     #
     # Last of the layers: it moves the whole programme back to make room, so
@@ -544,6 +785,10 @@ async def run_presentation_pass(
             "grade", _sync(look.apply_genre_grade, timeline, settings, genre),
             default=None)
         report.grade_applied = applied_grade or ""
+    if settings.recreations:
+        report.recreations_placed = await stages.run(
+            "recreations", _sync(_apply_recreations, timeline, settings, genre),
+            default=0) or 0
     if settings.topic_transitions and plan.topics:
         report.topic_transitions = await stages.run(
             "topic_transitions",
@@ -567,18 +812,36 @@ async def run_presentation_pass(
     # final position of the cutaway it marks (the title stage above may have
     # shifted the programme behind a card).
     if settings.music or settings.sfx or settings.ambience:
+        # A best-effort ComfyUI pre-pass for "auto"/"generated" sourcing: it
+        # only fills gaps the library doesn't cover, and needs to run (and be
+        # awaited) before the synchronous planning/placement below, which
+        # only ever READS the cache it fills. Skipped whenever ComfyUI's
+        # status was never checked (broll/thumbnail/graphics all off) — no
+        # extra connectivity probe just for this.
+        if settings.sfx_source in ("auto", "generated") or settings.music_source in ("auto", "generated"):
+            await stages.run(
+                "sound_generation",
+                sound_stage.warm_generated_cache(
+                    settings, genre, seed, comfyui_online=bool(report.comfyui_online),
+                    acts=[t.act or "" for t in plan.topics],
+                    music_cues=list(directives.get("music_cues") or []),
+                    duration=program.duration_s),
+                default=None)
         report_progress(0.85, "Sound design")
         sound_result = await stages.run(
             "sound",
             _sync(_apply_sound, timeline, program, settings, genre, seed,
                   window_zoom_times, list(directives["sfx"]) + list(mood_plan.sfx),
                   mood_plan.loops,
-                  [(t.start_s, t.end_s, t.act or "") for t in plan.topics]),
+                  [(t.start_s, t.end_s, t.act or "") for t in plan.topics],
+                  list(directives.get("music_cues") or [])),
             default=None)
         if sound_result:
             report.music_used = sound_result.get("music", "")
             report.sfx_placed = int(sound_result.get("sfx", 0))
             report.ambience_used = sound_result.get("ambience", "")
+            report.sfx_source_used = sound_result.get("sfx_sources", {})
+            report.music_source_used = sound_result.get("music_source", "")
             for note in sound_result.get("notes", []):
                 report.degraded.append(note)
     if settings.voice_preset and settings.voice_preset.lower() not in ("off", "none"):
@@ -586,6 +849,38 @@ async def run_presentation_pass(
             "voice_master", _sync(sound_stage.apply_voice_master, timeline, settings),
             default=None)
         report.voice_preset = applied_voice or ""
+        if applied_voice and timeline.audio_master is not None:
+            from render.audio import resolve_voice_enhance
+            report.voice_enhance_used = resolve_voice_enhance(timeline.audio_master.voice_enhance)
+            logger.info("Voice master: preset=%s denoise_engine=%s",
+                       applied_voice, report.voice_enhance_used)
+
+    # --- text effects --------------------------------------------------------
+    #
+    # Text behind the speaker's head, knockout, focus, newspaper highlighter
+    # sweeps, kinetic keyword pop-ins, hand-drawn annotations, typewriter and
+    # glitch reveals (presentation.text_fx). Runs after every other overlay
+    # (cards, pip, zooms, captions) has settled onto the timeline, so its own
+    # spacing has an accurate picture of what is already busy, and before the
+    # timeline below is saved/rendered.
+    if getattr(settings, "text_fx", True):
+        report_progress(0.865, "Adding text effects")
+        card_windows = cards_stage.card_windows(timeline)
+        broll_busy = placement.broll_windows(timeline)
+        text_fx_result = await stages.run(
+            "text_fx",
+            # Off the event loop thread, not `_sync`: the torchvision matte
+            # backend leases the GPU broker (runtime.gpu_broker) around its
+            # inference, which needs a thread with no event loop of its own
+            # already running — see presentation.matte._run_with_gpu_lease.
+            asyncio.to_thread(_apply_text_fx, timeline, program, plan.beats, generated, settings,
+                              genre, face_anchors, broll_busy, card_windows,
+                              PROJECTS_DIR / project_id, source_video, seed),
+            default=({}, "off", []))
+        placed, matte_used, fx_skipped = text_fx_result if text_fx_result else ({}, "off", [])
+        report.text_fx_placed = placed or {}
+        report.person_matte_used = matte_used or "off"
+        report.text_fx_skipped = fx_skipped or []
 
     # --- save before rendering --------------------------------------------
     #
@@ -594,6 +889,10 @@ async def run_presentation_pass(
     report_progress(0.86, "Saving the timeline")
     data["timeline"] = timeline.model_dump()
     data["status"] = "presented"
+    # When this timeline was made, so a retry can tell it came from the job
+    # whose render failed and re-render it (rerender_presented) instead of
+    # running the whole pass again.
+    data["presented_at"] = datetime.now().isoformat(timespec="seconds")
     store.save_project(project_id, data)
 
     # --- thumbnail ---------------------------------------------------------
@@ -602,11 +901,14 @@ async def run_presentation_pass(
         # Title was written up front (before the LLM was ejected); this stage is
         # only the ComfyUI image now.
         report.thumbnail = await stages.run(
-            "thumbnail", _make_thumbnail(project_id, data, thumb_title, genre),
+            "thumbnail", _make_thumbnail(project_id, data, thumb_title, genre, thumb_scene),
             default=None)
 
     # --- render ------------------------------------------------------------
     if settings.render:
+        # Written now as well as at the end: a render that dies leaves the
+        # report of everything before it for a render-only retry to finish.
+        _write_report(project_id, report)
         report_progress(0.90, "Rendering")
         output_path = str(OUTPUT_DIR / f"{project_id}_presented.mp4")
         rendered = await stages.run(
@@ -663,6 +965,55 @@ async def run_presentation_pass(
     return report
 
 
+async def rerender_presented(
+    project_id: str,
+    progress_cb: Optional[Callable[[float, str], None]] = None,
+    output_dir: Optional[Path] = None,
+) -> PresentationReport:
+    """Render the timeline a presentation pass already saved, and nothing else.
+
+    For a pass whose render failed (ffmpeg killed, the machine slept): every
+    stage before the render -- planning, pictures, music, placement -- is
+    already in the saved timeline, so re-running them would only cost time.
+    Raises when there is no presented timeline to render.
+    """
+    report_progress = progress_cb or (lambda fraction, message="": None)
+    store = ProjectStore(base_dir=str(PROJECTS_DIR))
+    data = store.get_project(project_id)
+    if not data:
+        raise FileNotFoundError(f"Project {project_id} not found")
+    if data.get("status") != "presented" or not data.get("timeline"):
+        raise RuntimeError(f"Project {project_id} has no presented timeline to re-render "
+                           f"(status {data.get('status')!r})")
+    timeline = Timeline.model_validate(data["timeline"])
+
+    path = PROJECTS_DIR / project_id / "presentation_report.json"
+    try:
+        report = PresentationReport.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception:
+        report = PresentationReport(project_id=project_id, started_at=datetime.now().isoformat())
+    stages = _Stages(report)
+
+    report_progress(0.90, "Rendering (re-using the saved edit)")
+    output_path = str(OUTPUT_DIR / f"{project_id}_presented.mp4")
+    rendered = await stages.run(
+        "render",
+        _render(timeline, output_path, data,
+                lambda pct: report_progress(0.90 + 0.09 * (pct / 100.0), "Rendering")),
+        required=True)
+    report.output_path = rendered
+    data["output_path"] = rendered
+    data["status"] = "rendered"
+    store.save_project(project_id, data)
+
+    if output_dir:
+        _collect(Path(output_dir), report.output_path, report.thumbnail)
+    report.finished_at = datetime.now().isoformat()
+    _write_report(project_id, report)
+    report_progress(1.0, "Done")
+    return report
+
+
 async def _sync(fn, *args, **kwargs):
     """Await a synchronous function so every stage has the same shape."""
     return fn(*args, **kwargs)
@@ -680,7 +1031,7 @@ async def _ensure_timeline(data: Dict[str, Any], store: ProjectStore,
 
     logger.info("Presentation: no timeline yet, running the auto-edit first")
     from asr import whisper_engine
-    from asr.auto_edit import extract_project_audio, plan_auto_edit, record_cut_coverage
+    from asr.auto_edit import extract_project_audio, pacing_kwargs, plan_auto_edit, record_cut_coverage
     from timeline import build_timeline_from_transcript
     from utils.ffmpeg_utils import get_video_info
 
@@ -693,22 +1044,33 @@ async def _ensure_timeline(data: Dict[str, Any], store: ProjectStore,
         audio_path or source_video, language=settings.get("language"))
     settings["language"] = detected_language
     data["settings"] = settings
-    plan = await plan_auto_edit(
-        words, audio_path,
-        aggressiveness=float(settings.get("fumble_aggressiveness", 0.5)))
+    precut = bool(settings.get("precut"))
+    if precut:
+        # Already cut by the user: keep every frame (Timeline.keep_full_source).
+        plan = None
+        plan_words, plan_report = words, {"precut": True}
+    else:
+        plan = await plan_auto_edit(
+            words, audio_path,
+            aggressiveness=float(settings.get("fumble_aggressiveness", 0.5)),
+            settings=settings)
+        plan_words, plan_report = plan.words, plan.report
     timeline = build_timeline_from_transcript(
         source_path=source_video,
         duration_seconds=info.get("duration", 0.0),
-        transcript_words=plan.words,
+        transcript_words=plan_words,
         fps_num=info.get("fps_num", 30),
         fps_den=info.get("fps_den", 1),
         width=info.get("width", 1920),
         height=info.get("height", 1080),
         has_audio=info.get("audio_codec") not in (None, "none"),
-        speech_regions=plan.report.get("speech"),
-        energy_envelope=plan.report.get("energy"),
+        speech_regions=plan_report.get("speech"),
+        energy_envelope=plan_report.get("energy"),
+        keep_full_source=precut,
+        **pacing_kwargs(settings),
     )
-    record_cut_coverage(timeline, plan.report)
+    if plan is not None:
+        record_cut_coverage(timeline, plan_report)
     data["timeline"] = timeline.model_dump()
     store.save_project(project_id, data)
     return timeline
@@ -758,12 +1120,143 @@ def _apply_atmosphere(timeline: Timeline, settings: PresentationSettings,
     return str(values["type"])
 
 
+RECREATION_ORIGIN = "recreation"
+RECREATION_GENRES = ("true_crime", "horror")
+
+
+def _apply_recreations(timeline: Timeline, settings: PresentationSettings,
+                       genre: str) -> int:
+    """Give reenactment B-roll a 'dramatization' look.
+
+    In the investigative genres the generated cutaways ARE reconstructions of a
+    past event, so they get a desaturated, grainy grade and — sparingly — a
+    'DRAMATIZATION' super, the broadcast convention that keeps a recreation from
+    being read as real footage. Only the pass's own layer is replaced on a
+    re-run; anything the user added stays."""
+    from timeline.authoring import clear_generated
+    from timeline.schema import AtmosphereEffect, time_to_frame
+
+    clear_generated(timeline, RECREATION_ORIGIN)
+    if genre not in RECREATION_GENRES:
+        return 0
+
+    broll = sorted(
+        (i for i in timeline.items
+         if i.origin == placement.BROLL_ORIGIN and i.source_id and i.kind == "media"
+         and "generated" in Path(timeline.sources[i.source_id].path).parts),
+        key=lambda i: i.timeline_start_frame)
+    if not broll:
+        return 0
+
+    fps = timeline.fps_num / max(1, timeline.fps_den)
+    count = 0
+    last_label_s = -1e9
+    for item in broll:
+        start_frame = item.timeline_start_frame
+        frames = max(1, item.timeline_end_frame - item.timeline_start_frame)
+        layer = clip_ops.add_adjustment_item(timeline, start_frame, frames, track="V7")
+        layer.origin = RECREATION_ORIGIN
+        layer.label = "recreation look"
+        clip_ops.set_color(timeline, layer.id,
+                           {"saturation": 0.72, "contrast": 1.06, "vignette": 0.22})
+        layer.atmosphere.append(AtmosphereEffect(
+            type="grain", intensity=0.25, origin=RECREATION_ORIGIN))
+        count += 1
+        # The super lands on the first reenactment and then no more often than
+        # every 40s, so it reads as a standing convention, not a per-shot label.
+        start_s = start_frame / fps
+        if start_s - last_label_s >= 40.0:
+            label_frames = min(frames, time_to_frame(1.6, timeline.fps_num, timeline.fps_den))
+            label = clip_ops.add_text_item(
+                timeline, "DRAMATIZATION", start_frame, max(1, label_frames),
+                track=placement.POPUP_TRACK, preset=settings.popup_preset,
+                style={"pos_y": -0.62, "animation": "fade", "animation_duration": 0.3})
+            label.origin = RECREATION_ORIGIN
+            label.label = "dramatization super"
+            last_label_s = start_s
+
+    timeline.recalculate_duration()
+    timeline.revision += 1
+    logger.info("Recreations: %d clips graded", count)
+    return count
+
+
+SCRIPT_FX_ORIGIN = "script_fx"
+
+
+def _apply_script_fx(timeline: Timeline, fx_list: List[Dict[str, Any]], program) -> int:
+    """Place the effect windows the script asked for as adjustment layers.
+
+    Each `[fx: ...]` / `[atmos: ...]` / `[grade: ...]` directive from the script
+    becomes an adjustment item at the moment it was spoken, carrying an
+    AtmosphereEffect (or a colour grade) over its window. Only this pass's own
+    layers are replaced on a re-run; effects the user added by hand stay."""
+    from timeline.authoring import clear_generated
+    from timeline.schema import AtmosphereEffect, time_to_frame
+
+    clear_generated(timeline, SCRIPT_FX_ORIGIN)
+    if not fx_list:
+        return 0
+
+    count = 0
+    for fx in fx_list:
+        at = max(0.0, float(fx.get("at") or 0.0))
+        dur = max(0.2, float(fx.get("dur") or 1.0))
+        start_frame = time_to_frame(at, timeline.fps_num, timeline.fps_den)
+        frames = max(1, time_to_frame(dur, timeline.fps_num, timeline.fps_den))
+        try:
+            layer = clip_ops.add_adjustment_item(timeline, start_frame, frames, track="V7")
+        except Exception as exc:
+            logger.warning("script fx %r could not be placed: %s", fx.get("effect"), exc)
+            continue
+        layer.origin = SCRIPT_FX_ORIGIN
+        layer.label = f"fx: {fx.get('effect') or fx.get('kind')}"
+        if fx.get("kind") == "grade":
+            grade = fx.get("grade") or {}
+            if grade:
+                try:
+                    clip_ops.set_color(timeline, layer.id, grade)
+                except Exception as exc:
+                    logger.warning("script grade could not be applied: %s", exc)
+        else:
+            layer.atmosphere.append(AtmosphereEffect(
+                type=fx.get("effect") or "grain",
+                intensity=float(fx.get("intensity", 0.5)),
+                speed=float(fx.get("speed", 1.0)),
+                color=fx.get("color"),
+                origin=SCRIPT_FX_ORIGIN))
+        count += 1
+
+    timeline.recalculate_duration()
+    timeline.revision += 1
+    logger.info("Script FX: %d effect window(s) placed", count)
+    return count
+
+
+def _apply_text_fx(timeline: Timeline, program, beats, generated_assets,
+                   settings: PresentationSettings, genre: str,
+                   face_anchors: Dict[str, Tuple[float, float]],
+                   busy: List[Tuple[float, float]], card_windows: List[Tuple[float, float]],
+                   project_dir: Path, source_video: Optional[str], seed: int):
+    """Plan and place behind_head/knockout/focus/annotation/newspaper-sweep/
+    kinetic-words/typewriter/glitch. Returns (counts_by_style, matte_backend,
+    skipped) — see presentation.text_fx.apply_moments."""
+    from . import text_fx as text_fx_stage
+    canvas_w = timeline.width or 1920
+    canvas_h = timeline.height or 1080
+    moments = text_fx_stage.plan_moments(program, beats, timeline, generated_assets, settings,
+                                         genre, face_anchors, busy, card_windows, seed=seed)
+    return text_fx_stage.apply_moments(timeline, moments, settings, project_dir, source_video,
+                                       canvas_w, canvas_h)
+
+
 def _apply_sound(timeline: Timeline, program, settings: PresentationSettings,
                  genre: str, seed: int,
                  punch_in_times: Optional[List[float]] = None,
                  extra_sfx: Optional[List[Tuple[float, str]]] = None,
                  loops: Optional[List[Tuple[float, float, str, float]]] = None,
-                 sections: Optional[List[Tuple[float, float, str]]] = None) -> Dict[str, Any]:
+                 sections: Optional[List[Tuple[float, float, str]]] = None,
+                 music_cues: Optional[List[Tuple[float, str]]] = None) -> Dict[str, Any]:
     """Plan and place the music, effects and ambience lanes."""
     from timeline.schema import frame_to_time
     broll = placement.broll_windows(timeline)
@@ -773,8 +1266,10 @@ def _apply_sound(timeline: Timeline, program, settings: PresentationSettings,
     extra.extend(extra_sfx or [])
     plan = sound_stage.plan_sound(timeline, program, settings, genre, seed,
                                   broll_windows=broll, popup_times=popups,
-                                  extra_sfx=extra, loops=loops, sections=sections)
-    counts = sound_stage.apply_sound(timeline, plan, settings, seed)
+                                  extra_sfx=extra, loops=loops, sections=sections,
+                                  music_cues=music_cues)
+    sfx_sources: Dict[str, int] = {}
+    counts = sound_stage.apply_sound(timeline, plan, settings, seed, source_counts=sfx_sources)
     music = ""
     if plan.music:
         names = []
@@ -786,8 +1281,9 @@ def _apply_sound(timeline: Timeline, program, settings: PresentationSettings,
     if plan.ambience:
         cue = plan.ambience[0]
         ambience = f"synth:{cue.kind}" if cue.synthesised else cue.kind
+    music_source = plan.music[0].source if plan.music else ""
     return {"music": music, "sfx": counts.get("sfx", 0), "ambience": ambience,
-            "notes": plan.notes}
+            "notes": plan.notes, "sfx_sources": sfx_sources, "music_source": music_source}
 
 
 def _apply_style_profile(timeline: Timeline, settings: PresentationSettings,
@@ -805,10 +1301,14 @@ def _apply_style_profile(timeline: Timeline, settings: PresentationSettings,
 
 
 def _draw_local_assets(beats, project_dir: Path, width: int, height: int, genre: str,
-                       settings: PresentationSettings):
-    """Maps and charts for the beats that want them (synchronous; run in a thread)."""
+                       settings: PresentationSettings, generated=()):
+    """Maps, charts, newspapers and case files for the beats that want them
+    (synchronous; run in a thread). None of these touch ComfyUI, so they run
+    whether or not it is online and take the same placement path as B-roll."""
     from . import charts as charts_stage
+    from . import dossier as dossier_stage
     from . import maps as maps_stage
+    from . import newspaper as newspaper_stage
     assets: List = []
     failures: List[Dict[str, str]] = []
     if settings.maps:
@@ -817,6 +1317,20 @@ def _draw_local_assets(beats, project_dir: Path, width: int, height: int, genre:
         assets += drawn
         failures += failed
     drawn, failed = charts_stage.render_chart_assets(beats, project_dir, width, height, genre)
+    assets += drawn
+    failures += failed
+    if settings.newspapers:
+        drawn, failed = newspaper_stage.render_newspaper_assets(beats, project_dir, width,
+                                                               height, genre)
+        assets += drawn
+        failures += failed
+    if settings.case_files:
+        drawn, failed = dossier_stage.render_case_file_assets(beats, project_dir, width,
+                                                             height, genre)
+        assets += drawn
+        failures += failed
+    drawn, failed = graphics_stage.render_graphic_assets(beats, project_dir, width, height,
+                                                         generated)
     assets += drawn
     failures += failed
     return assets, failures
@@ -843,15 +1357,19 @@ def _regenerate_captions(timeline: Timeline, settings: PresentationSettings,
 
 async def _make_thumbnail(project_id: str, data: Dict[str, Any],
                           title: Optional[str],
-                          genre: str = "general") -> Optional[str]:
+                          genre: str = "general",
+                          scene: Optional[str] = None) -> Optional[str]:
     """The thumbnail image, from a title already written up front (no LLM here)."""
     from agents.thumbnail_agent import ThumbnailAgent
+    from runtime import gpu_handover
+    # Its own model: hand the card over from whatever phase ran before.
+    await gpu_handover.prepare_for_phase("thumbnail", need_vram_mb=6000, need_ram_mb=4000)
     from models import Project
 
     project = Project.model_validate(data)
     agent = ThumbnailAgent()
     return await agent.generate_thumbnail(project, PROJECTS_DIR / project_id,
-                                          title=title, genre=genre)
+                                          title=title, genre=genre, scene=scene)
 
 
 def _comfyui_online() -> bool:
@@ -861,13 +1379,18 @@ def _comfyui_online() -> bool:
 
 
 async def _eject_llm() -> None:
-    """Unload every LM Studio model so ComfyUI gets the whole GPU."""
-    from llm.lm_launcher import unload_all_models
-    from llm.client import lm_studio_client
-    await unload_all_models(lm_studio_client.base_url)
+    """Unload every LM Studio model so ComfyUI gets the whole GPU.
+
+    Through the `lms` CLI unconditionally: the HTTP check behind
+    `unload_all_models` asks whichever server the LLM client points at, which
+    is not LM Studio when the passes run on a remote model -- and then a model
+    loaded by anything else on the machine was never ejected."""
+    from runtime.gpu_handover import eject_lm_studio
+    await eject_lm_studio()
 
 
-def _write_shot_plan(project_id: str, plan, thumb_title: Optional[str]) -> None:
+def _write_shot_plan(project_id: str, plan, thumb_title: Optional[str],
+                     thumb_scene: Optional[str] = None) -> None:
     """Save the one-shot LLM output — beat prompts and the thumbnail title — so
     generation reads it from disk, and so a run can be inspected afterwards."""
     try:
@@ -877,6 +1400,7 @@ def _write_shot_plan(project_id: str, plan, thumb_title: Optional[str]) -> None:
             "source": plan.source,
             "genre": plan.genre,
             "thumbnail_title": thumb_title,
+            "thumbnail_scene": thumb_scene,
             "beats": [b.model_dump() for b in plan.beats],
         }
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")

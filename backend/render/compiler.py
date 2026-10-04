@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from config import TEMP_DIR
 from render import transitions
@@ -18,7 +18,19 @@ from render.text import build_drawtext
 from render.ass import build_ass, build_ass_filter, needs_ass, write_ass_asset
 from render.audio import build_ducking, build_loudness_chain, build_voice_chain
 
+# Below this many V1 segments the single shared decode is cheaper than opening
+# an input per segment; above it the fan-out dominates (see `compile`).
+_SEEK_INPUTS_MIN_SEGMENTS = 12
+# An overlay clip whose source time runs this far AHEAD of its slot on the
+# timeline is decoded from its own seeked input instead of the shared stream.
+_OVERLAY_SEEK_LAG_SECONDS = 1.0
+
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+
+# GPU (NVDEC) decoding: at most this many inputs, and only ones big enough for
+# the CPU decode to matter (a 4K recording, not a 512px B-roll clip).
+_HW_DECODERS_MAX = 6
+_HW_DECODE_MIN_EDGE = 1280
 
 
 def _is_image(path: str) -> bool:
@@ -84,15 +96,21 @@ def flatten_items(items: List[TimelineItem]) -> List[TimelineItem]:
 
 
 class FilterGraphCompiler:
-    def __init__(self, timeline: Timeline, assets_dir: Optional[Path] = None):
+    def __init__(self, timeline: Timeline, assets_dir: Optional[Path] = None,
+                 canvas: Optional[Tuple[int, int]] = None, hw_decode: bool = False):
+        """`canvas` (w, h) composes the programme at that size instead of the
+        primary source's: a 4K recording delivered at 1080p is composed at
+        1080p, a quarter of the pixels in every overlay, zoom and grade.
+        `hw_decode` decodes the larger video inputs on the GPU (NVDEC)."""
         self.timeline = timeline
+        self.hw_decode = hw_decode
         self.fps_num = timeline.fps_num
         self.fps_den = timeline.fps_den
         self.fps = self.fps_num / self.fps_den
         # Text clips are rendered from sidecar files; keep them beside the other
         # scratch artefacts unless a caller (tests) points somewhere else.
         self.assets_dir = Path(assets_dir) if assets_dir else Path(TEMP_DIR) / "text"
-        self.canvas_w, self.canvas_h = self._canvas_size()
+        self.canvas_w, self.canvas_h = canvas or self._canvas_size()
 
     # -- helpers ---------------------------------------------------------
 
@@ -128,7 +146,8 @@ class FilterGraphCompiler:
 
     # -- compile ---------------------------------------------------------
 
-    def compile(self) -> Tuple[List[str], str, str, str]:
+    def compile(self, loudness_measured: Optional[Dict[str, float]] = None
+               ) -> Tuple[List[str], str, str, str]:
         """
         Compiles the EDL Timeline into FFmpeg command components:
         Returns:
@@ -136,13 +155,119 @@ class FilterGraphCompiler:
             - filter_complex_str: The compiled FFmpeg filter_complex graph
             - video_map_label: Label of final output video stream (e.g. "[final_v]")
             - audio_map_label: Label of final output audio stream (e.g. "[final_a]")
+
+        `loudness_measured` is the first pass's loudnorm stats (see
+        render.audio.measure_loudness_stats). None (the default) compiles the
+        loudness stage as plain single-pass loudnorm, exactly as before —
+        two-pass is something a caller opts into by measuring first.
         """
         input_args: List[str] = []
         source_index_map: Dict[str, int] = {}
+        input_count = 0
+        hw_budget = [_HW_DECODERS_MAX if self.hw_decode else 0]
+
+        def hw_args(src) -> List[str]:
+            """`-hwaccel cuda` for a large video input while the budget lasts.
+            Each NVDEC session holds its own VRAM, so an edit with 150 seeked
+            segment inputs must not open 150 of them; the rest decode on the CPU
+            as before. Without an output format ffmpeg downloads the frames
+            itself, so the graph is unchanged, and it falls back to software
+            decoding if CUDA cannot start."""
+            if hw_budget[0] <= 0 or src is None or src.kind == "image" or _is_image(src.path):
+                return []
+            if max(int(src.width or 0), int(src.height or 0)) < _HW_DECODE_MIN_EDGE:
+                return []
+            hw_budget[0] -= 1
+            return ["-hwaccel", "cuda"]
+
+        # The primary programme sources first, so they get the GPU decoders.
+        ordered = sorted(self.timeline.sources.items(),
+                         key=lambda kv: -max(int(kv[1].width or 0), int(kv[1].height or 0)))
+        index_of = {src_id: n for n, (src_id, _) in enumerate(self.timeline.sources.items())}
+        hw_for = {src_id: hw_args(src) for src_id, src in ordered}
+
+        def thread_args(src, hw: List[str]) -> List[str]:
+            """One decoder thread for every small input. Left to itself each
+            input starts a pool sized to the machine (28 here) with its own
+            frame buffers: a 230-input render ran 4,195 threads, for stills,
+            short clips and sound effects that decode in microseconds."""
+            if hw:
+                return []
+            big = max(int(src.width or 0), int(src.height or 0)) >= _HW_DECODE_MIN_EDGE
+            is_video = src.kind != "image" and not _is_image(src.path) and src.kind != "audio"
+            return [] if (big and is_video) else ["-threads", "1"]
 
         for src_id, src in self.timeline.sources.items():
-            source_index_map[src_id] = len(input_args) // 2
-            input_args.extend(["-i", src.path])
+            source_index_map[src_id] = index_of[src_id]
+            input_args.extend([*hw_for[src_id], *thread_args(src, hw_for[src_id]), "-i", src.path])
+            input_count += 1
+
+        # Segment inputs. With the whole cut trimmed out of ONE decoded stream,
+        # every decoded frame fans out to every segment's trim branch, and the
+        # ones whose turn has not come yet hold their frames -- measured on a
+        # 150-segment edit, the V1 chain ran at 0.28x realtime where its first
+        # 10 segments alone ran at 8.6x: the cost grows with the number of cuts,
+        # not the length. Past a handful of segments each one gets its own
+        # input, seeked to its start (-ss before -i is frame-accurate: FFmpeg
+        # decodes from the keyframe and drops up to the mark), so it decodes
+        # only its own few seconds. -threads 1 keeps 150 decoders from each
+        # allocating a full frame-thread pool.
+        segment_inputs: Dict[Tuple[str, int, int], int] = {}
+
+        def segment_input(item: TimelineItem) -> Optional[int]:
+            nonlocal input_count
+            if len(v1_items_all) < _SEEK_INPUTS_MIN_SEGMENTS:
+                return None
+            src = self.timeline.sources.get(item.source_id)
+            if src is None or not src.path:
+                return None
+            key = (item.source_id, item.source_start_frame, item.source_end_frame)
+            if key not in segment_inputs:
+                start = self._sec(item.source_start_frame)
+                span = self._sec(item.source_end_frame) - start
+                input_args.extend([*hw_args(src), "-ss", f"{start:.3f}", "-t", f"{span + 0.1:.3f}",
+                                   "-threads", "1", "-i", src.path])
+                segment_inputs[key] = input_count
+                input_count += 1
+            return segment_inputs[key]
+
+        # Overlay clips cut from a video source AHEAD of where they play. The
+        # cold open is the one that matters: a hook from 39s into the programme
+        # shown at t=0. Trimmed out of the same decoded stream as V1, that
+        # overlay cannot emit its first frame until the decoder reaches 39s,
+        # and every frame the V1 chain produced meanwhile (upscaled for the
+        # zoompan, ~16 MB each) waits in the graph's queues: hundreds of MB per
+        # second of lag, gigabytes within a minute, no output frame at all --
+        # until Sentinel freezes and then kills ffmpeg (exit code 1, no message).
+        # A seeked input decodes just the clip, so the graph flows from frame 0.
+        overlay_seek_inputs: Dict[Tuple[str, int, int], int] = {}
+
+        def overlay_seek_input(item: TimelineItem) -> Optional[int]:
+            nonlocal input_count
+            src = self.timeline.sources.get(item.source_id or "")
+            if src is None or not src.path or self._is_still(item):
+                return None
+            lag = self._sec(item.source_start_frame) - self._sec(item.timeline_start_frame)
+            # The mirror image of the cold-open case: a clip whose slot comes
+            # LATER than its own time (every B-roll clip -- source time 0,
+            # shown minutes in). On the shared stream its packets are stamped
+            # from 0, ffmpeg reads the lowest timestamp first, so the whole
+            # clip was decoded at once and held until its slot: a real 8-minute
+            # render peaked at 14.7 GB. `-itsoffset` stamps the input with its
+            # slot, and ffmpeg then reads it only when the programme gets there.
+            if abs(lag) <= _OVERLAY_SEEK_LAG_SECONDS:
+                return None
+            key = (item.source_id, item.source_start_frame, item.source_end_frame,
+                   item.timeline_start_frame)
+            if key not in overlay_seek_inputs:
+                start = self._sec(item.source_start_frame)
+                span = self._sec(item.source_end_frame) - start
+                offset = self._sec(item.timeline_start_frame)
+                input_args.extend([*hw_args(src), "-itsoffset", f"{offset:.3f}", "-ss", f"{start:.3f}",
+                                   "-t", f"{span + 0.1:.3f}", "-threads", "1", "-i", src.path])
+                overlay_seek_inputs[key] = input_count
+                input_count += 1
+            return overlay_seek_inputs[key]
 
         items = flatten_items(self.timeline.items)
 
@@ -153,14 +278,19 @@ class FilterGraphCompiler:
             key=lambda i: (_track_num(i.track), i.timeline_start_frame),
         )
 
+        # V1 and A1 are concatenated in the order given, so they are put in time
+        # order first: a hand-split clip used to append both halves to the end
+        # of the list, and the render then played them after everything else.
+        by_start = lambda i: i.timeline_start_frame
         v1_items = ([] if self._track_hidden("V1")
-                    else [i for i in media if i.track == "V1"])
+                    else sorted((i for i in media if i.track == "V1"), key=by_start))
         # An item whose source carries no audio stream cannot be trimmed with
         # [n:a] — ffmpeg rejects the whole graph with "matches no streams". The
         # transcript builder creates A1 items unconditionally, so silent footage
         # would otherwise make the project unrenderable.
         a1_items = ([] if self._track_muted("A1")
-                    else [i for i in media if i.track == "A1" and self._has_audio(i)])
+                    else sorted((i for i in media if i.track == "A1" and self._has_audio(i)),
+                                key=by_start))
         # Manual overlay video tracks (V2, V3, ...) — composited on top of the V1 program,
         # ordered bottom-to-top by track number, then by timeline position.
         overlay_items = sorted(
@@ -187,6 +317,7 @@ class FilterGraphCompiler:
 
         if not v1_items:
             raise ValueError("Timeline has no enabled V1 video items to render.")
+        v1_items_all = v1_items
 
         filters: List[str] = []
 
@@ -202,6 +333,8 @@ class FilterGraphCompiler:
         pad_sec = self._sec(pad_frames)
         normalize_v1 = len(v1_dims) > 1 or pad_frames > 0 or any(
             i.transform and not i.transform.is_identity() for i in v1_items
+        ) or any(  # composed at a size other than the footage's (a 4K take on a 1080p canvas)
+            (int(w or 0), int(h or 0)) != (self.canvas_w, self.canvas_h) for w, h in v1_dims
         )
 
         v1_labels: List[str] = []
@@ -210,7 +343,12 @@ class FilterGraphCompiler:
             start_sec = self._sec(item.source_start_frame)
             end_sec = self._sec(item.source_end_frame)
             out_label = f"[v1_{idx}]"
-            chain = [f"trim=start={start_sec:.3f}:end={end_sec:.3f}", "setpts=PTS-STARTPTS"]
+            seg_idx = segment_input(item)
+            if seg_idx is not None:
+                src_idx = seg_idx
+                chain = [f"trim=duration={end_sec - start_sec:.3f}", "setpts=PTS-STARTPTS"]
+            else:
+                chain = [f"trim=start={start_sec:.3f}:end={end_sec:.3f}", "setpts=PTS-STARTPTS"]
             geometry = self._geometry_for(item, normalize_v1)
             # Every V1 clip is either concatenated or cross-faded with its
             # neighbours, and both demand identical frame rate, SAR and pixel
@@ -261,10 +399,17 @@ class FilterGraphCompiler:
             start_sec = self._sec(item.source_start_frame)
             end_sec = self._sec(item.source_end_frame)
             out_label = f"[a1_{idx}]"
-            chain = [
-                f"atrim=start={start_sec:.3f}:end={end_sec:.3f}",
-                "asetpts=PTS-STARTPTS",
-            ]
+            # Same fan-out as V1; an A1 item usually spans exactly its V1
+            # partner's range, so it shares that segment's seeked input.
+            seg_idx = segment_input(item)
+            if seg_idx is not None:
+                src_idx = seg_idx
+                chain = [f"atrim=duration={end_sec - start_sec:.3f}", "asetpts=PTS-STARTPTS"]
+            else:
+                chain = [
+                    f"atrim=start={start_sec:.3f}:end={end_sec:.3f}",
+                    "asetpts=PTS-STARTPTS",
+                ]
             if item.volume != 1.0:
                 chain.append(f"volume={item.volume:.3f}")
             # Declick every join: a hard concat at an arbitrary sample almost
@@ -332,7 +477,7 @@ class FilterGraphCompiler:
                 continue
 
             overlay_input, x_expr, y_expr = self._build_overlay_input(
-                item, idx, source_index_map, filters
+                item, idx, source_index_map, filters, overlay_seek_input
             )
             tl_start_sec = self._sec(item.timeline_start_frame)
             tl_end_sec = self._sec(item.timeline_end_frame)
@@ -422,7 +567,7 @@ class FilterGraphCompiler:
             final_a_label = mixed_label
 
         # 6b. Loudness target on the finished mix — what the platform measures.
-        loudness_chain = build_loudness_chain(master_a)
+        loudness_chain = build_loudness_chain(master_a, measured=loudness_measured)
         if loudness_chain and final_a_label != "[anull]":
             out_label = "[master_a]"
             filters.append(f"{final_a_label}" + ",".join(loudness_chain) + out_label)
@@ -662,10 +807,19 @@ class FilterGraphCompiler:
         start_frame = item.timeline_start_frame
         chain: List[str] = []
 
+        # The work copy is trimmed to this clip's own window before anything
+        # runs on it. Untrimmed, every adjustment processed the WHOLE programme
+        # -- a 0.8s punch-in ran zoompan at 5760x3240 over all ~10k frames and
+        # overlay's `enable` threw 99% of it away; 27 of them made the final
+        # render crawl at <0.1x realtime. zoompan restarts `on` (and its PTS)
+        # at the window, hence frame_offset=0 and the re-anchor below, which
+        # puts timestamps back on the programme clock the effects expect.
+        win_start = self._sec(start_frame)
+        win_end = self._sec(item.timeline_end_frame)
         if transform is not None and not self._is_opacity_only(transform):
             chain.extend(build_canvas_transform(
                 transform, self.canvas_w, self.canvas_h,
-                max(1, item.duration_frames), self.fps, frame_offset=start_frame,
+                max(1, item.duration_frames), self.fps, frame_offset=0,
             ))
         chain.extend(build_color_chain(item.color, self._sec(item.duration_frames)))
         effects = [e for e in item.atmosphere if e.enabled]
@@ -678,16 +832,20 @@ class FilterGraphCompiler:
         work_label = f"[adjsrc_{index}]"
         filters.append(f"{input_label}split{base_label}{work_label}")
 
-        if chain:
-            out_label = f"[adjfx_{index}]"
-            filters.append(f"{work_label}" + ",".join(chain) + out_label)
-            work_label = out_label
+        out_label = f"[adjfx_{index}]"
+        filters.append(
+            f"{work_label}trim=start={win_start:.3f}:end={win_end:.3f},"
+            + "".join(f"{c}," for c in chain)
+            + f"setpts=PTS-STARTPTS+{win_start:.3f}/TB{out_label}"
+        )
+        work_label = out_label
 
         for order, effect in enumerate(effects):
             out_label = f"[adjatmo_{index}_{order}]"
             statements = build_effect(
                 effect, work_label, out_label, self.canvas_w, self.canvas_h,
                 self.fps, total_seconds, f"{index}_{order}",
+                assets_dir=self.assets_dir,
             )
             if statements:
                 filters.extend(statements)
@@ -700,11 +858,30 @@ class FilterGraphCompiler:
             filters.append(f"{work_label}" + ",".join(fade) + out_label)
             work_label = out_label
 
+        if start_frame > 0:
+            # The trimmed copy has no frames before its window, and overlay's
+            # framesync will not let a base frame through until the treated
+            # copy has produced its first one. With the first window at 109s
+            # that held every base frame before it in RAM (~8 GB at 1080p),
+            # FFmpeg never wrote a frame, and the memory guardian froze and
+            # then killed it (exit code 1, nothing on stderr). Padding the copy
+            # with black from t=0 keeps the two streams in step; the overlay is
+            # disabled outside the window, so the pad is never composited.
+            # Re-anchoring to 0 first makes tpad land the real frames exactly
+            # at win_start (start_frame pad frames at the timeline rate).
+            out_label = f"[adjpad_{index}]"
+            filters.append(
+                f"{work_label}setpts=PTS-STARTPTS,"
+                f"tpad=start_mode=add:start_duration={win_start:.3f}:color=black{out_label}"
+            )
+            work_label = out_label
+
         out_label = f"[adj_{index}]"
+        # eof_action=pass: the trimmed copy ends with its window, and the rest
+        # of the programme must flow through untouched rather than stall on it.
         filters.append(
-            f"{base_label}{work_label}overlay=x=0:y=0:"
-            f"enable='between(t,{self._sec(start_frame):.3f},"
-            f"{self._sec(item.timeline_end_frame):.3f})'{out_label}"
+            f"{base_label}{work_label}overlay=x=0:y=0:eof_action=pass:"
+            f"enable='between(t,{win_start:.3f},{win_end:.3f})'{out_label}"
         )
         return out_label
 
@@ -719,8 +896,13 @@ class FilterGraphCompiler:
         idx: int,
         source_index_map: Dict[str, int],
         filters: List[str],
+        seek_input: Optional[Callable[[TimelineItem], Optional[int]]] = None,
     ) -> Tuple[str, str, str]:
-        """Prepare an overlay clip's stream and return (label, x_expr, y_expr)."""
+        """Prepare an overlay clip's stream and return (label, x_expr, y_expr).
+
+        `seek_input` may hand a video clip its own seeked input index (see
+        `overlay_seek_input` in `compile`); None keeps the shared stream.
+        """
         src_idx = source_index_map[item.source_id]
         tl_start_sec = self._sec(item.timeline_start_frame)
         tl_end_sec = self._sec(item.timeline_end_frame)
@@ -753,10 +935,18 @@ class FilterGraphCompiler:
 
         src_start_sec = self._sec(item.source_start_frame)
         src_end_sec = self._sec(item.source_end_frame)
-        chain = [
-            f"trim=start={src_start_sec:.3f}:end={src_end_sec:.3f}",
-            "setpts=PTS-STARTPTS",
-        ]
+        seek_idx = seek_input(item) if seek_input is not None else None
+        if seek_idx is not None:
+            src_idx = seek_idx
+            chain = [
+                f"trim=duration={src_end_sec - src_start_sec:.3f}",
+                "setpts=PTS-STARTPTS",
+            ]
+        else:
+            chain = [
+                f"trim=start={src_start_sec:.3f}:end={src_end_sec:.3f}",
+                "setpts=PTS-STARTPTS",
+            ]
         chain_geo, x_expr, y_expr = build_overlay_transform(
             item.transform, self.canvas_w, self.canvas_h, duration_frames,
             self.fps, tl_start_sec, tl_end_sec,

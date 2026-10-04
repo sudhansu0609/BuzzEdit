@@ -46,12 +46,21 @@ export function chordLabel(chord?: string): string {
     .join('+');
 }
 
-/** True when the event target is a text field we must not steal keys from. */
+/** True when the event target is a field we must not steal keys from. A
+ *  dropdown counts: its arrow keys pick an option, they don't step frames. */
 function inTextField(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   if (!el) return false;
   const tag = el.tagName;
-  return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
+
+function hasTextSelection(): boolean {
+  try {
+    return !!window.getSelection()?.toString();
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -69,13 +78,22 @@ export function useShortcuts() {
       const { keymap, run, isEnabled } = useCommandStore.getState();
       // Resolve chord -> command id using overrides on top of defaults. An empty
       // override means the command was explicitly unbound, so it never matches.
+      // Main chords are matched before extra ones, so a user binding always wins
+      // over another command's secondary default.
+      const fire = (cmd: (typeof COMMANDS)[number]) => {
+        if (!isEnabled(cmd.id)) return false;
+        if (cmd.yieldsToTextSelection && hasTextSelection()) return false;
+        e.preventDefault();
+        run(cmd.id);
+        return true;
+      };
       for (const cmd of COMMANDS) {
         const bound = cmd.id in keymap ? keymap[cmd.id] : cmd.defaultChord;
-        if (bound && bound === chord && isEnabled(cmd.id)) {
-          e.preventDefault();
-          run(cmd.id);
-          return;
-        }
+        if (bound && bound === chord && fire(cmd)) return;
+      }
+      for (const cmd of COMMANDS) {
+        if (cmd.id in keymap) continue;
+        if ((cmd.extraChords ?? []).includes(chord) && fire(cmd)) return;
       }
     };
     window.addEventListener('keydown', onKey);

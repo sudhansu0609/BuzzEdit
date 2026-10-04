@@ -181,6 +181,65 @@ def test_centre_cards_keep_clear_of_the_opening_title_but_not_of_popups():
     assert counts == {"chapter_title": 1, "definition_card": 1}
 
 
+# --- genre-blended card-type weighting -------------------------------------
+
+def test_affinity_boost_primary_secondary_and_none():
+    assert cards._affinity_boost("quote_card", "motivational", None) == cards._AFFINITY_PRIMARY_BOOST
+    assert cards._affinity_boost("quote_card", "vlog", "motivational") == cards._AFFINITY_SECONDARY_BOOST
+    assert 0.0 < cards._AFFINITY_SECONDARY_BOOST < cards._AFFINITY_PRIMARY_BOOST
+    assert cards._affinity_boost("quote_card", "vlog", None) == 0.0
+    assert cards._affinity_boost("quote_card", "vlog", "vlog") == 0.0
+    assert cards._affinity_boost("quote_card", "vlog", "general") == 0.0
+
+
+def test_a_favoured_primary_genre_kind_wins_a_shared_centre_slot():
+    # Equal, modest durations: whichever card claims 10.0 first, the other has
+    # room to slide to (within SLIDE_MAX_S) rather than being dropped, so both
+    # scenarios below place both cards and only their order differs.
+    beats = [
+        Beat(kind="chapter_title", start_s=10.0, end_s=12.0, topic="a", text="Chapter",
+             origin="structure"),
+        Beat(kind="quote_card", start_s=10.0, end_s=12.0, topic="a", text="“quote”",
+             origin="entity"),
+    ]
+
+    timeline = _timeline()
+    program = build_program(timeline)
+    cards.place_cards(timeline, beats, program, PresentationSettings(), "general")
+    items = [i for i in timeline.items if i.origin == cards.CARD_ORIGIN and i.kind == "text"]
+    chapter = next(i for i in items if (i.label or "").startswith("chapter_title"))
+    quote = next(i for i in items if (i.label or "").startswith("quote_card"))
+    # No affinity: equal priority, chapter_title (listed first) claims the slot.
+    assert chapter.timeline_start_frame < quote.timeline_start_frame
+
+    timeline2 = _timeline()
+    program2 = build_program(timeline2)
+    cards.place_cards(timeline2, beats, program2, PresentationSettings(), "motivational")
+    items2 = [i for i in timeline2.items if i.origin == cards.CARD_ORIGIN and i.kind == "text"]
+    chapter2 = next(i for i in items2 if (i.label or "").startswith("chapter_title"))
+    quote2 = next(i for i in items2 if (i.label or "").startswith("quote_card"))
+    # motivational favours quote_card: it now claims the slot instead.
+    assert quote2.timeline_start_frame < chapter2.timeline_start_frame
+
+
+def test_a_favoured_secondary_genre_kind_also_wins_a_shared_centre_slot():
+    beats = [
+        Beat(kind="chapter_title", start_s=10.0, end_s=12.0, topic="a", text="Chapter",
+             origin="structure"),
+        Beat(kind="stat_callout", start_s=10.0, end_s=12.0, topic="a", text="25%",
+             data={"value": 25}, origin="entity"),
+    ]
+    timeline = _timeline()
+    program = build_program(timeline)
+    # vlog alone favours nothing; motivational blended in as the secondary
+    # still lifts stat_callout enough to win the shared slot.
+    cards.place_cards(timeline, beats, program, PresentationSettings(), "vlog", "motivational")
+    items = [i for i in timeline.items if i.origin == cards.CARD_ORIGIN and i.kind == "text"]
+    chapter = next(i for i in items if (i.label or "").startswith("chapter_title"))
+    stat = next(i for i in items if i.label.startswith("stat:"))
+    assert stat.timeline_start_frame < chapter.timeline_start_frame
+
+
 def test_text_beats_survive_sanitising():
     timeline = _timeline()
     program = build_program(timeline)

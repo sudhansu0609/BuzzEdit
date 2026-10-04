@@ -33,7 +33,12 @@ logger = logging.getLogger("script_align")
 # (a script may legitimately contain "[laughs]"; that is not a directive).
 DIRECTIVES = ("map", "sfx", "broll", "video", "text", "title", "card", "chapter",
               "music", "mood", "quote", "stat", "source", "character", "location",
-              "chart", "definition", "split", "freeze")
+              "chart", "definition", "split", "freeze", "newspaper", "case_file",
+              "fx", "atmos", "grade",
+              # designed graphics (presentation/graphics.py; grammar in
+              # presentation/script.py::directive_beats)
+              "statement", "canvas", "pills", "point", "name", "source_quote",
+              "document", "timeline")
 _DIRECTIVE_RE = re.compile(
     r"\[\s*(" + "|".join(DIRECTIVES) + r")\s*:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 _HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.+?)\s*$")

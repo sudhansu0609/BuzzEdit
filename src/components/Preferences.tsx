@@ -4,14 +4,18 @@ import {
   getLlmStatus, ensureLlm, getLlmModels, LlmModelList, LlmStatus,
   getComfyUIStatus, listGenerationWorkflows, getComfyUIModels, ComfyModelList,
   getGpuStatus, getSystemPaths, clearVram, COMFY_BASE, hostPort,
+  getPresentationOverrides, setPresentationOverrides, PresentationOverrideMode,
+  getStockKeys, setStockKeys, StockKeysState,
+  audioPreview, mediaStreamUrl,
 } from '../hooks/api';
+import { useProjectStore } from '../hooks/store';
 import {
   useAppearanceStore, ACCENT_SWATCHES, THEMES, DensityId,
 } from '../hooks/appearance';
 import { COMMANDS, COMMAND_GROUPS, useCommandStore } from '../hooks/commands';
 import { eventToChord, chordLabel } from '../hooks/shortcuts';
 
-export type PrefTab = 'general' | 'models' | 'shortcuts' | 'appearance' | 'diagnostics';
+export type PrefTab = 'general' | 'models' | 'presentation' | 'shortcuts' | 'appearance' | 'diagnostics';
 
 interface Props {
   isOpen: boolean;
@@ -22,6 +26,7 @@ interface Props {
 const TABS: { id: PrefTab; label: string; icon: string }[] = [
   { id: 'general', label: 'General', icon: '⚙️' },
   { id: 'models', label: 'AI Models', icon: '🧠' },
+  { id: 'presentation', label: 'Presentation', icon: '🎬' },
   { id: 'shortcuts', label: 'Shortcuts', icon: '⌨️' },
   { id: 'appearance', label: 'Appearance', icon: '🎨' },
   { id: 'diagnostics', label: 'Diagnostics', icon: '🩺' },
@@ -64,6 +69,7 @@ export default function Preferences({ isOpen, onClose, initialTab = 'general' }:
           <div className="pref-content">
             {tab === 'general' && <GeneralTab />}
             {tab === 'models' && <ModelsTab />}
+            {tab === 'presentation' && <PresentationTab />}
             {tab === 'shortcuts' && <ShortcutsTab />}
             {tab === 'appearance' && <AppearanceTab />}
             {tab === 'diagnostics' && <DiagnosticsTab />}
@@ -328,6 +334,316 @@ function sizeToStr(v: any): string | null {
 function strToSize(s: string): number[] {
   const [w, h] = s.split('x').map((n) => parseInt(n, 10));
   return [w, h];
+}
+
+// --- Presentation defaults & overrides (BuzzcafStudio contract) --------------
+
+// The 18 genres presentation/genre.py styles (GENRE_STYLES keys), in the same
+// order — "general" first, since that's the identity genre.
+const GENRE_OPTIONS = [
+  'general', 'horror', 'true_crime', 'comedy', 'gaming', 'tech', 'science_education',
+  'finance', 'motivational', 'health_fitness', 'cooking', 'travel', 'devotional',
+  'news', 'vlog', 'documentary', 'mystery', 'geopolitics',
+];
+const DENSITY_OPTIONS = ['calm', 'balanced', 'busy', 'max'] as const;
+const VOICE_PRESET_OPTIONS = [
+  'studio_mic', 'broadcast', 'warm_radio', 'rap_vocal', 'horror_intimate',
+  'clean', 'podcast', 'light',
+];
+const SOURCE_OPTIONS = ['auto', 'library', 'generated', 'synth', 'off'];
+
+const PRESENTATION_FIELDS = [
+  'density', 'genre', 'genre_secondary', 'target_coverage', 'video_broll_share',
+  'punch_rate_per_minute', 'text_fx_per_minute', 'zoom_depth', 'voice_preset',
+  'sfx_source', 'music_source',
+] as const;
+type PresentationField = typeof PRESENTATION_FIELDS[number];
+
+const PRESENTATION_DEFAULTS: Record<PresentationField, any> = {
+  density: 'balanced', genre: 'general', genre_secondary: '',
+  target_coverage: 0.5, video_broll_share: 0.2, punch_rate_per_minute: 1.5,
+  text_fx_per_minute: 2.0, zoom_depth: 0.10, voice_preset: 'studio_mic',
+  sfx_source: 'auto', music_source: 'auto',
+};
+
+function PresentationTab() {
+  const { project } = useProjectStore();
+  const [mode, setMode] = useState<PresentationOverrideMode>('off');
+  const [locked, setLocked] = useState<Set<PresentationField>>(new Set());
+  const [values, setValues] = useState<Record<PresentationField, any>>({ ...PRESENTATION_DEFAULTS });
+  const [loaded, setLoaded] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [stockKeys, setStockKeysState] = useState<StockKeysState | null>(null);
+  const [pexelsInput, setPexelsInput] = useState('');
+  const [pixabayInput, setPixabayInput] = useState('');
+  const [savingKeys, setSavingKeys] = useState(false);
+  const [keysNote, setKeysNote] = useState<string | null>(null);
+
+  useEffect(() => {
+    getStockKeys().then(setStockKeysState).catch(() => {});
+  }, []);
+
+  const saveStockKey = async (field: 'pexels_api_key' | 'pixabay_api_key', value: string) => {
+    if (!value) return;
+    setSavingKeys(true);
+    try {
+      const next = await setStockKeys({ [field]: value });
+      setStockKeysState(next);
+      if (field === 'pexels_api_key') setPexelsInput(''); else setPixabayInput('');
+      setKeysNote('Saved.');
+      setTimeout(() => setKeysNote(null), 1500);
+    } catch (e: any) {
+      setKeysNote(`Save failed: ${e.message}`);
+    } finally {
+      setSavingKeys(false);
+    }
+  };
+
+  useEffect(() => {
+    getPresentationOverrides().then((state) => {
+      const saved = state.presentation_overrides || {};
+      const nextValues = { ...PRESENTATION_DEFAULTS };
+      const nextLocked = new Set<PresentationField>();
+      for (const field of PRESENTATION_FIELDS) {
+        if (field in saved) {
+          nextValues[field] = saved[field];
+          nextLocked.add(field);
+        }
+      }
+      setMode(state.override_mode || 'off');
+      setValues(nextValues);
+      setLocked(nextLocked);
+      setLoaded(true);
+    }).catch(() => setLoaded(true));
+  }, []);
+
+  const persist = useCallback(async (
+    nextValues: Record<PresentationField, any>,
+    nextLocked: Set<PresentationField>,
+    nextMode: PresentationOverrideMode,
+  ) => {
+    const overrides: Record<string, any> = {};
+    for (const field of PRESENTATION_FIELDS) {
+      if (nextMode === 'all' || (nextMode === 'fields' && nextLocked.has(field))) {
+        overrides[field] = nextValues[field];
+      }
+    }
+    try {
+      await setPresentationOverrides(overrides, nextMode);
+      setNote('Saved.');
+      setTimeout(() => setNote(null), 1500);
+    } catch (e: any) {
+      setNote(`Save failed: ${e.message}`);
+    }
+  }, []);
+
+  const setValue = (field: PresentationField, value: any) => {
+    const next = { ...values, [field]: value };
+    setValues(next);
+    persist(next, locked, mode);
+  };
+
+  const toggleLock = (field: PresentationField) => {
+    const next = new Set(locked);
+    if (next.has(field)) next.delete(field); else next.add(field);
+    setLocked(next);
+    persist(values, next, mode);
+  };
+
+  const changeMode = (next: PresentationOverrideMode) => {
+    setMode(next);
+    persist(values, locked, next);
+  };
+
+  const runPreview = async () => {
+    if (!project) return;
+    setPreviewing(true);
+    setPreviewError(null);
+    setPreviewUrl(null);
+    try {
+      const res = await audioPreview(project.id, values.voice_preset);
+      setPreviewUrl(mediaStreamUrl(res.path));
+    } catch (e: any) {
+      setPreviewError(e.message || 'Preview failed');
+    } finally {
+      setPreviewing(false);
+    }
+  };
+
+  if (!loaded) return <div className="pref-section">Loading…</div>;
+
+  return (
+    <div className="pref-section">
+      {note && <div className="pref-saved-banner">{note}</div>}
+      <h4>Presentation defaults &amp; overrides
+        <span className="pref-hint">for BuzzcafStudio-enqueued jobs</span>
+      </h4>
+      <p className="pref-note">
+        BuzzcafStudio sends its own density, genre and voice settings with every overnight job.
+        <strong> Off</strong> leaves them alone; <strong>Fields</strong> overrides only the fields
+        locked below; <strong>All</strong> overrides every field on this page, whatever Studio sent.
+      </p>
+
+      <Field label="Override mode">
+        <div className="seg-row">
+          {(['off', 'fields', 'all'] as PresentationOverrideMode[]).map((m) => (
+            <button key={m} type="button" className={`seg ${mode === m ? 'active' : ''}`}
+              onClick={() => changeMode(m)}>{m}</button>
+          ))}
+        </div>
+      </Field>
+
+      <LockableField label="Density" field="density" mode={mode} locked={locked} onToggleLock={toggleLock}>
+        <select className="pref-input" value={values.density}
+          onChange={(e) => setValue('density', e.target.value)}>
+          {DENSITY_OPTIONS.map((d) => <option key={d} value={d}>{d}</option>)}
+        </select>
+      </LockableField>
+
+      <LockableField label="Genre" field="genre" mode={mode} locked={locked} onToggleLock={toggleLock}>
+        <select className="pref-input" value={values.genre}
+          onChange={(e) => setValue('genre', e.target.value)}>
+          {GENRE_OPTIONS.map((g) => <option key={g} value={g}>{g}</option>)}
+        </select>
+      </LockableField>
+
+      <LockableField label="Secondary genre" field="genre_secondary" mode={mode} locked={locked} onToggleLock={toggleLock}>
+        <select className="pref-input" value={values.genre_secondary}
+          onChange={(e) => setValue('genre_secondary', e.target.value)}>
+          <option value="">— none —</option>
+          {GENRE_OPTIONS.map((g) => <option key={g} value={g}>{g}</option>)}
+        </select>
+      </LockableField>
+
+      <LockableField label={`Coverage — ${Math.round(values.target_coverage * 100)}%`}
+        field="target_coverage" mode={mode} locked={locked} onToggleLock={toggleLock}>
+        <input type="range" min={0} max={0.8} step={0.01} value={values.target_coverage}
+          onChange={(e) => setValue('target_coverage', parseFloat(e.target.value))} />
+      </LockableField>
+
+      <LockableField label={`Video share — ${Math.round(values.video_broll_share * 100)}%`}
+        field="video_broll_share" mode={mode} locked={locked} onToggleLock={toggleLock}>
+        <input type="range" min={0} max={1} step={0.01} value={values.video_broll_share}
+          onChange={(e) => setValue('video_broll_share', parseFloat(e.target.value))} />
+      </LockableField>
+
+      <LockableField label={`Punch-ins / min — ${Number(values.punch_rate_per_minute).toFixed(1)}`}
+        field="punch_rate_per_minute" mode={mode} locked={locked} onToggleLock={toggleLock}>
+        <input type="range" min={0} max={5} step={0.1} value={values.punch_rate_per_minute}
+          onChange={(e) => setValue('punch_rate_per_minute', parseFloat(e.target.value))} />
+      </LockableField>
+
+      <LockableField label={`Text FX / min — ${Number(values.text_fx_per_minute).toFixed(1)}`}
+        field="text_fx_per_minute" mode={mode} locked={locked} onToggleLock={toggleLock}>
+        <input type="range" min={0} max={6} step={0.1} value={values.text_fx_per_minute}
+          onChange={(e) => setValue('text_fx_per_minute', parseFloat(e.target.value))} />
+      </LockableField>
+
+      <LockableField label={`Zoom depth — ${Number(values.zoom_depth).toFixed(2)}`}
+        field="zoom_depth" mode={mode} locked={locked} onToggleLock={toggleLock}>
+        <input type="range" min={0.04} max={0.3} step={0.01} value={values.zoom_depth}
+          onChange={(e) => setValue('zoom_depth', parseFloat(e.target.value))} />
+      </LockableField>
+
+      <LockableField label="Voice preset" field="voice_preset" mode={mode} locked={locked} onToggleLock={toggleLock}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flex: 1 }}>
+          <select className="pref-input" value={values.voice_preset}
+            onChange={(e) => setValue('voice_preset', e.target.value)}>
+            {VOICE_PRESET_OPTIONS.map((v) => <option key={v} value={v}>{v}</option>)}
+          </select>
+          <button className="btn btn-sm" disabled={!project || previewing} onClick={runPreview}
+            title={project ? "Render 20s of this project's voice through the preset"
+                            : 'Open a project to preview'}>
+            {previewing ? 'Rendering…' : '▶ Preview 20s'}
+          </button>
+        </div>
+      </LockableField>
+      {previewUrl && <audio controls src={previewUrl} style={{ width: '100%', marginTop: 6 }} />}
+      {previewError && (
+        <p className="pref-note" style={{ color: 'var(--danger)' }}>{previewError}</p>
+      )}
+
+      <LockableField label="SFX source" field="sfx_source" mode={mode} locked={locked} onToggleLock={toggleLock}>
+        <select className="pref-input" value={values.sfx_source}
+          onChange={(e) => setValue('sfx_source', e.target.value)}>
+          {SOURCE_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+      </LockableField>
+
+      <LockableField label="Music source" field="music_source" mode={mode} locked={locked} onToggleLock={toggleLock}>
+        <select className="pref-input" value={values.music_source}
+          onChange={(e) => setValue('music_source', e.target.value)}>
+          {SOURCE_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+      </LockableField>
+
+      <h4>Free stock fallback</h4>
+      <p className="pref-note">
+        Free sources only; used only when ComfyUI can&apos;t make a visual and
+        &quot;Allow free stock&quot; is on.
+      </p>
+      {keysNote && <div className="pref-saved-banner">{keysNote}</div>}
+
+      <Field label="Pexels API key">
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flex: 1 }}>
+          <input type="password" className="pref-input" value={pexelsInput}
+            placeholder={stockKeys?.pexels_api_key_set ? `Saved: ${stockKeys.pexels_api_key}` : 'Not set'}
+            onChange={(e) => setPexelsInput(e.target.value)} />
+          <button className="btn btn-sm" disabled={!pexelsInput || savingKeys}
+            onClick={() => saveStockKey('pexels_api_key', pexelsInput)}>
+            Save
+          </button>
+        </div>
+      </Field>
+
+      <Field label="Pixabay API key">
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flex: 1 }}>
+          <input type="password" className="pref-input" value={pixabayInput}
+            placeholder={stockKeys?.pixabay_api_key_set ? `Saved: ${stockKeys.pixabay_api_key}` : 'Not set'}
+            onChange={(e) => setPixabayInput(e.target.value)} />
+          <button className="btn btn-sm" disabled={!pixabayInput || savingKeys}
+            onClick={() => saveStockKey('pixabay_api_key', pixabayInput)}>
+            Save
+          </button>
+        </div>
+      </Field>
+    </div>
+  );
+}
+
+function LockableField({ label, field, mode, locked, onToggleLock, children }: {
+  label: string;
+  field: PresentationField;
+  mode: PresentationOverrideMode;
+  locked: Set<PresentationField>;
+  onToggleLock: (field: PresentationField) => void;
+  children: ReactNode;
+}) {
+  const isLocked = locked.has(field);
+  const active = mode === 'all' || (mode === 'fields' && isLocked);
+  return (
+    <label className="pref-field">
+      <span className="pref-field-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        {label}
+        {mode === 'fields' && (
+          <button
+            type="button"
+            className={`lock-toggle ${isLocked ? 'active' : ''}`}
+            title={isLocked ? 'BuzzEdit wins on this field' : 'BuzzcafStudio wins on this field'}
+            onClick={(e) => { e.preventDefault(); onToggleLock(field); }}
+          >
+            {isLocked ? '🔒 BuzzEdit wins' : '🔓 Studio wins'}
+          </button>
+        )}
+      </span>
+      <span className="pref-field-control" style={{ opacity: mode === 'off' ? 0.6 : active ? 1 : 0.85 }}>
+        {children}
+      </span>
+    </label>
+  );
 }
 
 // --- Shortcuts ---------------------------------------------------------------

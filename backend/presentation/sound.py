@@ -34,7 +34,7 @@ import logging
 import random
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import DATA_DIR, FFMPEG_BIN
 from utils.proc import NO_WINDOW
@@ -42,6 +42,7 @@ from timeline import clip_ops
 from timeline.authoring import clear_generated
 from timeline.schema import AudioMaster, SourceFile, Timeline, time_to_frame
 
+from . import workflows
 from .models import (AmbienceCue, LoopCue, MusicCue, PresentationSettings, Program,
                      SfxCue, SoundPlan)
 
@@ -59,6 +60,9 @@ MUSIC_DIR = Path(DATA_DIR) / "music"
 SFX_DIR = Path(DATA_DIR) / "sfx"
 AMBIENCE_DIR = Path(DATA_DIR) / "ambience"
 SYNTH_DIR = Path(DATA_DIR) / "audio_synth"
+# ComfyUI text-to-audio generations, cached by prompt+duration so each sound
+# (and each music mood/genre) is made once and then reused like a library file.
+AUDIO_GEN_DIR = Path(DATA_DIR) / "audio_gen"
 
 AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus"}
 
@@ -70,10 +74,11 @@ SYNTH_KINDS = ("drone", "drone_low", "drone_high", "wind", "rain", "room_tone") 
 
 # Two whooshes closer than this read as a stutter.
 MIN_SFX_GAP_S = 1.2
-# Music fades: long enough to breathe, short enough to be under the title.
-MUSIC_FADE_IN_S = 1.5
-MUSIC_FADE_OUT_S = 3.0
 SYNTH_LOOP_SECONDS = 48.0
+# A one-shot SFX gets this short a fade on each edge — inaudible as a fade,
+# enough to kill the click a hard start/stop (or a programme-boundary trim)
+# would otherwise leave.
+SFX_CLICK_FADE_S = 0.015
 
 # Ambience per genre, paired with the visual atmosphere in genre.py.
 _AMBIENCE_FOR_GENRE: Dict[str, Optional[str]] = {
@@ -87,13 +92,73 @@ _SYNTH_BED_FOR_GENRE: Dict[str, str] = {
     "true_crime": "drone_low",
 }
 
-# Voice-master presets: (denoise, deess, compress).
+# Voice-master presets: (denoise, deess, compress) strengths for the
+# `voice_denoise`/`voice_deess`/`voice_compress` 0..1 knobs. The preset NAME is
+# also written straight to `AudioMaster.voice_eq_preset` — render/audio.py's
+# EQ_PRESETS holds the actual EQ/character curve for each of these same names,
+# so this one lookup carries both the strength and the tone.
 VOICE_PRESETS: Dict[str, Tuple[float, float, float]] = {
+    "studio_mic": (0.4, 0.35, 0.55),
+    "broadcast": (0.35, 0.3, 0.7),
+    "warm_radio": (0.35, 0.2, 0.5),
+    "rap_vocal": (0.3, 0.35, 0.75),
+    "horror_intimate": (0.5, 0.25, 0.7),
     "clean": (0.35, 0.3, 0.45),
     "podcast": (0.3, 0.35, 0.65),
-    "horror_intimate": (0.5, 0.25, 0.7),
     "light": (0.2, 0.15, 0.25),
 }
+
+# Prompts and target durations for ComfyUI text-to-audio generation, one entry
+# per SFX tag. A tag with no prompt here is simply never generated (it falls
+# through to "off" in "auto"/"generated" mode).
+_SFX_GEN_PROMPTS: Dict[str, str] = {
+    "whoosh": "fast cinematic air whoosh transition, swipe sound effect",
+    "whoosh_soft": "soft gentle air whoosh sound effect, subtle swipe",
+    "pop": "short clean UI pop click sound effect",
+    "boom": "deep cinematic boom impact sound effect, trailer hit",
+    "riser": "rising tension sound effect, cinematic riser building to a hit",
+    "stinger": "dramatic dissonant orchestral stinger hit, cinematic accent",
+    "heartbeat": "tense human heartbeat loop, thumping pulse",
+    "thunder": "thunder clap and distant rumble sound effect",
+    "flash": "bright magical flash whoosh hit sound effect",
+    "click": "short mechanical click sound effect",
+}
+_SFX_GEN_DURATION: Dict[str, float] = {
+    "whoosh": 0.8, "whoosh_soft": 0.7, "pop": 0.3, "boom": 2.5, "riser": 3.5,
+    "stinger": 2.0, "heartbeat": 20.0, "thunder": 4.5, "flash": 0.8, "click": 0.2,
+}
+# Music bed prompts by genre, for the same generator. Genres missing here get
+# a generic "<genre> background music" prompt rather than nothing.
+_MUSIC_GEN_PROMPTS: Dict[str, str] = {
+    "horror": "dark ominous horror drone, unsettling cinematic tension, no melody",
+    "true_crime": "moody tense true crime documentary background music, minimal",
+    "comedy": "upbeat playful comedic background music, light and bouncy",
+    "finance": "corporate motivational background music, confident and modern",
+    "tech": "modern electronic background music, clean and minimal",
+}
+# Kept off a music bed: it is background under a voice, not a song, so vocals
+# and obvious artifacts are exactly what the negative prompt should steer away
+# from. SFX one-shots have no equivalent — there is nothing a two-second
+# whoosh needs to be told to avoid.
+_MUSIC_GEN_NEGATIVE = "low quality, noise, hiss, distortion, vocals"
+# SFX one-shots DO need one after all: Stable Audio answered "whoosh" and
+# "pop" with bursts of broadband static (94% of the energy above 5 kHz), and
+# those two clips, reused 137 times, were the hiss that ran through a render.
+_SFX_GEN_NEGATIVE = "hiss, static, white noise, pink noise, harsh high frequencies, distortion, crackle"
+
+# A generated SFX whose spectrum looks like noise rather than a sound is
+# rejected (`sfx_is_noise`) and the cue plays nothing instead.
+SFX_NOISE_HIGH_BAND_HZ = 5000.0
+SFX_NOISE_MAX_HIGH_SHARE = 0.6
+SFX_NOISE_MAX_FLATNESS = 0.3
+SFX_NOISE_MIN_CENTROID_HZ = 4500.0
+# Hard ceiling on one-shots per minute of programme, whatever the planners
+# asked for: at ~17/min a whoosh on every cut stops being punctuation.
+MAX_SFX_PER_MINUTE = 6.0
+# B-roll whooshes: at most one per this many seconds, at this share of sfx_volume.
+WHOOSH_MIN_GAP_S = 30.0
+WHOOSH_GAIN = 0.5
+MIN_SFX_CEILING = 8
 
 
 # --- library -------------------------------------------------------------------
@@ -125,18 +190,47 @@ def _as_list(value) -> List[str]:
     return [str(v) for v in value]
 
 
-def find_music(genre: str, rng: random.Random,
-               mood: Optional[str] = None,
-               library: Path = MUSIC_DIR) -> Optional[Path]:
-    """A music file for the genre from the user's library, or None.
+_unlicensed_logged: set = set()
 
-    Looks in `<library>/<genre>/`, then `<library>/general/`, then loose files
-    in `<library>/` whose manifest entry lists the genre (or has no genre at
-    all). A manifest `mood` list narrows the choice when the caller has one.
-    """
-    candidates: List[Path] = _audio_files(library / genre)
+
+def _licensed(files: List[Path]) -> List[Path]:
+    """Library files whose manifest names an allowed licence (see
+    music_gen.license_ok). Copyright policy: a file with no licence on record
+    is never used; it is logged once so the user knows to label it."""
+    from .music_gen import license_ok
+    kept = []
+    for path in files:
+        if license_ok(path):
+            kept.append(path)
+        elif str(path) not in _unlicensed_logged:
+            _unlicensed_logged.add(str(path))
+            logger.warning("Skipping %s: no allowed licence in its manifest.json "
+                           "(add \"license\": \"own\" / \"cc0\" / \"royalty-free\" ...)", path)
+    return kept
+
+
+def _entry(path: Path) -> Dict[str, Any]:
+    return _manifest(path.parent).get(path.name) or {}
+
+
+_NO_BORROWED_MUSIC = {"horror", "true_crime", "mystery"}
+
+
+def _music_candidates(genre: str, library: Path = MUSIC_DIR) -> List[Path]:
+    """Licensed tracks for the genre: `<genre>/`, plus `general/` tracks whose
+    manifest lists the genre (a Music-page track made "for" several genres).
+    Falls back to all of `general/`, then loose files, when that is empty."""
+    candidates: List[Path] = _licensed(_audio_files(library / genre))
+    general = _licensed(_audio_files(library / "general")) if genre != "general" else []
+    candidates += [p for p in general
+                   if genre in _as_list(_entry(p).get("genre") or _entry(p).get("genres"))]
+    # Any general track is a fair stand-in for a vlog, not for horror: an
+    # empty horror/ folder put "sad violin" under a Raat3Baje story. Those
+    # genres get only tracks made for them (or the dark drone fallback).
+    if not candidates and genre in _NO_BORROWED_MUSIC:
+        return []
     if not candidates:
-        candidates = _audio_files(library / "general")
+        candidates = general
     if not candidates:
         manifest = _manifest(library)
         candidates = []
@@ -145,11 +239,28 @@ def find_music(genre: str, rng: random.Random,
             genres = _as_list(entry.get("genre") or entry.get("genres"))
             if not genres or genre in genres:
                 candidates.append(path)
+        candidates = _licensed(candidates)
+    return candidates
+
+
+def _with_mood(paths: List[Path], mood: str) -> List[Path]:
+    return [p for p in paths
+            if mood in _as_list(_entry(p).get("mood") or _entry(p).get("moods"))]
+
+
+def find_music(genre: str, rng: random.Random,
+               mood: Optional[str] = None,
+               library: Path = MUSIC_DIR) -> Optional[Path]:
+    """A music file for the genre from the user's library, or None.
+
+    Looks in `<library>/<genre>/` and the `general/` tracks made for the genre,
+    then all of `general/`, then loose files in `<library>/` whose manifest
+    entry lists the genre (or has no genre at all). A manifest `mood` list
+    narrows the choice when the caller has one.
+    """
+    candidates = _music_candidates(genre, library)
     if mood and candidates:
-        manifest = _manifest(candidates[0].parent)
-        moody = [p for p in candidates
-                 if mood in _as_list((manifest.get(p.name) or {}).get("mood")
-                                     or (manifest.get(p.name) or {}).get("moods"))]
+        moody = _with_mood(candidates, mood)
         if moody:
             candidates = moody
     if not candidates:
@@ -157,14 +268,57 @@ def find_music(genre: str, rng: random.Random,
     return rng.choice(candidates)
 
 
+def has_music_for(genre: str, mood: Optional[str], library: Path = MUSIC_DIR) -> bool:
+    """Whether the library has a licensed track for this genre in this act
+    mood (any track, when no mood is given)."""
+    if not mood:
+        return find_music(genre, random.Random(0)) is not None if library == MUSIC_DIR             else bool(_music_candidates(genre, library))
+    return bool(_with_mood(_music_candidates(genre, library), mood))
+
+
+def music_cue_sections(settings: PresentationSettings,
+                       music_cues: Optional[Sequence[Tuple[float, str]]],
+                       duration: float) -> List[Tuple[float, float, Dict[str, Any], str]]:
+    """(start, end, recipe, cue text) for the music the video asks for by name.
+
+    The script's `[music: ...]` cues each start a section that runs to the next
+    one; the project's `music_brief` covers the opening before the first cue
+    (or the whole video when the script has none). Empty when neither is set,
+    and the act-by-act library beds apply instead.
+    """
+    from .music_gen import parse_music_cue
+    raw: List[Tuple[float, str]] = []
+    if settings.music_cues and music_cues:
+        raw = sorted((max(0.0, float(at)), str(text)) for at, text in music_cues if str(text).strip())
+    brief = (settings.music_brief or "").strip()
+    if brief and (not raw or raw[0][0] > MIN_SECTION_S):
+        raw.insert(0, (0.0, brief))
+    if not raw or duration <= 0:
+        return []
+    raw[0] = (0.0, raw[0][1])
+    # Cues closer together than a section merge: the later one wins.
+    merged: List[Tuple[float, str]] = []
+    for at, text in raw:
+        if merged and at - merged[-1][0] < MIN_SECTION_S:
+            merged[-1] = (merged[-1][0], text)
+        else:
+            merged.append((at, text))
+    out = []
+    for i, (at, text) in enumerate(merged):
+        end = merged[i + 1][0] if i + 1 < len(merged) else duration
+        if end > at:
+            out.append((at, end, parse_music_cue(text), text))
+    return out
+
+
 def find_sfx(tag: str, rng: random.Random, library: Path = SFX_DIR) -> Optional[Path]:
-    files = _audio_files(library / tag)
+    files = _licensed(_audio_files(library / tag))
     return rng.choice(files) if files else None
 
 
 def find_ambience(kind: str, rng: random.Random,
                   library: Path = AMBIENCE_DIR) -> Optional[Path]:
-    files = _audio_files(library / kind)
+    files = _licensed(_audio_files(library / kind))
     return rng.choice(files) if files else None
 
 
@@ -302,6 +456,306 @@ def synth_duration(kind: str) -> float:
     return recipe[1] if recipe else 0.0
 
 
+# --- ComfyUI generation ----------------------------------------------------------
+#
+# "generated" sourcing (see _resolve_sfx / _bed_for below): a text-to-audio
+# ComfyUI workflow (role "audio" in presentation.workflows — Stable Audio
+# Open, ACE-Step, ...) makes the sound once, and it is cached by prompt+
+# duration so every later render just reads the file. Nothing here ever
+# raises past `warm_generated_cache`: a missing workflow, an offline ComfyUI,
+# or a failed job all just mean fewer sounds get generated, same as an empty
+# library folder does today.
+
+def _audio_gen_key(prompt: str, duration_s: float) -> str:
+    return hashlib.sha1(f"{prompt}|{duration_s:.2f}".encode("utf-8")).hexdigest()[:16]
+
+
+MAX_GAP_TRACKS = 3   # act moods filled per video, at most
+
+
+async def _warm_music(settings: PresentationSettings, genre: str, seed: int,
+                      acts: Optional[Sequence[str]],
+                      music_cues: Optional[Sequence[Tuple[float, str]]],
+                      duration: float, counts: Dict[str, int]) -> bool:
+    """Generate the music this video needs; True when the genre still has no
+    bed at all (no music model, or it made nothing), so the caller can fall
+    back to a Stable Audio Open loop."""
+    from . import music_gen
+    source = (settings.music_source or "auto").lower()
+    if not settings.music or source == "off" or settings.music_tracks:
+        return False
+    genre_empty = False
+    jobs: List[Dict[str, Any]] = []
+    cues = music_cue_sections(settings, music_cues, duration)
+    if cues:
+        engine_default = settings.music_engine if settings.music_engine in music_gen.ENGINES \
+            else music_gen.DEFAULT_ENGINE
+        seen = set()
+        for start, end, recipe, text in cues:
+            engine = recipe.get("engine") or engine_default
+            if recipe.get("off") or not music_gen.cue_has_content(recipe):
+                continue
+            key = music_gen.cue_key(recipe, engine)
+            if key in seen or music_gen.find_cue_track(recipe, engine) is not None:
+                continue
+            seen.add(key)
+            jobs.append({"cue": (recipe, engine, text), "seconds": end - start})
+    elif source in ("auto", "generated"):
+        genre_empty = not has_music_for(genre, None)
+        moods: List[str] = []
+        for act in (acts or [""]):
+            mood = ACT_MUSIC.get((act or "").lower(), ("", "", 1.0))[0]
+            if mood not in moods:
+                moods.append(mood)
+        for mood in moods:
+            if not has_music_for(genre, mood or None):
+                jobs.append({"style": music_gen.style_for(genre, mood or None), "mood": mood})
+        jobs = jobs[:MAX_GAP_TRACKS]
+    if not jobs:
+        return genre_empty
+    roles = {music_gen.ENGINES[j["cue"][1]]["role"] if "cue" in j else "music" for j in jobs}
+    if any(workflows.resolve(role) is None for role in roles):
+        logger.info("Music generation skipped: no workflow for %s", sorted(roles))
+        return genre_empty
+    made_any = False
+    from runtime import gpu_handover
+    await gpu_handover.prepare_for_phase(
+        "music", need_vram_mb=music_gen.MUSIC_PHASE_MIN_VRAM_MB,
+        need_ram_mb=music_gen.MUSIC_PHASE_MIN_RAM_MB)
+    rng = random.Random(seed)
+    for job in jobs:
+        try:
+            if "cue" in job:
+                recipe, engine, text = job["cue"]
+                max_s = music_gen.ENGINES[engine]["max_seconds"]
+                seconds = max(30.0, min(max_s, job["seconds"] + 4.0))
+                made = await music_gen.ensure_cue_track(recipe, engine, seconds, genre=genre,
+                                                        seed=rng.randint(1, 2**31 - 1),
+                                                        cue_text=text)
+            else:
+                made = await music_gen.generate_track(job["style"], music_gen.DEFAULT_SECONDS,
+                                                      seed=rng.randint(1, 2**31 - 1), genre=genre)
+            if made is not None:
+                counts["music"] += 1
+                made_any = True
+        except Exception as e:
+            logger.warning("Music generation for %s failed: %s", job, e)
+    return genre_empty and not made_any
+
+
+def _cached_generated(prompt: str, duration_s: float) -> Optional[Path]:
+    """Read-only lookup: the cached WAV for this prompt+duration, if one exists.
+
+    Safe to call from the synchronous planning/placement code — it never
+    triggers a generation, only reads what `warm_generated_cache` already made.
+    """
+    path = AUDIO_GEN_DIR / f"{_audio_gen_key(prompt, duration_s)}.wav"
+    return path if path.exists() and path.stat().st_size > 1000 else None
+
+
+_noise_verdicts: Dict[str, bool] = {}
+
+
+def sfx_is_noise(path: Path) -> bool:
+    """True when a clip is mostly broadband high-frequency noise -- hiss, not a
+    whoosh or a pop. Decided once per file (by path+mtime) from its spectrum:
+    too much energy above SFX_NOISE_HIGH_BAND_HZ, or a flat (noise-like)
+    spectrum centred high. An unreadable file counts as noise."""
+    try:
+        stamp = f"{path}|{path.stat().st_mtime_ns}"
+    except OSError:
+        return True
+    if stamp in _noise_verdicts:
+        return _noise_verdicts[stamp]
+    verdict = True
+    try:
+        import numpy as np
+        rate = 44100
+        raw = subprocess.run(
+            [FFMPEG_BIN, "-v", "error", "-i", str(path), "-ac", "1", "-ar", str(rate),
+             "-t", "4", "-f", "f32le", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+            creationflags=NO_WINDOW).stdout
+        samples = np.frombuffer(raw, dtype=np.float32)
+        if samples.size >= 1024:
+            spectrum = np.abs(np.fft.rfft(samples * np.hanning(samples.size))) + 1e-9
+            freqs = np.fft.rfftfreq(samples.size, 1.0 / rate)
+            total = float(spectrum.sum())
+            high_share = float(spectrum[freqs > SFX_NOISE_HIGH_BAND_HZ].sum()) / total
+            centroid = float((spectrum * freqs).sum()) / total
+            flatness = float(np.exp(np.mean(np.log(spectrum))) / np.mean(spectrum))
+            verdict = (high_share > SFX_NOISE_MAX_HIGH_SHARE
+                       or (flatness > SFX_NOISE_MAX_FLATNESS and centroid > SFX_NOISE_MIN_CENTROID_HZ))
+            if verdict:
+                logger.warning("Generated SFX %s rejected as noise (%.0f%% above %.0f Hz, "
+                               "centroid %.0f Hz, flatness %.2f)", path.name, high_share * 100,
+                               SFX_NOISE_HIGH_BAND_HZ, centroid, flatness)
+    except Exception as e:
+        logger.warning("Could not analyse generated SFX %s (%s); not using it", path, e)
+    _noise_verdicts[stamp] = verdict
+    return verdict
+
+
+def _generated_sfx_path(tag: str) -> Optional[Path]:
+    prompt = _SFX_GEN_PROMPTS.get(tag)
+    if not prompt:
+        return None
+    path = _cached_generated(prompt, _SFX_GEN_DURATION.get(tag, 1.0))
+    if path is None or sfx_is_noise(path):
+        return None
+    return path
+
+
+def _generated_music_path(genre: str) -> Optional[Path]:
+    prompt = _MUSIC_GEN_PROMPTS.get(genre, f"{genre} background music, cinematic instrumental")
+    return _cached_generated(prompt, SYNTH_LOOP_SECONDS)
+
+
+# The edge fade applied to every generated clip before it is cached — short
+# enough to be inaudible as a fade, long enough to kill the click a hard
+# ComfyUI-decoded start/stop (or the silence trim right before it) would
+# otherwise leave. Same duration as the one the placed-SFX path already uses.
+_GEN_FADE_S = SFX_CLICK_FADE_S
+# A generated clip is background material (a bed, a one-shot effect), not a
+# mastered voice track, so it is normalised to a gentler target than the
+# programme's own -14 LUFS — loud enough to sit correctly under the mix's own
+# gain stages, quiet enough that a single hot generation cannot clip them.
+_GEN_LOUDNESS_I = -16.0
+_GEN_LOUDNESS_TP = -1.5
+
+
+def _master_generated(source: Path, destination: Path, lowpass_hz: Optional[int] = None) -> bool:
+    """Trim leading/trailing silence, fade both edges, and loudness-normalise
+    a ComfyUI generation, once, before it enters the cache.
+
+    Best-effort like every other step in this pipeline: `destination` is left
+    unwritten on any ffmpeg failure, and the caller falls back to caching the
+    raw generation exactly as if this pass had never run.
+    """
+    trim = ("silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.1:"
+            "detection=peak,areverse,"
+            "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.1:"
+            "detection=peak,areverse")
+    # A fade-in at the start, mirrored (via areverse) onto the end, so both
+    # edges get the same short fade without needing the clip's own duration.
+    fade = f"afade=t=in:st=0:d={_GEN_FADE_S},areverse,afade=t=in:st=0:d={_GEN_FADE_S},areverse"
+    loud = f"loudnorm=I={_GEN_LOUDNESS_I:.1f}:TP={_GEN_LOUDNESS_TP:.1f}:LRA=11"
+    # SFX only: roll off the top octave, where a one-shot's residual fizz lives.
+    shape = f"lowpass=f={int(lowpass_hz)}," if lowpass_hz else ""
+    command = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+               "-i", str(source), "-af", f"{shape}{trim},{fade},{loud}",
+               "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", str(destination)]
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, timeout=60, creationflags=NO_WINDOW)
+    except Exception as e:
+        logger.warning("Could not master generated audio %s: %s", source, e)
+        return False
+    return destination.exists() and destination.stat().st_size > 1000
+
+
+async def _generate_audio(prompt: str, duration_s: float, seed: int,
+                          negative: str = "", lowpass_hz: Optional[int] = None) -> Optional[Path]:
+    """Submit one text-to-audio job and cache the result by prompt+duration."""
+    cached = _cached_generated(prompt, duration_s)
+    if cached is not None:
+        return cached
+    workflow = workflows.resolve("audio")
+    if workflow is None:
+        return None
+    try:
+        graph = workflow.build(positive=prompt, negative=negative, seed=seed,
+                               length=max(1, int(round(duration_s))))
+        from comfyui_bridge import queue_manager
+        outputs = await queue_manager.submit_and_wait(graph, timeout=120)
+    except Exception as e:
+        logger.warning("Audio generation failed for %r: %s", prompt[:60], e)
+        return None
+    if not outputs:
+        return None
+    chosen = next((o for o in outputs if Path(o).suffix.lower() in AUDIO_EXTS), outputs[0])
+    AUDIO_GEN_DIR.mkdir(parents=True, exist_ok=True)
+    destination = AUDIO_GEN_DIR / f"{_audio_gen_key(prompt, duration_s)}.wav"
+    if _master_generated(Path(chosen), destination, lowpass_hz=lowpass_hz):
+        return destination
+    try:
+        import shutil
+        shutil.copy2(chosen, destination)
+    except Exception as e:
+        logger.warning("Could not cache generated audio %s: %s", chosen, e)
+        return Path(chosen)
+    return destination
+
+
+async def warm_generated_cache(settings: PresentationSettings, genre: str, seed: int,
+                               comfyui_online: bool = True,
+                               acts: Optional[Sequence[str]] = None,
+                               music_cues: Optional[Sequence[Tuple[float, str]]] = None,
+                               duration: float = 0.0) -> Dict[str, int]:
+    """Best-effort pre-generation of the SFX/music the library does not cover.
+
+    Run BEFORE the (synchronous) planning/placement pass so `_resolve_sfx` and
+    `_bed_for` find an already-cached file rather than needing to be async
+    themselves. Only fills gaps: a tag or genre the library already has is
+    never regenerated, and this is a no-op entirely when ComfyUI is offline or
+    no "audio" workflow is configured.
+    """
+    counts = {"sfx": 0, "music": 0}
+    if not comfyui_online:
+        return counts
+    from runtime import gpu_handover
+    rng = random.Random(seed)
+
+    # Music first, with the card handed over to the music model once for the
+    # whole batch. Named music (the script's [music: ...] cues, the project's
+    # music brief) gets exactly its track, made once and reused after; with no
+    # names, every act mood the video needs that the library cannot cover gets
+    # a track in the genre's style for that mood. Everything lands in the
+    # library, so later videos reuse it.
+    music_wanted = await _warm_music(settings, genre, seed, acts, music_cues, duration, counts)
+
+    if workflows.resolve("audio") is None:
+        return counts
+    handed_over = False
+    if settings.sfx_source in ("auto", "generated") and (settings.sfx or settings.ambience):
+        for tag in SFX_TAGS:
+            prompt = _SFX_GEN_PROMPTS.get(tag)
+            if not prompt or find_sfx(tag, rng) is not None:
+                continue
+            if not handed_over:
+                # Stable Audio Open is a different model: swap it in cleanly.
+                await gpu_handover.prepare_for_phase("sfx", need_vram_mb=4000, need_ram_mb=4000)
+                handed_over = True
+            duration = _SFX_GEN_DURATION.get(tag, 1.0)
+            made = None
+            # A cached clip that is really static gets thrown away and made
+            # again, steered off noise, with a couple of fresh seeds.
+            for attempt in range(3):
+                cached = _cached_generated(prompt, duration)
+                if cached is not None and sfx_is_noise(cached):
+                    try:
+                        cached.unlink()
+                    except OSError:
+                        break
+                made = await _generate_audio(prompt, duration, seed + attempt * 7919,
+                                             negative=_SFX_GEN_NEGATIVE, lowpass_hz=9000)
+                if made is None or not sfx_is_noise(made):
+                    break
+                made = None
+            if made is not None:
+                counts["sfx"] += 1
+    if music_wanted:
+        # No ACE-Step: fall back to a Stable Audio Open loop.
+        if not handed_over:
+            await gpu_handover.prepare_for_phase("sfx", need_vram_mb=4000, need_ram_mb=4000)
+        prompt = _MUSIC_GEN_PROMPTS.get(genre, f"{genre} background music, cinematic instrumental")
+        made = await _generate_audio(prompt, SYNTH_LOOP_SECONDS, seed,
+                                     negative=_MUSIC_GEN_NEGATIVE)
+        if made is not None:
+            counts["music"] += 1
+    return counts
+
+
 # --- planning ------------------------------------------------------------------
 
 def plan_sound(timeline: Timeline, program: Program, settings: PresentationSettings,
@@ -310,7 +764,8 @@ def plan_sound(timeline: Timeline, program: Program, settings: PresentationSetti
                popup_times: Optional[Sequence[float]] = None,
                extra_sfx: Optional[Sequence[Tuple[float, str]]] = None,
                loops: Optional[Sequence[Tuple[float, float, str, float]]] = None,
-               sections: Optional[Sequence[Tuple[float, float, str]]] = None) -> SoundPlan:
+               sections: Optional[Sequence[Tuple[float, float, str]]] = None,
+               music_cues: Optional[Sequence[Tuple[float, str]]] = None) -> SoundPlan:
     """Decide the music, effects and ambience for the programme.
 
     `extra_sfx` are (time, tag) pairs from other planners (the mood recipes
@@ -326,8 +781,18 @@ def plan_sound(timeline: Timeline, program: Program, settings: PresentationSetti
         return plan
 
     if settings.music:
-        plan.music = _plan_music(genre, settings, rng, duration,
-                                 sections if settings.music_by_act else None)
+        cue_sections = music_cue_sections(settings, music_cues, duration)
+        if settings.music_tracks:
+            # The creator's own picks, at their own levels, replace the
+            # automatic choice; picks that cannot be used leave silence (and
+            # a note) rather than a track nobody chose.
+            chosen = chosen_tracks(settings)
+            plan.music = _plan_chosen_music(settings, duration, chosen) if chosen else []
+        elif cue_sections:
+            plan.music = _plan_cue_music(genre, settings, rng, duration, cue_sections)
+        else:
+            plan.music = _plan_music(genre, settings, rng, duration,
+                                     sections if settings.music_by_act else None)
         if not plan.music:
             plan.notes.append("music_missing")
 
@@ -343,10 +808,16 @@ def plan_sound(timeline: Timeline, program: Program, settings: PresentationSetti
 
     if settings.sfx:
         events: List[Tuple[float, str, float]] = []
-        for start, end in (broll_windows or []):
-            events.append((start, "whoosh", 1.0))
-            if end - start >= 1.5 and end < duration - 0.5:
-                events.append((end, "whoosh_soft", 0.7))
+        # A whoosh marks a change of scene, not every cutaway: one on each of
+        # 63 B-roll cuts (plus a soft one on each return) was the "periodic
+        # hiss" through a 14-minute Raat3Baje render -- the high-frequency
+        # bursts in the mix lined up with them. At most one per
+        # WHOOSH_MIN_GAP_S, quieter, and none on the way back.
+        last_whoosh = -WHOOSH_MIN_GAP_S
+        for start, _end in sorted(broll_windows or []):
+            if start - last_whoosh >= WHOOSH_MIN_GAP_S:
+                events.append((start, "whoosh", WHOOSH_GAIN))
+                last_whoosh = start
         for at in (popup_times or []):
             events.append((at, "pop", 0.8))
         for at, tag in (extra_sfx or []):
@@ -407,23 +878,45 @@ def music_sections(sections: Optional[Sequence[Tuple[float, float, str]]],
 
 
 def _bed_for(genre: str, act: str, settings: PresentationSettings,
-             rng: random.Random, previous: Optional[str]) -> Tuple[Optional[Path], bool]:
-    """(file, synthesised) for one section, avoiding the previous section's file."""
+             rng: random.Random, previous: Optional[str]) -> Tuple[Optional[Path], bool, str]:
+    """(file, synthesised, source label) for one section, avoiding the
+    previous section's file.
+
+    Governed by `music_source`: "auto" (default) is the user's library, then a
+    cached ComfyUI generation, then the genre's own synthesised bed (a horror
+    drone, true-crime room drone) — that last fallback is kept for "auto" on
+    purpose, as explicit genre behaviour, not the one-shot SFX noise that
+    caused the periodic hiss `sfx_source` fixes below. "library"/"generated"/
+    "synth"/"off" each use exactly the one named source.
+    """
+    source = (settings.music_source or "auto").lower()
+    if source == "off":
+        return None, False, "off"
     mood, variant, _ = ACT_MUSIC.get(act, ("", "", 1.0))
-    path = find_music(genre, rng, mood=mood or None)
-    if path is not None and previous and str(path) == previous:
-        alternative = find_music(genre, random.Random(rng.random()), mood=mood or None)
-        if alternative is not None and str(alternative) != previous:
-            path = alternative
+    path: Optional[Path] = None
+    if source in ("auto", "library"):
+        path = find_music(genre, rng, mood=mood or None)
+        if path is not None and previous and str(path) == previous:
+            alternative = find_music(genre, random.Random(rng.random()), mood=mood or None)
+            if alternative is not None and str(alternative) != previous:
+                path = alternative
     if path is not None:
-        return path, False
+        return path, False, "library"
+    if source == "library":
+        return None, False, "off"
+    if source in ("auto", "generated"):
+        generated = _generated_music_path(genre)
+        if generated is not None:
+            return generated, False, "generated"
+    if source == "generated":
+        return None, False, "off"
     kind = _SYNTH_BED_FOR_GENRE.get(genre)
     if kind and settings.music_synth_fallback:
         base = kind.replace("_low", "")
         candidate = f"{base}_{variant}" if variant else kind
         synth = synth_path(candidate) or synth_path(kind)
-        return synth, synth is not None
-    return None, False
+        return synth, synth is not None, ("synth" if synth is not None else "off")
+    return None, False, "off"
 
 
 def _plan_music(genre: str, settings: PresentationSettings, rng: random.Random,
@@ -434,7 +927,7 @@ def _plan_music(genre: str, settings: PresentationSettings, rng: random.Random,
     previous: Optional[str] = None
     parts = music_sections(sections, duration)
     for index, (start, end, act) in enumerate(parts):
-        path, synthesised = _bed_for(genre, act, settings, rng, previous)
+        path, synthesised, source_label = _bed_for(genre, act, settings, rng, previous)
         if path is None:
             continue
         _, _, gain_mult = ACT_MUSIC.get(act, ("", "", 1.0))
@@ -444,10 +937,120 @@ def _plan_music(genre: str, settings: PresentationSettings, rng: random.Random,
         cues.append(MusicCue(
             path=str(path), start_s=cue_start, end_s=cue_end,
             gain=settings.music_volume * gain_mult, duck=settings.music_duck,
-            fade_in_s=MUSIC_FADE_IN_S if first else MUSIC_CROSSFADE_S,
-            fade_out_s=min(MUSIC_FADE_OUT_S, duration / 3.0) if last else MUSIC_CROSSFADE_S,
-            synthesised=synthesised, act=act))
+            fade_in_s=settings.fade_in_s if first else MUSIC_CROSSFADE_S,
+            fade_out_s=min(settings.fade_out_s, duration / 3.0) if last else MUSIC_CROSSFADE_S,
+            synthesised=synthesised, act=act, source=source_label))
         previous = str(path)
+    return cues
+
+
+def _plan_cue_music(genre: str, settings: PresentationSettings, rng: random.Random,
+                    duration: float,
+                    cue_sections: Sequence[Tuple[float, float, Dict[str, Any], str]]) -> List[MusicCue]:
+    """One cue per named-music section: its own generated track, else the
+    library's best match for the cue's mood; "off" sections stay silent."""
+    from . import music_gen
+    engine_default = settings.music_engine if settings.music_engine in music_gen.ENGINES \
+        else music_gen.DEFAULT_ENGINE
+    cues: List[MusicCue] = []
+    for index, (start, end, recipe, _text) in enumerate(cue_sections):
+        if recipe.get("off"):
+            continue
+        engine = recipe.get("engine") or engine_default
+        path = music_gen.find_cue_track(recipe, engine)
+        source_label = "cue"
+        if path is None:
+            act_moods = [music_gen.MOODS[m] for m in recipe.get("moods") or [] if m in music_gen.MOODS]
+            path = find_music(genre, rng, mood=act_moods[0] if act_moods else None)
+            source_label = "library"
+        if path is None:
+            continue
+        first, last = index == 0, index == len(cue_sections) - 1
+        cue_start = 0.0 if first else max(0.0, start - MUSIC_CROSSFADE_S / 2)
+        cue_end = duration if last else min(duration, end + MUSIC_CROSSFADE_S / 2)
+        cues.append(MusicCue(
+            path=str(path), start_s=cue_start, end_s=cue_end,
+            gain=settings.music_volume, duck=settings.music_duck,
+            fade_in_s=settings.fade_in_s if first else MUSIC_CROSSFADE_S,
+            fade_out_s=min(settings.fade_out_s, duration / 3.0) if last else MUSIC_CROSSFADE_S,
+            synthesised=False, act="cue", source=source_label))
+    return cues
+
+
+# --- tracks the creator picked ---------------------------------------------------
+
+# A picked track's level, in dB of linear gain on the file (library tracks are
+# mastered to about -16 LUFS, near the voice, so -20 dB sits well under it).
+# Outside this range is clamped: below is silence, above risks clipping.
+CHOSEN_MIN_DB, CHOSEN_MAX_DB = -60.0, 6.0
+CHOSEN_DEFAULT_DB = -20.0
+
+
+def chosen_tracks(settings: PresentationSettings,
+                  library: Optional[Path] = None) -> List[Tuple[Path, float, bool]]:
+    """(file, linear gain, duck) for each of `settings.music_tracks` that is
+    in the library and has a cleared licence. Anything else is skipped and
+    logged: a pick is never swapped for a guess."""
+    from . import music_gen
+    library = library or MUSIC_DIR
+    root = library.resolve()
+    out: List[Tuple[Path, float, bool]] = []
+    for raw in settings.music_tracks or []:
+        if not isinstance(raw, dict):
+            continue
+        relative = str(raw.get("file") or "").strip().replace("\\", "/")
+        if not relative:
+            continue
+        path = (library / relative).resolve()
+        if root not in path.parents or not path.is_file() or path.suffix.lower() not in AUDIO_EXTS:
+            logger.warning("Chosen music %r is not in the library; skipped", relative)
+            continue
+        if not music_gen.license_ok(path):
+            logger.warning("Chosen music %r has no cleared licence; skipped", relative)
+            continue
+        try:
+            db = float(raw.get("volume_db", CHOSEN_DEFAULT_DB))
+        except (TypeError, ValueError):
+            db = CHOSEN_DEFAULT_DB
+        db = max(CHOSEN_MIN_DB, min(CHOSEN_MAX_DB, db))
+        out.append((path, 10.0 ** (db / 20.0), bool(raw.get("duck"))))
+    return out
+
+
+def _plan_chosen_music(settings: PresentationSettings, duration: float,
+                       tracks: Sequence[Tuple[Path, float, bool]]) -> List[MusicCue]:
+    """The picked tracks at exactly their own levels -- no act multipliers.
+    "together": every track under the whole video, looped. "sequence": each
+    track plays through once, crossfading into the next, the list looping
+    until the video ends."""
+    end_fade = min(settings.fade_out_s, duration / 3.0)
+
+    def cue(path: Path, gain: float, duck: bool, start: float, end: float,
+            fade_in: float, fade_out: float) -> MusicCue:
+        return MusicCue(path=str(path), start_s=start, end_s=end, gain=gain,
+                        duck=settings.music_duck if duck else 0.0,
+                        fade_in_s=fade_in, fade_out_s=fade_out,
+                        synthesised=False, act="", source="chosen")
+
+    if (settings.music_tracks_mode or "together").lower() != "sequence":
+        return [cue(path, gain, duck, 0.0, duration, settings.fade_in_s, end_fade)
+                for path, gain, duck in tracks]
+
+    playable = [(path, gain, duck, file_duration(str(path))) for path, gain, duck in tracks]
+    playable = [t for t in playable if t[3] > MUSIC_CROSSFADE_S * 2]
+    cues: List[MusicCue] = []
+    at, index = 0.0, 0
+    while playable and at < duration - 0.5:
+        path, gain, duck, length = playable[index % len(playable)]
+        index += 1
+        end = min(duration, at + length)
+        last = end >= duration - 0.5
+        cues.append(cue(path, gain, duck, at, duration if last else end,
+                        settings.fade_in_s if not cues else MUSIC_CROSSFADE_S,
+                        end_fade if last else MUSIC_CROSSFADE_S))
+        if last:
+            break
+        at = end - MUSIC_CROSSFADE_S
     return cues
 
 
@@ -471,11 +1074,57 @@ def _space_sfx(events: List[Tuple[float, str, float]], duration: float,
             else:
                 continue
         kept.append(SfxCue(tag=tag, at_s=round(at, 3), gain=gain * master_gain))
+    # A floor keeps a Short or a teaser from being cut to a single hit.
+    ceiling = max(MIN_SFX_CEILING, int(MAX_SFX_PER_MINUTE * max(duration, 1.0) / 60.0))
+    if len(kept) > ceiling:
+        # The weightiest survive; ties go to whichever sits farthest from its
+        # neighbours, so what is left stays spread through the programme.
+        kept.sort(key=lambda c: c.at_s)
+
+        def isolation(i: int) -> float:
+            before = kept[i].at_s - kept[i - 1].at_s if i > 0 else duration
+            after = kept[i + 1].at_s - kept[i].at_s if i + 1 < len(kept) else duration
+            return min(before, after)
+
+        ranked = sorted(range(len(kept)),
+                        key=lambda i: (-_SFX_PRIORITY.get(kept[i].tag, 0), -isolation(i)))
+        kept = [kept[i] for i in sorted(ranked[:ceiling])]
     kept.sort(key=lambda c: c.at_s)
     return kept
 
 
 # --- placement -----------------------------------------------------------------
+
+def _resolve_sfx(tag: str, rng: random.Random, source: str) -> Tuple[Optional[Path], str]:
+    """(file, source label) for one sound effect, per `sfx_source`.
+
+    "library" / "generated" / "synth" each use exactly the one named source.
+    "off" plays nothing. "auto" (the default) is the user's own data/sfx/<tag>/
+    first, then a cached ComfyUI generation, then nothing at all — it NEVER
+    reaches for the synthesised FFmpeg noise fallback, which is what produced
+    the periodic hiss (18 white/pink-noise whooshes in the diagnosed render):
+    that fallback now only runs when a caller asks for "synth" by name.
+    """
+    source = (source or "auto").lower()
+    if source == "off":
+        return None, "off"
+    if source == "library":
+        path = find_sfx(tag, rng)
+        return path, ("library" if path is not None else "off")
+    if source == "generated":
+        path = _generated_sfx_path(tag)
+        return path, ("generated" if path is not None else "off")
+    if source == "synth":
+        path = synth_path(tag)
+        return path, ("synth" if path is not None else "off")
+    path = find_sfx(tag, rng)
+    if path is not None:
+        return path, "library"
+    path = _generated_sfx_path(tag)
+    if path is not None:
+        return path, "generated"
+    return None, "off"
+
 
 def _register(timeline: Timeline, path: str, duration_s: float) -> str:
     """A SourceFile for an audio file, reused when the same file is already in."""
@@ -508,14 +1157,25 @@ def file_duration(path: str) -> float:
 
 
 def apply_sound(timeline: Timeline, plan: SoundPlan, settings: PresentationSettings,
-                seed: int = 0) -> Dict[str, int]:
-    """Put the plan on the timeline. Replaces the pass's own lanes only."""
+                seed: int = 0, source_counts: Optional[Dict[str, int]] = None
+                ) -> Dict[str, int]:
+    """Put the plan on the timeline. Replaces the pass's own lanes only.
+
+    `source_counts`, when given, is incremented in place with how many placed
+    SFX came from each source ("library"/"generated"/"synth"/"off") — an
+    opt-in the report reads from; every existing caller that omits it keeps
+    today's return value unchanged.
+    """
     for origin in (MUSIC_ORIGIN, SFX_ORIGIN, AMBIENCE_ORIGIN):
         clear_generated(timeline, origin)
     fps_num, fps_den = timeline.fps_num, timeline.fps_den
     counts = {"music": 0, "sfx": 0, "ambience": 0}
     rng = random.Random(seed)
     programme_frames = timeline.duration_frames
+
+    def note_source(label: str) -> None:
+        if source_counts is not None:
+            source_counts[label] = source_counts.get(label, 0) + 1
 
     for cue in plan.music:
         duration = file_duration(cue.path)
@@ -547,14 +1207,15 @@ def apply_sound(timeline: Timeline, plan: SoundPlan, settings: PresentationSetti
             origin=AMBIENCE_ORIGIN)
         item.loop = True
         item.volume = cue.gain
-        item.audio_fade_in = 2.0
-        item.audio_fade_out = 2.0
+        item.audio_fade_in = settings.fade_in_s
+        item.audio_fade_out = settings.fade_out_s
         item.label = f"Ambience: {cue.kind}"
         counts["ambience"] += 1
 
     for cue in plan.sfx:
-        path = find_sfx(cue.tag, rng) or synth_path(cue.tag)
+        path, src = _resolve_sfx(cue.tag, rng, settings.sfx_source)
         if path is None:
+            note_source(src)
             continue
         duration = file_duration(str(path))
         if duration <= 0.0:
@@ -569,12 +1230,19 @@ def apply_sound(timeline: Timeline, plan: SoundPlan, settings: PresentationSetti
             timeline, source_id, SFX_TRACK, start_frame, 0, end_frame - start_frame,
             origin=SFX_ORIGIN)
         item.volume = cue.gain
+        # A short edge fade so a one-shot effect never clicks, whether the
+        # source file itself starts/stops hard or the programme boundary
+        # trimmed its tail.
+        item.audio_fade_in = SFX_CLICK_FADE_S
+        item.audio_fade_out = SFX_CLICK_FADE_S
         item.label = f"SFX: {cue.tag}"
         counts["sfx"] += 1
+        note_source(src)
 
     for cue in plan.loops:
-        path = find_sfx(cue.tag, rng) or synth_path(cue.tag)
+        path, src = _resolve_sfx(cue.tag, rng, settings.sfx_source)
         if path is None:
+            note_source(src)
             continue
         duration = file_duration(str(path))
         if duration <= 0.0:
@@ -593,6 +1261,7 @@ def apply_sound(timeline: Timeline, plan: SoundPlan, settings: PresentationSetti
         item.audio_fade_out = 1.5
         item.label = f"SFX loop: {cue.tag}"
         counts["sfx"] += 1
+        note_source(src)
 
     _drop_orphan_audio_sources(timeline)
     timeline.recalculate_duration()
@@ -612,7 +1281,7 @@ def add_sfx_events(timeline: Timeline, events: Sequence[Tuple[float, str]],
             continue
         if any(abs(at - other) < MIN_SFX_GAP_S for other in existing):
             continue
-        path = find_sfx(tag, rng) or synth_path(tag)
+        path, _src = _resolve_sfx(tag, rng, settings.sfx_source)
         if path is None:
             continue
         duration = file_duration(str(path))
@@ -628,10 +1297,33 @@ def add_sfx_events(timeline: Timeline, events: Sequence[Tuple[float, str]],
             timeline, source_id, SFX_TRACK, start_frame, 0, end_frame - start_frame,
             origin=SFX_ORIGIN)
         item.volume = settings.sfx_volume
+        item.audio_fade_in = SFX_CLICK_FADE_S
+        item.audio_fade_out = SFX_CLICK_FADE_S
         item.label = f"SFX: {tag}"
         existing.append(at)
         count += 1
     return count
+
+
+def master_for_preset(preset: str, loudness_lufs: Optional[float] = -14.0,
+                      voice_enhance: str = "auto",
+                      voice_fx: Optional[Sequence[Any]] = None) -> Optional[AudioMaster]:
+    """The AudioMaster one named voice preset resolves to, with no timeline
+    needed — used by `apply_voice_master` and the audio-preview endpoint alike.
+
+    Returns None for "off"/"none"/"" (no treatment at all).
+    """
+    preset = (preset or "").lower()
+    if preset in ("off", "none", ""):
+        return None
+    denoise, deess, compress = VOICE_PRESETS.get(preset, VOICE_PRESETS["studio_mic"])
+    eq_preset = preset if preset in VOICE_PRESETS else "studio_mic"
+    fx_dicts = [fx.model_dump() if hasattr(fx, "model_dump") else dict(fx)
+                for fx in (voice_fx or [])]
+    return AudioMaster(
+        voice_denoise=denoise, voice_deess=deess, voice_compress=compress,
+        voice_enhance=voice_enhance, voice_eq_preset=eq_preset, voice_fx=fx_dicts,
+        loudness_lufs=loudness_lufs, origin=MASTER_ORIGIN)
 
 
 def apply_voice_master(timeline: Timeline, settings: PresentationSettings) -> Optional[str]:
@@ -643,15 +1335,14 @@ def apply_voice_master(timeline: Timeline, settings: PresentationSettings) -> Op
     current = timeline.audio_master
     if current is not None and current.origin != MASTER_ORIGIN and not current.is_identity():
         return None
-    preset = (settings.voice_preset or "clean").lower()
-    if preset in ("off", "none", ""):
+    preset = (settings.voice_preset or "").lower()
+    master = master_for_preset(preset, settings.loudness_lufs, settings.voice_enhance,
+                               settings.voice_fx)
+    if master is None:
         if current is not None and current.origin == MASTER_ORIGIN:
             timeline.audio_master = None
         return None
-    denoise, deess, compress = VOICE_PRESETS.get(preset, VOICE_PRESETS["clean"])
-    timeline.audio_master = AudioMaster(
-        voice_denoise=denoise, voice_deess=deess, voice_compress=compress,
-        loudness_lufs=settings.loudness_lufs, origin=MASTER_ORIGIN)
+    timeline.audio_master = master
     timeline.revision += 1
     return preset
 

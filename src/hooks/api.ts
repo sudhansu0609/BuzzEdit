@@ -143,6 +143,27 @@ export async function toggleWordApi(projectId: string, wordId: string, enabled: 
   });
 }
 
+/** Find/replace across the transcript. Omit `wordIds` (or pass null) to match
+ *  every occurrence; pass one or more word ids to scope the replacement to
+ *  specific words (e.g. "replace this one match only"). */
+export async function replaceWords(
+  projectId: string,
+  find: string,
+  replace: string,
+  opts?: { wordIds?: string[] | null; matchCase?: boolean; wholeWord?: boolean },
+): Promise<any> {
+  return api(`/api/transcription/${projectId}/replace_words`, {
+    method: 'POST',
+    body: JSON.stringify({
+      find,
+      replace,
+      word_ids: opts?.wordIds ?? null,
+      match_case: opts?.matchCase ?? false,
+      whole_word: opts?.wholeWord ?? false,
+    }),
+  });
+}
+
 // --- Multi-track clip editing ---
 
 export async function splitClip(projectId: string, itemId: string, atFrame: number): Promise<any> {
@@ -159,6 +180,83 @@ export async function deleteClip(projectId: string, itemId: string): Promise<any
   });
 }
 
+/** Split every listed clip the frame falls inside (linked partners included). */
+export async function splitClips(projectId: string, itemIds: string[], atFrame: number): Promise<any> {
+  return api(`/api/timeline/${projectId}/clip/split_many`, {
+    method: 'POST',
+    body: JSON.stringify({ item_ids: itemIds, at_frame: atFrame }),
+  });
+}
+
+/** Delete a selection with its linked partners; `ripple` closes the holes. */
+export async function deleteClips(projectId: string, itemIds: string[], ripple = false): Promise<any> {
+  return api(`/api/timeline/${projectId}/clip/delete_many`, {
+    method: 'POST',
+    body: JSON.stringify({ item_ids: itemIds, ripple }),
+  });
+}
+
+/** Slide a selection (and linked partners) by a frame delta, optionally re-homing some clips. */
+export async function moveClips(
+  projectId: string, itemIds: string[], deltaFrames: number, trackMap?: Record<string, string>,
+  linked = true,
+): Promise<any> {
+  return api(`/api/timeline/${projectId}/clip/move_many`, {
+    method: 'POST',
+    body: JSON.stringify({ item_ids: itemIds, delta_frames: deltaFrames, track_map: trackMap ?? {}, linked }),
+  });
+}
+
+/** Trim the start or end of the listed clips to a frame — "trim to playhead". */
+export async function trimClips(
+  projectId: string, itemIds: string[], edge: 'start' | 'end', atFrame: number, ripple = false,
+): Promise<any> {
+  return api(`/api/timeline/${projectId}/clip/trim_many`, {
+    method: 'POST',
+    body: JSON.stringify({ item_ids: itemIds, edge, at_frame: atFrame, ripple }),
+  });
+}
+
+export async function linkClips(projectId: string, itemIds: string[]): Promise<any> {
+  return api(`/api/timeline/${projectId}/clip/link`, {
+    method: 'POST',
+    body: JSON.stringify({ item_ids: itemIds }),
+  });
+}
+
+export async function unlinkClips(projectId: string, itemIds: string[]): Promise<any> {
+  return api(`/api/timeline/${projectId}/clip/unlink`, {
+    method: 'POST',
+    body: JSON.stringify({ item_ids: itemIds }),
+  });
+}
+
+/** Paste copied clip snapshots so the earliest starts at `atFrame`. */
+export async function pasteClips(
+  projectId: string, items: unknown[], atFrame: number, insert = false,
+): Promise<{ item_ids: string[]; timeline: any }> {
+  return api(`/api/timeline/${projectId}/clip/paste`, {
+    method: 'POST',
+    body: JSON.stringify({ items, at_frame: atFrame, insert }),
+  });
+}
+
+/** Ripple-delete the empty stretch of a track under a frame. */
+export async function closeGap(projectId: string, track: string, atFrame: number): Promise<any> {
+  return api(`/api/timeline/${projectId}/track/close_gap`, {
+    method: 'POST',
+    body: JSON.stringify({ track, at_frame: atFrame }),
+  });
+}
+
+/** Put a whole earlier timeline back — the undo/redo path. */
+export async function replaceTimeline(projectId: string, timeline: unknown): Promise<any> {
+  return api(`/api/timeline/${projectId}/replace`, {
+    method: 'POST',
+    body: JSON.stringify({ timeline }),
+  });
+}
+
 export async function moveClip(projectId: string, itemId: string, timelineStartFrame: number, track?: string): Promise<any> {
   return api(`/api/timeline/${projectId}/clip/move`, {
     method: 'POST',
@@ -166,10 +264,30 @@ export async function moveClip(projectId: string, itemId: string, timelineStartF
   });
 }
 
-export async function trimClip(projectId: string, itemId: string, edge: 'start' | 'end', timelineFrame: number): Promise<any> {
+export async function trimClip(
+  projectId: string, itemId: string, edge: 'start' | 'end', timelineFrame: number, ripple = false,
+  linked = true,
+): Promise<any> {
   return api(`/api/timeline/${projectId}/clip/trim`, {
     method: 'POST',
-    body: JSON.stringify({ item_id: itemId, edge, timeline_frame: timelineFrame }),
+    body: JSON.stringify({ item_id: itemId, edge, timeline_frame: timelineFrame, ripple, linked }),
+  });
+}
+
+/** Ripple-cut a programme-frame range out of V1/A1 (the auto-edited spine),
+ *  shifting overlays to close the gap. */
+export async function cutProgramRange(projectId: string, startFrame: number, endFrame: number): Promise<any> {
+  return api(`/api/timeline/${projectId}/program/cut`, {
+    method: 'POST',
+    body: JSON.stringify({ start_frame: startFrame, end_frame: endFrame }),
+  });
+}
+
+/** Undo every ripple cut made on the programme via `cutProgramRange`. */
+export async function restoreProgramCuts(projectId: string): Promise<any> {
+  return api(`/api/timeline/${projectId}/program/restore_cuts`, {
+    method: 'POST',
+    body: JSON.stringify({}),
   });
 }
 
@@ -197,7 +315,10 @@ export async function uncompoundClip(projectId: string, itemId: string): Promise
 export async function setClipFlags(
   projectId: string,
   itemId: string,
-  flags: { enabled?: boolean; locked?: boolean; mute?: boolean; volume?: number; label?: string },
+  flags: {
+    enabled?: boolean; locked?: boolean; mute?: boolean; volume?: number; label?: string;
+    loop?: boolean; audio_fade_in?: number; audio_fade_out?: number; duck?: number;
+  },
 ): Promise<any> {
   return api(`/api/timeline/${projectId}/clip/flags`, {
     method: 'POST',
@@ -293,6 +414,35 @@ export async function setChroma(
   return api(`/api/timeline/${projectId}/chroma`, {
     method: 'POST',
     body: JSON.stringify({ item_id: itemId, updates, reset }),
+  });
+}
+
+// --- Programme audio master (voice chain: EQ, de-ess, compress, reverb...) ---
+
+/** Mirrors backend timeline/schema.py AudioMaster. */
+export interface AudioMaster {
+  voice_gain_db: number;
+  voice_enhance: string;
+  voice_denoise: number;
+  voice_deess: number;
+  voice_compress: number;
+  voice_eq_preset: string;
+  voice_saturation: number;
+  voice_reverb: string;
+  voice_fx: Array<Record<string, any>>;
+  loudness_lufs: number | null;
+  true_peak_db: number;
+  origin?: string | null;
+}
+
+export async function getAudioMaster(projectId: string): Promise<any> {
+  return api(`/api/timeline/${projectId}/audio_master`);
+}
+
+export async function updateAudioMaster(projectId: string, updates: Record<string, any>): Promise<any> {
+  return api(`/api/timeline/${projectId}/audio_master`, {
+    method: 'POST',
+    body: JSON.stringify({ updates }),
   });
 }
 
@@ -671,6 +821,8 @@ export interface MediaEntry {
   linked?: boolean;
   missing?: boolean;
   has_thumb?: boolean;
+  /** Set once the clip has been re-aimed at the lens; original_path is what revert restores. */
+  eye_contact?: { original_path: string; output_path: string; report?: EyeContactReport };
 }
 
 export interface MediaListing {
@@ -733,6 +885,90 @@ export async function relinkMedia(projectId: string, mediaId: string, path: stri
     method: 'POST',
     body: JSON.stringify({ path }),
   });
+}
+
+// --- Eye contact (teleprompter gaze correction) ---
+
+export interface EyeContactReport {
+  frames: number;
+  face_found_pct: number;
+  corrected_pct: number;
+  prompter_offset_deg: number;
+  symmetry_offset_deg: number;
+  reading_sweep_deg: number;
+  median_shift_px: number;
+  seconds: number;
+}
+
+export interface EyeContactJob {
+  id: string;
+  media_id: string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  progress: number;
+  stage: string;
+  result: EyeContactReport | null;
+  error: string | null;
+}
+
+/** The speaker's prompter setup: saved once, pre-filled for every run. */
+export interface EyeContactSetup {
+  prompter_side: 'left' | 'right' | 'auto';
+  /** Degrees between prompter and lens; 0 = work it out from the two distances. */
+  angle_deg: number;
+  prompter_cm: number;
+  camera_cm: number;
+  steadiness: number;
+  aim_deg: number;
+  quality: 'standard' | 'high' | 'max';
+}
+
+export async function getEyeContactSetup(): Promise<EyeContactSetup> {
+  return api(`/api/eyecontact/settings`);
+}
+
+export async function saveEyeContactSetup(setup: Partial<EyeContactSetup>): Promise<EyeContactSetup> {
+  return api(`/api/eyecontact/settings`, { method: 'PUT', body: JSON.stringify(setup) });
+}
+
+export async function eyeContactAvailable(): Promise<{ available: boolean; reason: string }> {
+  return api(`/api/eyecontact/available`);
+}
+
+export async function startEyeContact(projectId: string, mediaId: string,
+  opts: Partial<EyeContactSetup> = {}): Promise<{ job_id: string }> {
+  return api(`/api/eyecontact/projects/${projectId}/media/${mediaId}`, {
+    method: 'POST',
+    body: JSON.stringify(opts),
+  });
+}
+
+/** A short corrected stretch of a clip: both files come from the same cut, frame for frame. */
+export interface EyeContactPreview extends EyeContactReport {
+  before_path: string;
+  after_path: string;
+  start_s: number;
+  duration_s: number;
+}
+
+/** Correct `durationS` seconds from `startS` without touching the project; poll with getEyeContactStatus. */
+export async function startEyeContactPreview(projectId: string, mediaId: string, setup: EyeContactSetup,
+  startS: number, durationS = 10): Promise<{ job_id: string }> {
+  return api(`/api/eyecontact/projects/${projectId}/media/${mediaId}/preview`, {
+    method: 'POST',
+    body: JSON.stringify({ ...setup, start_s: startS, duration_s: durationS }),
+  });
+}
+
+export async function getEyeContactStatus(jobId: string): Promise<EyeContactJob> {
+  return api(`/api/eyecontact/status/${jobId}`);
+}
+
+export async function cancelEyeContact(jobId: string): Promise<{ status: string }> {
+  return api(`/api/eyecontact/cancel/${jobId}`, { method: 'POST' });
+}
+
+export async function revertEyeContact(projectId: string, mediaId: string): Promise<{ media: MediaEntry[] }> {
+  return api(`/api/eyecontact/projects/${projectId}/media/${mediaId}/revert`, { method: 'POST' });
 }
 
 export async function getMediaWaveform(projectId: string, mediaId: string): Promise<WaveformData> {
@@ -936,6 +1172,35 @@ export async function deleteProjectScript(projectId: string): Promise<{ status: 
   return api(`/api/projects/${projectId}/script`, { method: 'DELETE' });
 }
 
+/** BuzzcafAI's brands -- distinct from this app's own `GENRE_OPTIONS`. Only
+    used to pick which brand voice/genre map `plan_visuals` asks BuzzcafAI to
+    use (backend/integrations/buzzedit_settings.py on BuzzcafAI's side). */
+export const BUZZCAF_BRAND_OPTIONS = [
+  'Beyond3Baje', 'Raat3Baje', 'Khayal3Baje', 'Life3Baje', 'Originals',
+] as const;
+
+export interface PlanVisualsResult {
+  status: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  settings: Record<string, any>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  visual_plan: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  skipped_beats?: any[];
+  script: { text: string; directives: { kind: string; arg: string; at: number }[]; paragraphs: number };
+}
+
+/** Ask BuzzcafAI to plan the visuals for this project (from its stored script,
+    else its transcript) and apply the annotated script it hands back -- the
+    round trip happens server-side, on `POST /api/agents/plan_visuals`, so the
+    browser never talks to BuzzcafAI directly. */
+export async function planVisualsWithBuzzcaf(projectId: string, brand: string): Promise<PlanVisualsResult> {
+  return api(`/api/agents/plan_visuals`, {
+    method: 'POST',
+    body: JSON.stringify({ project_id: projectId, brand }),
+  });
+}
+
 export interface ShotPrompt {
   id: string;
   topic: string;
@@ -1012,6 +1277,65 @@ export async function updateAppSettings(updates: Record<string, any>): Promise<a
   return api('/api/settings/', {
     method: 'PUT',
     body: JSON.stringify(updates),
+  });
+}
+
+// --- BuzzEdit-side presentation defaults & overrides (beat BuzzcafStudio) ---
+
+export type PresentationOverrideMode = 'off' | 'fields' | 'all';
+
+export interface PresentationOverridesState {
+  presentation_overrides: Record<string, any>;
+  override_mode: PresentationOverrideMode;
+}
+
+export async function getPresentationOverrides(): Promise<PresentationOverridesState> {
+  return api('/api/settings/presentation_overrides');
+}
+
+export async function setPresentationOverrides(
+  overrides: Record<string, any>,
+  mode: PresentationOverrideMode,
+): Promise<PresentationOverridesState> {
+  return api('/api/settings/presentation_overrides', {
+    method: 'PUT',
+    body: JSON.stringify({ presentation_overrides: overrides, override_mode: mode }),
+  });
+}
+
+// --- free stock fallback keys (Pexels / Pixabay) -----------------------------
+// See presentation.stock: used only when ComfyUI cannot make a visual for a
+// beat and the project's "Allow free stock" is on. Keys are masked server-side
+// — GET/PUT never return one in full.
+
+export interface StockKeysState {
+  pexels_api_key: string;
+  pexels_api_key_set: boolean;
+  pixabay_api_key: string;
+  pixabay_api_key_set: boolean;
+}
+
+export async function getStockKeys(): Promise<StockKeysState> {
+  return api('/api/settings/stock_keys');
+}
+
+export async function setStockKeys(
+  keys: { pexels_api_key?: string; pixabay_api_key?: string },
+): Promise<StockKeysState> {
+  return api('/api/settings/stock_keys', {
+    method: 'PUT',
+    body: JSON.stringify(keys),
+  });
+}
+
+/** A short WAV of the project's own voice run through one named preset — for
+ *  auditioning a voice preset without a full render. */
+export async function audioPreview(
+  projectId: string, preset: string, startS = 0, seconds = 20,
+): Promise<{ path: string; preset: string; start_s: number; seconds: number }> {
+  return api(`/api/presentation/${projectId}/audio_preview`, {
+    method: 'POST',
+    body: JSON.stringify({ preset, start_s: startS, seconds }),
   });
 }
 

@@ -160,7 +160,7 @@ def test_stage_directions_become_beats_that_win_the_budget():
     assert out["sfx"] and out["sfx"][0][1] == "whoosh"
 
     import asyncio
-    plan = asyncio.run(plan_shots(program, PresentationSettings(target_coverage=0.2),
+    plan = asyncio.run(plan_shots(program, PresentationSettings(target_coverage=0.2, broll_seconds_min=2.0, broll_seconds_max=3.0),
                                   None, "general",
                                   script_topics=script_stage.paragraph_topics(ctx, program),
                                   extra_beats=out["beats"]))

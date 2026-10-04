@@ -155,10 +155,15 @@ def test_loops_reach_the_sound_lanes(monkeypatch, tmp_path):
     monkeypatch.setattr(sound, "find_ambience", lambda *a, **k: None)
     timeline = _timeline()
     program = build_program(timeline)
-    plan = sound.plan_sound(timeline, program, PresentationSettings(), "horror", 1,
+    # Placement mechanics, not sourcing policy: sfx_source="synth" keeps this
+    # test on the old always-available FFmpeg fallback now that "auto" (the
+    # default) no longer reaches for it — see test_sound.py's
+    # test_sfx_source_auto_never_synthesises for that policy itself.
+    settings = PresentationSettings(sfx_source="synth")
+    plan = sound.plan_sound(timeline, program, settings, "horror", 1,
                             loops=[(11.0, 16.0, "heartbeat", 0.35), (1.0, 2.0, "heartbeat", 0.3)])
     assert len(plan.loops) == 1 and plan.loops[0].tag == "heartbeat"
-    counts = sound.apply_sound(timeline, plan, PresentationSettings())
+    counts = sound.apply_sound(timeline, plan, settings)
     loop_items = [i for i in timeline.items if (i.label or "").startswith("SFX loop")]
     assert len(loop_items) == 1 and loop_items[0].loop and loop_items[0].track == "A3"
     assert loop_items[0].timeline_start_frame == 330
@@ -193,3 +198,24 @@ def test_a_hit_compiles_as_a_windowed_adjustment():
     assert "drawbox=color=#FFFFFF@" in graph
     assert "enable='between(t,13.000,13.0" in graph
     assert "rgbashift=" in graph and "crop=w=iw-" in graph
+
+
+def test_mood_hits_off_keeps_the_grade_and_push_but_no_hits():
+    """Story channels: the calm mood layers stay; flash/shake hits, their
+    stinger/thunder and the riser do not."""
+    timeline = _timeline()
+    program = build_program(timeline)
+    topics = _topics(program)
+    for topic, name in zip(topics, ["build", "tense", "climax", "aftermath"]):
+        topic.mood = name
+        topic.key_moment_s = topic.start_s + 2.0
+    plan = mood.apply_moods(timeline, topics, program, PresentationSettings(mood_hits=False), "horror")
+
+    assert plan.layers == 4 and plan.hits == 0
+    assert not [i for i in timeline.items if i.origin == mood.MOOD_ORIGIN and i.label.startswith("hit:")]
+    assert not [tag for _, tag in plan.sfx if tag in ("thunder", "stinger", "riser")]
+
+
+def test_video_share_may_reach_every_cutaway():
+    assert PresentationSettings(video_broll_share=1.0).video_broll_share == 1.0
+    assert PresentationSettings(video_broll_share=3.0).video_broll_share == 1.0

@@ -6,6 +6,7 @@ import {
   listGenerationWorkflows, updateAppSettings, WorkflowInfo,
   getShotPlan, ShotPrompt, setProjectScript, getProjectScript, ScriptStatus,
   listStyleProfiles, StyleProfile, COMFY_BASE, hostPort,
+  planVisualsWithBuzzcaf, BUZZCAF_BRAND_OPTIONS,
 } from '../hooks/api';
 
 /** The dressing layers the pass adds on top of the cut (presentation/models.py
@@ -78,6 +79,10 @@ export default function AgentPanel() {
   const [scriptText, setScriptText] = useState('');
   const [scriptStatus, setScriptStatus] = useState<ScriptStatus | null>(null);
   const [scriptBusy, setScriptBusy] = useState(false);
+  // BuzzcafAI bridge: which brand's voice/genre map to plan visuals with.
+  const [buzzcafBrand, setBuzzcafBrand] = useState<string>(BUZZCAF_BRAND_OPTIONS[0]);
+  const [planBusy, setPlanBusy] = useState(false);
+  const [planNote, setPlanNote] = useState<string | null>(null);
   const [lastReport, setLastReport] = useState<any>(null);
   // The "Prompts used" tab: the text that produced each generated shot.
   const [showPrompts, setShowPrompts] = useState(false);
@@ -232,6 +237,41 @@ export default function AgentPanel() {
       setError(err.message);
     } finally {
       setScriptBusy(false);
+    }
+  };
+
+  // Ask BuzzcafAI's agents to plan the B-roll/card beats for this project
+  // (from its transcript, or an already-saved script) and apply the
+  // directive-annotated script it hands back -- the round trip runs
+  // server-side (POST /api/agents/plan_visuals), so this only needs one call.
+  const handlePlanVisuals = async () => {
+    if (!project) return;
+    setPlanBusy(true);
+    setPlanNote(null);
+    try {
+      const result = await planVisualsWithBuzzcaf(project.id, buzzcafBrand);
+      setScriptText(result.script.text);
+      setScriptStatus({
+        status: 'aligned',
+        text: result.script.text,
+        directives: result.script.directives,
+        aligned_words: undefined,
+        token_count: undefined,
+        spelling_fixed: undefined,
+        paragraphs: result.script.paragraphs,
+      });
+      const tl = await getTimeline(project.id);
+      updateProject({ timeline: tl } as any);
+      const genre = result.settings?.genre || 'general';
+      const skipped = result.skipped_beats?.length ?? 0;
+      setPlanNote(
+        `BuzzcafAI (${buzzcafBrand}, genre "${genre}") planned ${result.script.directives.length} direction${result.script.directives.length === 1 ? '' : 's'}`
+        + (skipped ? `, ${skipped} beat${skipped === 1 ? '' : 's'} could not be placed` : '') + '.',
+      );
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setPlanBusy(false);
     }
   };
 
@@ -469,6 +509,25 @@ export default function AgentPanel() {
             style={{ marginTop: 4 }}>
             {scriptBusy ? 'Aligning…' : 'Align script to transcript'}
           </button>
+
+          <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #313244', display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 12 }}
+              title="BuzzcafAI's agents plan B-roll, cards, maps and chapter beats from this project's script or transcript, styled to this brand's genre, and hand back a directive-annotated script.">
+              <span style={{ minWidth: 100, color: '#bac2de' }}>BuzzcafAI brand</span>
+              <select value={buzzcafBrand} onChange={(e) => setBuzzcafBrand(e.target.value)}
+                style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
+                {BUZZCAF_BRAND_OPTIONS.map((b) => (
+                  <option key={b} value={b}>{b}</option>
+                ))}
+              </select>
+            </label>
+            <button className="btn btn-sm" onClick={handlePlanVisuals}
+              disabled={planBusy || scriptBusy || !project?.transcript?.length}
+              title={project?.transcript?.length ? undefined : 'Transcribe the recording first'}>
+              {planBusy ? 'Planning…' : '✨ Plan visuals with BuzzcafAI'}
+            </button>
+            {planNote && <span style={{ fontSize: 11, color: '#a6e3a1' }}>{planNote}</span>}
+          </div>
         </div>
         <div style={{ marginTop: '8px' }}>
           <label style={{ fontSize: '12px', color: '#bac2de', display: 'block', marginBottom: '4px' }}>Thumbnail Custom Title:</label>

@@ -9,7 +9,7 @@ scheduler_instance = JobScheduler()
 
 class EnqueueJobRequest(BaseModel):
     project_id: str
-    job_type: str = "full_edit"        # "full_edit" | "presentation"
+    job_type: str = "full_edit"        # "full_edit" | "presentation" | "presentation_render"
     priority: str = "normal"           # urgent, normal, low
     # "23:00" for the next occurrence of that time, or an ISO timestamp. Empty
     # means start as soon as the queue reaches it.
@@ -40,7 +40,12 @@ async def enqueue_job(req: EnqueueJobRequest):
     # A presentation job is configured entirely by `settings`; the legacy
     # booleans belong to the older full_edit job and would be meaningless there.
     if req.job_type == "presentation":
-        settings = dict(req.settings)
+        # BuzzEdit-side overrides beat whatever BuzzcafStudio sent — applied
+        # again at execution time in agents/scheduler.py, so an override the
+        # user changes after enqueuing but before a delayed job runs still
+        # takes effect; this early merge just makes the queued job reflect it.
+        from store.app_settings import apply_presentation_overrides
+        settings, _sources = apply_presentation_overrides(dict(req.settings))
     else:
         settings = {
             "generate_thumbnail": req.generate_thumbnail,

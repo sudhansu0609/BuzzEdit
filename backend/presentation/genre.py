@@ -16,6 +16,7 @@ styles nothing and leaves the prompts exactly as they were.
 """
 
 import logging
+import math
 import re
 from typing import Dict, NamedTuple, Optional, Tuple
 
@@ -150,6 +151,34 @@ GENRE_STYLES: Dict[str, GenreStyle] = {
         "warm personal lifestyle look, candid moment, natural light",
         ("vlog", "vlogging", "daily", "routine", "morning", "subscribe",
          "channel", "ghar", "family", "dost", "friends", "shopping")),
+    "documentary": GenreStyle(
+        "cinematic archival documentary tone, natural realistic light, "
+        "restrained filmic colour, textured film grain, observational "
+        "composition",
+        "cartoon, fantasy",
+        "cinematic archival documentary look, restrained filmic colour, "
+        "textured film grain",
+        ("documentary", "history", "itihaas", "archive", "true story", "real",
+         "account", "incident", "kahani", "case")),
+    "mystery": GenreStyle(
+        "moody investigative mystery tone, low-key noir shadows, "
+        "desaturated cold palette, pools of light, tense unresolved "
+        "atmosphere",
+        "bright cheerful colors, cartoon",
+        "moody investigative mystery look, noir shadows, pools of light",
+        ("mystery", "rahasya", "unsolved", "disappeared", "gayab", "clue",
+         "suspense", "secret", "raaz", "conspiracy", "investigation",
+         "evidence")),
+    "geopolitics": GenreStyle(
+        "serious geopolitical documentary tone, world maps and satellite "
+        "imagery, muted institutional palette, cool clean realism, "
+        "authoritative composition",
+        "cartoon, fantasy",
+        "serious geopolitical documentary look, world maps, muted "
+        "institutional palette",
+        ("geopolitics", "border", "seema", "war", "yudh", "nato", "china",
+         "russia", "treaty", "sanction", "military", "strategy", "conflict",
+         "alliance")),
 }
 
 GENRE_NAMES = tuple(GENRE_STYLES.keys())
@@ -201,6 +230,9 @@ _ATMOSPHERE: Dict[str, Optional[Tuple[str, float]]] = {
     "devotional": ("light_leak", 0.18),
     "news": None,
     "vlog": ("grain", 0.15),
+    "documentary": ("grain", 0.16),
+    "mystery": ("grain", 0.24),
+    "geopolitics": ("grain", 0.12),
 }
 
 
@@ -231,6 +263,10 @@ _GRADE: Dict[str, Tuple[str, Dict[str, float]]] = {
     "devotional": ("warm", {"vignette": 0.22}),
     "news": ("clean", {}),
     "vlog": ("warm", {"contrast": 1.05}),
+    "documentary": ("cinematic", {"saturation": 0.92, "vignette": 0.14}),
+    "mystery": ("moody", {"saturation": 0.8, "temperature": -0.2, "vignette": 0.42,
+                          "contrast": 1.15}),
+    "geopolitics": ("clean", {"temperature": -0.1, "vignette": 0.12}),
 }
 
 
@@ -259,11 +295,133 @@ _TOPIC_TRANSITION: Dict[str, Tuple[str, float]] = {
     "devotional": ("fadewhite", 0.7),
     "news": ("wipeleft", 0.3),
     "vlog": ("slideleft", 0.35),
+    "documentary": ("fade", 0.5),
+    "mystery": ("fadeblack", 0.6),
+    "geopolitics": ("wipeleft", 0.35),
 }
 
 
 def topic_transition_for(genre: Optional[str]) -> Tuple[str, float]:
     return _TOPIC_TRANSITION.get(normalise(genre), _TOPIC_TRANSITION["general"])
+
+
+# Auto-edit pacing per genre, (max_pause_seconds, pause_padding_seconds): a pause
+# longer than the first is trimmed to the second either side of the speech. Only
+# genres whose delivery lives in its silences are listed; the rest keep the
+# Timeline defaults (0.40s / 0.12s), and a pacing a channel or the user chose
+# always wins over these (asr.auto_edit.apply_genre_pacing).
+#
+# Horror is measured from the creator's own cut of Raat3Baje ep1 (2026-10-04):
+# the pauses kept there have a median of 0.40s, p90 1.0s and p95 1.38s. Half of
+# them ran past the default's 0.40s, and the default crushed every one of those
+# to a ~0.24s beat — the dread before a reveal went with them. At 1.2s, 93% of
+# the cut's pauses pass untouched; longer dead air still comes down, to a 0.9s beat.
+_PACING: Dict[str, Tuple[float, float]] = {
+    "horror": (1.2, 0.45),
+}
+
+
+def pacing_for(genre: Optional[str]) -> Optional[Tuple[float, float]]:
+    """(max_pause_seconds, pause_padding_seconds) for the genre, or None when the
+    Timeline defaults suit it."""
+    return _PACING.get(normalise(genre))
+
+
+# What the AI editor (asr/editor.py) should know about how a genre is delivered: guidance
+# it weighs, not a rule that decides. Narrated stories repeat a phrase on purpose — on
+# Raat3Baje ep1 most of what the editor wrongly cut was such repetition ("वहाँ नीचे... वहाँ
+# नीचे") trimmed as if it were a stutter, after examples from a vlog taught it to.
+_STORYTELLING = ("This is narrated storytelling. Repeating a phrase for effect (\"वहाँ नीचे... वहाँ नीचे\"), "
+                 "a slow build and long dramatic pauses are part of the delivery: keep them. Trim a repeated "
+                 "phrase only when its first copy is clearly broken off or stumbled.")
+_EDITING_NOTES: Dict[str, str] = {
+    "horror": _STORYTELLING,
+    "mystery": _STORYTELLING,
+    "true_crime": _STORYTELLING,
+}
+
+
+def editing_notes_for(genre: Optional[str]) -> str:
+    """Delivery notes for the AI editor, or "" when the genre needs none."""
+    return _EDITING_NOTES.get(normalise(genre), "")
+
+
+# The recommended effect palette per genre — names an editor (human or model)
+# can pick from when reaching for something beyond the automatic atmosphere
+# and grade. Deliberately a suggestion list, not an enforced one.
+_FX_PALETTE: Dict[str, Tuple[str, ...]] = {
+    "general": ("grain",),
+    "horror": ("flicker", "shutter", "glitch", "fog", "shake", "flash", "vhs", "strobe"),
+    "true_crime": ("grain", "redaction", "spotlight", "flicker", "case_file"),
+    "comedy": ("push", "zoom"),
+    "gaming": ("glitch", "flash"),
+    "tech": ("push", "clean"),
+    "science_education": ("push", "spotlight"),
+    "finance": ("push", "stat", "chart", "clean"),
+    "motivational": ("push", "light_leak"),
+    "health_fitness": ("push",),
+    "cooking": ("push",),
+    "travel": ("push", "light_leak"),
+    "devotional": ("light_leak", "spotlight"),
+    "news": ("grain", "push"),
+    "vlog": ("push",),
+    "documentary": ("grain", "light_leak", "spotlight", "push", "fade"),
+    "mystery": ("grain", "flicker", "redaction", "spotlight", "shutter"),
+    "geopolitics": ("grain", "spotlight", "push", "map", "newspaper"),
+}
+
+
+def fx_palette_for(genre: Optional[str]) -> Tuple[str, ...]:
+    """The recommended effect names for the genre, or () when none apply."""
+    return _FX_PALETTE.get(normalise(genre), ())
+
+
+# --- secondary genre blend ---------------------------------------------------
+#
+# The primary genre alone drives the programme grade, atmosphere and topic
+# transitions — one look has to hold the whole video together. The FX palette
+# and B-roll style tags, in contrast, are lists a pass picks *from*, so a
+# second genre can fold into them: the primary's own names stay in full, and
+# roughly a 35/65 share of the secondary's own (non-overlapping) names are
+# appended after them, so a scan of the list still reads primary-first.
+_BLEND_PRIMARY_WEIGHT = 0.65
+_BLEND_SECONDARY_WEIGHT = 0.35
+
+
+def _blend(primary_names: Tuple[str, ...], secondary_names: Tuple[str, ...]) -> Tuple[str, ...]:
+    extra = [name for name in secondary_names if name not in primary_names]
+    if not extra:
+        return primary_names
+    ratio = _BLEND_SECONDARY_WEIGHT / _BLEND_PRIMARY_WEIGHT
+    take = max(1, math.ceil(len(primary_names) * ratio)) if primary_names else len(extra)
+    return tuple(list(primary_names) + extra[:take])
+
+
+def blended_fx_palette(genre: Optional[str], secondary: Optional[str]) -> Tuple[str, ...]:
+    """The FX palette for two genres, primary first and ~65/35 weighted.
+
+    `secondary` is ignored when absent, "general", or the same as `genre` —
+    a blend with nothing to add is just the primary's own palette.
+    """
+    primary = fx_palette_for(genre)
+    if not secondary or normalise(secondary) in ("general", normalise(genre)):
+        return primary
+    return _blend(primary, fx_palette_for(secondary))
+
+
+def _style_tags(genre: Optional[str]) -> Tuple[str, ...]:
+    """A genre's `look` string, split into its comma-separated phrases."""
+    return tuple(part.strip() for part in style_for(genre).look.split(",") if part.strip())
+
+
+def blended_style_tags(genre: Optional[str], secondary: Optional[str]) -> Tuple[str, ...]:
+    """B-roll style phrases for two genres, blended the same ~65/35 way as the
+    FX palette — for `apply_look`, and for any other pass that wants the two
+    genres' look words rather than a single genre's `look` string."""
+    primary = _style_tags(genre)
+    if not secondary or normalise(secondary) in ("general", normalise(genre)):
+        return primary
+    return _blend(primary, _style_tags(secondary))
 
 
 def normalise(genre: Optional[str]) -> str:
@@ -284,8 +442,11 @@ def normalise(genre: Optional[str]) -> str:
         "business": "finance", "money": "finance", "fitness": "health_fitness",
         "health": "health_fitness", "food": "cooking", "recipes": "cooking",
         "spiritual": "devotional", "religious": "devotional",
-        "technology": "tech", "lifestyle": "vlog", "documentary": "news",
+        "technology": "tech", "lifestyle": "vlog",
         "motivation": "motivational", "inspirational": "motivational",
+        "geopolitical": "geopolitics", "geo": "geopolitics",
+        "mystery_thriller": "mystery", "whodunit": "mystery",
+        "financial_documentary": "finance", "financial": "finance",
     }
     return aliases.get(slug, "general")
 
@@ -307,18 +468,29 @@ def genre_block(genre: Optional[str]) -> str:
     )
 
 
-def apply_look(prompt: Optional[str], genre: Optional[str]) -> Optional[str]:
-    """The genre's look stamped onto a positive prompt, exactly once."""
+def apply_look(prompt: Optional[str], genre: Optional[str],
+              secondary: Optional[str] = None) -> Optional[str]:
+    """The genre's look stamped onto a positive prompt, exactly once.
+
+    `secondary`, when given, blends its own style words in behind the
+    primary's (see `blended_style_tags`) — the primary genre still leads.
+    """
     if not prompt:
         return prompt
-    look = style_for(genre).look
+    look = (", ".join(blended_style_tags(genre, secondary)) if secondary
+           else style_for(genre).look)
     if not look or look in prompt:
         return prompt
     return f"{prompt}, {look}"
 
 
-def apply_negative(negative: str, genre: Optional[str]) -> str:
+def apply_negative(negative: str, genre: Optional[str],
+                   secondary: Optional[str] = None) -> str:
     extra = style_for(genre).negative
+    if secondary and normalise(secondary) not in ("general", normalise(genre)):
+        sec_negative = style_for(secondary).negative
+        if sec_negative and sec_negative not in extra:
+            extra = f"{extra}, {sec_negative}" if extra else sec_negative
     if not extra or extra in (negative or ""):
         return negative
     return f"{negative}, {extra}" if negative else extra
@@ -345,7 +517,16 @@ async def detect_genre(program, ask) -> str:
 
     Never raises — a detection failure is a plain video, not a failed pass.
     """
-    excerpt = program.text_between(0.0, min(300.0, program.duration_s))
+    return await detect_genre_in_text(
+        program.text_between(0.0, min(300.0, program.duration_s)),
+        program.text_between(0.0, program.duration_s), ask)
+
+
+async def detect_genre_in_text(excerpt: str, full_text: str, ask) -> str:
+    """`detect_genre` over plain transcript text: `excerpt` (the opening minutes)
+    for the model, `full_text` for the keyword fallback. For callers that have
+    words but no Program yet — the auto-edit picks its pacing before any
+    presentation exists."""
     if ask is not None and excerpt:
         try:
             answer = await ask(GENRE_SYSTEM, f"Transcript:\n{excerpt}\n\nGenre:",
@@ -364,7 +545,6 @@ async def detect_genre(program, ask) -> str:
             if name != "general":
                 logger.info("Genre (model): %s", name)
                 return name
-    full_text = program.text_between(0.0, program.duration_s)
     name = keyword_genre(full_text)
     logger.info("Genre (keywords): %s", name)
     return name

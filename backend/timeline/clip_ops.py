@@ -10,7 +10,7 @@ to prevent the next word-rebuild from silently clobbering hand edits.
 """
 
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from pydantic import BaseModel
 from .presets import (color_preset_values, effect_preset, text_preset_style,
                       transition_preset)
@@ -79,9 +79,266 @@ def next_track(timeline: Timeline, kind: str) -> str:
     return f"{prefix}{max_num + 1}"
 
 
-def _finalize(timeline: Timeline) -> None:
+def _finalize(timeline: Timeline, first: Iterable[str] = ()) -> None:
+    pack_main_track(timeline, first)
     timeline.recalculate_duration()
     timeline.revision += 1
+
+
+def _new_id(prefix: str = "clip") -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+
+def new_link_id() -> str:
+    return f"lnk_{uuid.uuid4().hex[:8]}"
+
+
+# ---------------------------------------------------------------------------
+# Linked clips (a video and its own sound, moved as one)
+# ---------------------------------------------------------------------------
+
+def linked_partners(timeline: Timeline, item: TimelineItem) -> List[TimelineItem]:
+    if not item.link_id:
+        return []
+    return [i for i in timeline.items if i.link_id == item.link_id and i.id != item.id]
+
+
+def with_partners(timeline: Timeline, item_ids: Iterable[str]) -> List[TimelineItem]:
+    """The named items plus everything linked to them, each once."""
+    seen: Set[str] = set()
+    out: List[TimelineItem] = []
+    for item_id in item_ids:
+        item = get_item(timeline, item_id)
+        if item is None:
+            raise ClipOpError(f"Item {item_id} not found")
+        for member in [item, *linked_partners(timeline, item)]:
+            if member.id not in seen:
+                seen.add(member.id)
+                out.append(member)
+    return out
+
+
+def link_items(timeline: Timeline, item_ids: List[str]) -> str:
+    """Link clips so they move, trim, split and delete together. Anything already
+    linked to one of them joins the new set rather than being orphaned."""
+    members = with_partners(timeline, item_ids)
+    if len(members) < 2:
+        raise ClipOpError("Select at least two clips to link")
+    for member in members:
+        _require_editable(member, member.id, timeline)
+    link_id = new_link_id()
+    for member in members:
+        member.link_id = link_id
+    _finalize(timeline)
+    return link_id
+
+
+def unlink_items(timeline: Timeline, item_ids: List[str]) -> int:
+    """Break the link on these clips (and their partners) so each edits alone."""
+    members = with_partners(timeline, item_ids)
+    for member in members:
+        member.link_id = None
+    _finalize(timeline)
+    return len(members)
+
+
+# ---------------------------------------------------------------------------
+# The magnetic main track and ripple edits
+# ---------------------------------------------------------------------------
+
+MAIN_TRACK = "V1"
+
+
+def is_magnetic_main(timeline: Timeline) -> bool:
+    """True when V1 holds hand-placed clips only.
+
+    The compiler renders V1 as a straight concatenation of its clips — a gap on
+    the lane is simply not there in the export — so a hand-built V1 is kept
+    packed: first clip at the start, no holes, which makes the lane show what
+    the render will actually play. A transcript-built spine (origin "auto") has
+    its own ripple rules (ops.cut_program_range) and is left alone.
+    """
+    v1 = [i for i in timeline.items if i.track == MAIN_TRACK]
+    return bool(v1) and all(i.origin != "auto" for i in v1)
+
+
+def pack_main_track(timeline: Timeline, first: Iterable[str] = ()) -> None:
+    """Close every gap on a hand-built V1, carrying linked partners along.
+
+    Order is by start frame; on a tie the clips in `first` (the ones just
+    dropped, pasted or moved) go ahead of the clip already there, which is what
+    makes dropping onto a clip's leading edge insert before it.
+    """
+    if not is_magnetic_main(timeline):
+        return
+    first = set(first)
+    v1 = sorted(
+        (i for i in timeline.items if i.track == MAIN_TRACK),
+        key=lambda i: (i.timeline_start_frame, 0 if i.id in first else 1, i.timeline_end_frame),
+    )
+    cursor = max(0, timeline.program_offset_frames)
+    shifted: Set[str] = set()
+    for item in v1:
+        shift = cursor - item.timeline_start_frame
+        cursor = item.timeline_end_frame + shift
+        if not shift:
+            continue
+        item.timeline_start_frame += shift
+        item.timeline_end_frame += shift
+        for partner in linked_partners(timeline, item):
+            # A partner on V1 gets its own turn in this loop; one on another
+            # track follows the first V1 clip it is linked to, exactly once.
+            if partner.track == MAIN_TRACK or partner.id in shifted:
+                continue
+            partner.timeline_start_frame += shift
+            partner.timeline_end_frame += shift
+            shifted.add(partner.id)
+
+
+def main_track_insert_frame(timeline: Timeline, frame: int) -> int:
+    """Where a clip dropped at `frame` lands on a magnetic V1: the nearest edit
+    point — before a clip if dropped on its first half, after it otherwise, and
+    on the end of the track if dropped past everything."""
+    v1 = sorted((i for i in timeline.items if i.track == MAIN_TRACK),
+                key=lambda i: i.timeline_start_frame)
+    if not v1:
+        return max(0, timeline.program_offset_frames)
+    for item in v1:
+        if item.timeline_start_frame <= frame < item.timeline_end_frame:
+            mid = (item.timeline_start_frame + item.timeline_end_frame) / 2
+            return item.timeline_start_frame if frame < mid else item.timeline_end_frame
+    return v1[-1].timeline_end_frame if frame >= v1[-1].timeline_end_frame else v1[0].timeline_start_frame
+
+
+def _movable(timeline: Timeline, item: TimelineItem) -> bool:
+    return item.origin != "auto" and not item.locked and not is_track_locked(timeline, item.track)
+
+
+def _ripple(timeline: Timeline, tracks: Iterable[str], from_frame: int, delta: int,
+            include: Iterable[TimelineItem] = (), exclude: Iterable[str] = ()) -> int:
+    """Slide every clip on `tracks` that starts at or after `from_frame` by
+    `delta` frames (negative = left), together with linked partners — and with
+    the rest of each partner's track from that point, so a ripple never shears a
+    linked pair or slides one clip into the next.
+
+    A leftward slide is shortened rather than let a moving clip land on one that
+    is staying put or run past frame 0. Every moving clip moves by the same
+    amount, so sync between tracks always survives. Returns the delta applied.
+    """
+    if delta == 0:
+        return 0
+    exclude = set(exclude)
+    tracks = set(tracks)
+    moving: Dict[str, TimelineItem] = {i.id: i for i in include if i.id not in exclude}
+    changed = True
+    while changed:
+        changed = False
+        for item in timeline.items:
+            if item.id in moving or item.id in exclude or not _movable(timeline, item):
+                continue
+            if item.track in tracks and item.timeline_start_frame >= from_frame:
+                moving[item.id] = item
+                changed = True
+        for item in list(moving.values()):
+            tracks.add(item.track)
+            for partner in linked_partners(timeline, item):
+                if partner.id not in moving and partner.id not in exclude and _movable(timeline, partner):
+                    moving[partner.id] = partner
+                    changed = True
+    if not moving:
+        return 0
+
+    if delta < 0:
+        room = min(m.timeline_start_frame for m in moving.values())
+        for m in moving.values():
+            for other in timeline.items:
+                if other.id in moving or other.track != m.track:
+                    continue
+                if other.timeline_end_frame <= m.timeline_start_frame:
+                    room = min(room, m.timeline_start_frame - other.timeline_end_frame)
+        delta = -min(-delta, max(0, room))
+    else:
+        room = None
+        for m in moving.values():
+            for other in timeline.items:
+                if other.id in moving or other.track != m.track:
+                    continue
+                if other.timeline_start_frame >= m.timeline_end_frame:
+                    gap = other.timeline_start_frame - m.timeline_end_frame
+                    room = gap if room is None else min(room, gap)
+        if room is not None:
+            delta = min(delta, room)
+
+    for m in moving.values():
+        m.timeline_start_frame += delta
+        m.timeline_end_frame += delta
+    return delta
+
+
+def close_gap(timeline: Timeline, track: str, at_frame: int) -> int:
+    """Delete the empty stretch of `track` around `at_frame`, sliding everything
+    after it left (a ripple). Returns how many frames were closed."""
+    on_track = [i for i in timeline.items if i.track == track]
+    if any(i.timeline_start_frame <= at_frame < i.timeline_end_frame for i in on_track):
+        raise ClipOpError("That is a clip, not a gap")
+    later = [i.timeline_start_frame for i in on_track if i.timeline_start_frame > at_frame]
+    if not later:
+        raise ClipOpError("There is nothing after this gap to close it up")
+    gap_end = min(later)
+    gap_start = max([i.timeline_end_frame for i in on_track if i.timeline_end_frame <= at_frame],
+                    default=0)
+    applied = _ripple(timeline, {track}, gap_end, -(gap_end - gap_start))
+    if applied == 0:
+        raise ClipOpError("Can't close this gap — a locked clip or a linked clip on "
+                          "another track is in the way")
+    _finalize(timeline)
+    return -applied
+
+
+def track_fits(timeline: Timeline, track: str, start: int, end: int, ignore: Set[str] = frozenset()) -> bool:
+    return not any(
+        i.track == track and i.id not in ignore
+        and i.timeline_start_frame < end and start < i.timeline_end_frame
+        for i in timeline.items
+    )
+
+
+def track_has_auto(timeline: Timeline, track: str) -> bool:
+    return any(i.track == track and i.origin == "auto" for i in timeline.items)
+
+
+def _tracks_of_kind(timeline: Timeline, kind: str) -> List[str]:
+    names = {i.track for i in timeline.items if track_kind(i.track) == kind and i.track.upper() != "CAP"}
+    names.update(t for t in timeline.extra_tracks if track_kind(t) == kind)
+    return sorted(names, key=lambda t: int("".join(c for c in t if c.isdigit()) or 0))
+
+
+def free_track(timeline: Timeline, kind: str, start: int, end: int,
+               prefer: Iterable[str] = (), skip: Iterable[str] = ()) -> str:
+    """The first track of `kind` with nothing in [start, end): the preferred
+    ones first, then existing overlay lanes bottom-up, then a brand new lane.
+    Never V1/A1 unless asked for (they are the programme), never a locked lane."""
+    skip = set(skip)
+    candidates = [*prefer, *(t for t in _tracks_of_kind(timeline, kind) if t.upper() not in ("V1", "A1"))]
+    for track in candidates:
+        if track in skip or track_kind(track) != kind or is_track_locked(timeline, track):
+            continue
+        if track_has_auto(timeline, track):
+            continue
+        if track_fits(timeline, track, start, end):
+            return track
+    taken = set(_tracks_of_kind(timeline, kind)) | skip
+    num = max([int("".join(c for c in t if c.isdigit()) or 0) for t in taken] + [1]) + 1
+    return f"{kind}{num}"
+
+
+def a1_follows_v1(timeline: Timeline) -> bool:
+    """A1 is the main track's own sound: empty, or only clips linked to V1 clips.
+    Only then can a V1 clip's audio go on A1 without landing on music."""
+    if track_has_auto(timeline, "A1"):
+        return False
+    v1_links = {i.link_id for i in timeline.items if i.track == MAIN_TRACK and i.link_id}
+    return all(i.link_id in v1_links for i in timeline.items if i.track == "A1")
 
 
 # ---------------------------------------------------------------------------
@@ -176,43 +433,141 @@ def add_media_item(
         origin=origin,
     )
     timeline.items.append(item)
-    _finalize(timeline)
+    # Dropped on a clip's leading edge of a magnetic V1, it goes in front of it.
+    _finalize(timeline, first={item.id})
     return item
 
 
-def split_item(timeline: Timeline, item_id: str, at_timeline_frame: int) -> Tuple[TimelineItem, TimelineItem]:
-    """Split a clip into two at an absolute timeline frame (the playhead)."""
-    item = _require_editable(get_item(timeline, item_id), item_id, timeline)
-    if not (item.timeline_start_frame < at_timeline_frame < item.timeline_end_frame):
-        raise ClipOpError("Split point must be strictly inside the clip")
-
+def _split_one(timeline: Timeline, item: TimelineItem,
+               at_timeline_frame: int) -> Tuple[TimelineItem, TimelineItem]:
     offset = at_timeline_frame - item.timeline_start_frame  # frames into the clip
     src_split = item.source_start_frame + offset
 
     left = item.model_copy(deep=True, update={
-        "id": f"clip_{uuid.uuid4().hex[:8]}",
+        "id": _new_id(item.id.split("_")[0] or "clip"),
         "source_end_frame": src_split,
         "timeline_end_frame": at_timeline_frame,
     })
     right = item.model_copy(deep=True, update={
-        "id": f"clip_{uuid.uuid4().hex[:8]}",
+        "id": _new_id(item.id.split("_")[0] or "clip"),
         "source_start_frame": src_split,
         "timeline_start_frame": at_timeline_frame,
+        # The transition belongs to the clip's leading edge, which only the
+        # left half still has; a split must not invent a dissolve mid-shot.
+        "transition": None,
     })
     if item.kind == "compound":
         # Children are positioned relative to their parent's start, so the right
         # half has to be rebased or every child would jump forward by the offset.
         _rebase_children(right, -offset)
-    timeline.items = [i for i in timeline.items if i.id != item_id]
-    timeline.items.extend([left, right])
-    _finalize(timeline)
+    # Keep the halves where the original sat in the list: the compiler's V1
+    # concat must never see the right half ahead of the left.
+    idx = next(n for n, i in enumerate(timeline.items) if i.id == item.id)
+    timeline.items[idx:idx + 1] = [left, right]
     return left, right
 
 
-def delete_item(timeline: Timeline, item_id: str) -> None:
-    item = _require_editable(get_item(timeline, item_id), item_id, timeline)
-    timeline.items = [i for i in timeline.items if i.id != item.id]
+def split_items(timeline: Timeline, item_ids: List[str], at_timeline_frame: int,
+                linked: bool = True) -> List[TimelineItem]:
+    """Split every named clip (and, with `linked`, its partners) that the frame
+    falls strictly inside. Halves of a linked pair stay linked to each other:
+    the left halves keep the original link, the right halves share a new one."""
+    targets = with_partners(timeline, item_ids) if linked else [
+        get_item(timeline, i) for i in item_ids]
+    targets = [t for t in targets
+               if t is not None and t.timeline_start_frame < at_timeline_frame < t.timeline_end_frame]
+    if not targets:
+        raise ClipOpError("Split point must be strictly inside the clip")
+    for target in targets:
+        _require_editable(target, target.id, timeline)
+
+    rights: Dict[str, List[TimelineItem]] = {}
+    out: List[TimelineItem] = []
+    for target in targets:
+        left, right = _split_one(timeline, target, at_timeline_frame)
+        out.extend([left, right])
+        if target.link_id:
+            rights.setdefault(target.link_id, []).append(right)
+    for halves in rights.values():
+        new_link = new_link_id() if len(halves) > 1 else None
+        for half in halves:
+            half.link_id = new_link
     _finalize(timeline)
+    return out
+
+
+def split_item(timeline: Timeline, item_id: str, at_timeline_frame: int,
+               linked: bool = True) -> Tuple[TimelineItem, TimelineItem]:
+    """Split a clip into two at an absolute timeline frame (the playhead)."""
+    item = _require_editable(get_item(timeline, item_id), item_id, timeline)
+    if not (item.timeline_start_frame < at_timeline_frame < item.timeline_end_frame):
+        raise ClipOpError("Split point must be strictly inside the clip")
+    halves = split_items(timeline, [item_id], at_timeline_frame, linked=linked)
+    # The named clip's own halves come first: it was the first target.
+    return halves[0], halves[1]
+
+
+def delete_items(timeline: Timeline, item_ids: List[str], ripple: bool = False,
+                 linked: bool = True) -> int:
+    """Delete clips (with their linked partners). With `ripple`, each hole is
+    closed by sliding the rest of its track left — Filmora's Ripple Delete."""
+    members = with_partners(timeline, item_ids) if linked else [
+        get_item(timeline, i) for i in item_ids]
+    if any(m is None for m in members):
+        raise ClipOpError("Item not found")
+    for member in members:
+        _require_editable(member, member.id, timeline)
+    gone = {m.id for m in members}
+    timeline.items = [i for i in timeline.items if i.id not in gone]
+
+    if ripple:
+        # One ripple per distinct hole, latest first, so closing a later hole
+        # never moves the edges of an earlier one. A video and its linked audio
+        # share a hole and therefore a single ripple.
+        holes: Dict[Tuple[int, int], Set[str]] = {}
+        for m in members:
+            holes.setdefault((m.timeline_start_frame, m.timeline_end_frame), set()).add(m.track)
+        for (start, end), tracks in sorted(holes.items(), key=lambda kv: -kv[0][0]):
+            _ripple(timeline, tracks, end, -(end - start))
+    _finalize(timeline)
+    return len(members)
+
+
+def delete_item(timeline: Timeline, item_id: str, ripple: bool = False,
+                linked: bool = True) -> None:
+    delete_items(timeline, [item_id], ripple=ripple, linked=linked)
+
+
+def move_items(timeline: Timeline, item_ids: List[str], delta_frames: int,
+               track_map: Optional[Dict[str, str]] = None,
+               linked: bool = True) -> List[TimelineItem]:
+    """Slide clips (with their linked partners) by the same number of frames,
+    optionally re-homing some onto other lanes of the same kind."""
+    members = with_partners(timeline, item_ids) if linked else [
+        get_item(timeline, i) for i in item_ids]
+    if any(m is None for m in members):
+        raise ClipOpError("Item not found")
+    for member in members:
+        _require_editable(member, member.id, timeline)
+    track_map = track_map or {}
+    for item_id, track in track_map.items():
+        item = get_item(timeline, item_id)
+        if item is None or not track:
+            continue
+        if track_kind(track) != track_kind(item.track):
+            raise ClipOpError("Cannot move a video clip to an audio track (or vice-versa)")
+        if is_track_locked(timeline, track):
+            raise ClipOpError(f"{track} is locked — unlock it to move clips onto it")
+
+    # The group moves as a block: it stops at frame 0 rather than squashing.
+    delta = max(delta_frames, -min(m.timeline_start_frame for m in members))
+    for member in members:
+        member.timeline_start_frame += delta
+        member.timeline_end_frame += delta
+        if track_map.get(member.id):
+            member.track = track_map[member.id]
+    _finalize(timeline, first={m.id for m in members})
+    return members
 
 
 def move_item(
@@ -220,18 +575,14 @@ def move_item(
     item_id: str,
     new_timeline_start_frame: int,
     new_track: Optional[str] = None,
+    linked: bool = True,
 ) -> TimelineItem:
-    """Move a clip in time and optionally to another track. Duration is preserved."""
+    """Move a clip in time and optionally to another track. Duration is preserved,
+    and linked partners slide by the same amount (on their own tracks)."""
     item = _require_editable(get_item(timeline, item_id), item_id, timeline)
-    duration = item.timeline_end_frame - item.timeline_start_frame
-    new_start = max(0, new_timeline_start_frame)
-    item.timeline_start_frame = new_start
-    item.timeline_end_frame = new_start + duration
-    if new_track:
-        if track_kind(new_track) != track_kind(item.track):
-            raise ClipOpError("Cannot move a video clip to an audio track (or vice-versa)")
-        item.track = new_track
-    _finalize(timeline)
+    delta = max(0, new_timeline_start_frame) - item.timeline_start_frame
+    move_items(timeline, [item_id], delta,
+               track_map={item_id: new_track} if new_track else None, linked=linked)
     return item
 
 
@@ -242,11 +593,63 @@ def _rebase_children(item: TimelineItem, shift: int) -> None:
         child.timeline_end_frame += shift
 
 
-def trim_item(timeline: Timeline, item_id: str, edge: str, new_timeline_frame: int) -> TimelineItem:
+def trim_item(timeline: Timeline, item_id: str, edge: str, new_timeline_frame: int,
+              linked: bool = True, ripple: bool = False) -> TimelineItem:
     """Trim one edge of a clip to a new timeline frame, adjusting the source in/out
-    so the visible content stays anchored (like dragging a clip handle)."""
-    item = _require_editable(get_item(timeline, item_id), item_id, timeline)
+    so the visible content stays anchored (like dragging a clip handle).
 
+    Linked partners whose same edge sits on the same frame are trimmed with it,
+    so the picture and its sound stay cut together. With `ripple` the rest of
+    the track follows the edge: shortening pulls later clips in, lengthening
+    pushes them out, and a trimmed head keeps the clip's left edge in place.
+    """
+    item = _require_editable(get_item(timeline, item_id), item_id, timeline)
+    if edge not in ("start", "end"):
+        raise ClipOpError("edge must be 'start' or 'end'")
+    edge_of = (lambda i: i.timeline_start_frame) if edge == "start" else (lambda i: i.timeline_end_frame)
+    old = edge_of(item)
+    group = [item]
+    if linked:
+        group += [p for p in linked_partners(timeline, item) if edge_of(p) == old]
+    for member in group:
+        _require_editable(member, member.id, timeline)
+    for member in group:
+        _trim_one(timeline, member, edge, new_timeline_frame)
+
+    if ripple and new_timeline_frame != old:
+        tracks = {m.track for m in group}
+        if edge == "end":
+            _ripple(timeline, tracks, old, new_timeline_frame - old, exclude={m.id for m in group})
+        else:
+            # The clip itself slides back to where its head used to be.
+            _ripple(timeline, tracks, new_timeline_frame, old - new_timeline_frame,
+                    include=group)
+    _finalize(timeline)
+    return item
+
+
+def trim_items(timeline: Timeline, item_ids: List[str], edge: str, at_frame: int,
+               ripple: bool = False) -> List[TimelineItem]:
+    """Trim the start or end of every named clip the frame falls inside to that
+    frame — "trim start/end to playhead"."""
+    done: Set[str] = set()
+    trimmed: List[TimelineItem] = []
+    for item_id in item_ids:
+        if item_id in done:
+            continue
+        item = get_item(timeline, item_id)
+        if item is None or not (item.timeline_start_frame < at_frame < item.timeline_end_frame):
+            continue
+        group = [item, *linked_partners(timeline, item)]
+        done.update(m.id for m in group)
+        trim_item(timeline, item_id, edge, at_frame, linked=True, ripple=ripple)
+        trimmed.append(item)
+    if not trimmed:
+        raise ClipOpError("Put the playhead inside the clip to trim it")
+    return trimmed
+
+
+def _trim_one(timeline: Timeline, item: TimelineItem, edge: str, new_timeline_frame: int) -> None:
     # Text has no source to run out of, and a compound's material lives in its
     # children — only real media clips are bounded by a source file.
     trims_source = item.kind == "media"
@@ -286,9 +689,6 @@ def trim_item(timeline: Timeline, item_id: str, edge: str, new_timeline_frame: i
         item.timeline_end_frame = new_timeline_frame
     else:
         raise ClipOpError("edge must be 'start' or 'end'")
-
-    _finalize(timeline)
-    return item
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +984,22 @@ def update_effect(timeline: Timeline, index: int, updates: Dict[str, Any],
     effects = _effect_list(timeline, item_id)
     if not 0 <= index < len(effects):
         raise ClipOpError(f"No effect at position {index}")
-    effects[index] = _merged(AtmosphereEffect, effects[index], updates)
+    # `extra` is a free-form payload (the knockout/behind-head/etc. text-fx
+    # params): a caller editing one key (say `plate_color`) must not blow away
+    # every other key already sitting there, which a plain `_merged` replace
+    # would do. Merged by hand instead, with a None value deleting the key —
+    # the one way a caller can ever remove something from `extra`.
+    extra_update = updates.get("extra")
+    rest = {k: v for k, v in updates.items() if k != "extra"}
+    effects[index] = _merged(AtmosphereEffect, effects[index], rest)
+    if isinstance(extra_update, dict):
+        merged_extra = dict(effects[index].extra or {})
+        for key, value in extra_update.items():
+            if value is None:
+                merged_extra.pop(key, None)
+            else:
+                merged_extra[key] = value
+        effects[index].extra = merged_extra
     _finalize(timeline)
     return effects[index]
 
@@ -607,13 +1022,22 @@ def set_aspect_bars(timeline: Timeline, ratio: Optional[float]) -> Optional[floa
 
 
 def set_item_flags(timeline: Timeline, item_id: str, **flags: Any) -> TimelineItem:
-    """Toggle enabled / locked / mute, set volume or rename a clip."""
+    """Toggle enabled / locked / mute / loop, set volume, fades, ducking or rename a clip."""
     item = get_item(timeline, item_id)
     if item is None:
         raise ClipOpError(f"Item {item_id} not found")
-    for key in ("enabled", "locked", "mute", "volume", "label"):
-        if key in flags and flags[key] is not None:
-            setattr(item, key, flags[key])
+    for key in ("enabled", "locked", "mute", "volume", "label",
+                "loop", "audio_fade_in", "audio_fade_out", "duck"):
+        if key not in flags or flags[key] is None:
+            continue
+        value = flags[key]
+        if key == "duck":
+            value = max(0.0, min(1.0, float(value)))
+        elif key in ("audio_fade_in", "audio_fade_out"):
+            value = max(0.0, float(value))
+        elif key == "volume":
+            value = max(0.0, min(4.0, float(value)))
+        setattr(item, key, value)
     _finalize(timeline)
     return item
 
@@ -635,6 +1059,9 @@ def detach_audio(timeline: Timeline, item_id: str, track: Optional[str] = None) 
         raise ClipOpError("Only video clips can have their audio detached")
     if item.mute:
         raise ClipOpError("This clip's audio is already detached")
+    if any(track_kind(p.track) == "A" for p in linked_partners(timeline, item)):
+        raise ClipOpError("This clip's audio is already on its own track — unlink "
+                          "the two to edit them separately")
 
     source = timeline.sources.get(item.source_id or "")
     if source is None:
@@ -747,3 +1174,103 @@ def break_compound(timeline: Timeline, item_id: str) -> List[TimelineItem]:
     timeline.items.extend(restored)
     _finalize(timeline)
     return restored
+
+
+# ---------------------------------------------------------------------------
+# Clipboard: paste / paste-insert
+# ---------------------------------------------------------------------------
+
+def _fresh_identity(item: TimelineItem, link_map: Dict[str, str]) -> None:
+    """A pasted clip is a new, hand-placed clip — never a transcript-managed one."""
+    item.id = _new_id(item.id.split("_")[0] or "clip")
+    item.origin = "manual"
+    item.locked = False
+    item.anchor_word_id = None
+    if item.link_id:
+        item.link_id = link_map.setdefault(item.link_id, new_link_id())
+    for child in item.children:
+        child.id = _new_id(child.id.split("_")[0] or "clip")
+        child.anchor_word_id = None
+        if child.link_id:
+            child.link_id = link_map.setdefault(child.link_id, new_link_id())
+
+
+def paste_items(timeline: Timeline, clips: List[Dict[str, Any]], at_frame: int,
+                insert: bool = False) -> List[TimelineItem]:
+    """Paste copied clips so the earliest lands on `at_frame`, keeping their
+    spacing, lanes and links.
+
+    Each clip goes back on the lane it was copied from when that lane is free
+    for the pasted span; otherwise the whole lane's worth moves up to the first
+    free lane of its kind. A hand-built V1 is magnetic, so pasting onto it
+    inserts at the next edit point. With `insert`, the target lanes are split at
+    the playhead and pushed right to make room (Paste Insert).
+    """
+    if not clips:
+        raise ClipOpError("Nothing to paste")
+    try:
+        pasted = [TimelineItem.model_validate(c) for c in clips]
+    except Exception as e:  # pydantic ValidationError, bad shapes from the client
+        raise ClipOpError(f"Clipboard contents are not clips: {e}")
+    for clip in pasted:
+        if clip.kind == "media" and clip.source_id not in timeline.sources:
+            raise ClipOpError("A copied clip's media is no longer on this timeline")
+        if clip.timeline_end_frame <= clip.timeline_start_frame:
+            raise ClipOpError("A copied clip has no length")
+
+    shift = max(0, at_frame) - min(c.timeline_start_frame for c in pasted)
+    link_map: Dict[str, str] = {}
+    for clip in pasted:
+        _fresh_identity(clip, link_map)
+        clip.timeline_start_frame += shift
+        clip.timeline_end_frame += shift
+        # Text belongs on a text lane even when it was copied off the captions.
+        if clip.kind == "text" and track_kind(clip.track) != "T":
+            clip.track = "T1"
+    start = min(c.timeline_start_frame for c in pasted)
+    end = max(c.timeline_end_frame for c in pasted)
+
+    by_track: Dict[str, List[TimelineItem]] = {}
+    for clip in pasted:
+        by_track.setdefault(clip.track, []).append(clip)
+
+    main_magnetic = is_magnetic_main(timeline) or not any(i.track == MAIN_TRACK for i in timeline.items)
+    a1_free_to_follow = a1_follows_v1(timeline)
+    used: Set[str] = set()
+    a1_following = False
+    for track in sorted(by_track, key=lambda t: (_KIND_ORDER[track_kind(t)],
+                                                 int("".join(c for c in t if c.isdigit()) or 0))):
+        group = by_track[track]
+        kind = track_kind(track)
+        g_start = min(c.timeline_start_frame for c in group)
+        g_end = max(c.timeline_end_frame for c in group)
+        target = None
+        if track == MAIN_TRACK and main_magnetic and not track_has_auto(timeline, track):
+            target = track
+        elif track == "A1" and MAIN_TRACK in used and a1_free_to_follow:
+            target = track
+            a1_following = True
+        elif (track not in used and not is_track_locked(timeline, track)
+              and not track_has_auto(timeline, track)
+              and (insert or all(track_fits(timeline, track, c.timeline_start_frame, c.timeline_end_frame)
+                                 for c in group))):
+            target = track
+        if target is None:
+            target = free_track(timeline, kind, g_start, g_end, skip=used)
+        used.add(target)
+        for clip in group:
+            clip.track = target
+
+    if insert:
+        # The magnetic V1 (and the A1 that follows it) make room by packing.
+        targets = {c.track for c in pasted} - {MAIN_TRACK} - ({"A1"} if a1_following else set())
+        straddling = [i.id for i in timeline.items
+                      if i.track in targets and _movable(timeline, i)
+                      and i.timeline_start_frame < start < i.timeline_end_frame]
+        if straddling:
+            split_items(timeline, straddling, start)
+        _ripple(timeline, targets, start, end - start)
+
+    timeline.items.extend(pasted)
+    _finalize(timeline, first={c.id for c in pasted})
+    return pasted

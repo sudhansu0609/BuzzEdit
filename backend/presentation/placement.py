@@ -22,7 +22,7 @@ from timeline import clip_ops
 from timeline.authoring import clear_generated
 from timeline.schema import SourceFile, Timeline, time_to_frame
 
-from .models import Asset, Beat, PresentationSettings, Program
+from .models import BROLL_SECONDS_FLOOR, Asset, Beat, PresentationSettings, Program
 
 logger = logging.getLogger("presentation.placement")
 
@@ -38,6 +38,9 @@ POPUP_TRACK = "TP"
 POPUP_ORIGIN = "popup"
 
 # Enough movement to feel alive, not enough to notice as an effect.
+# A shot timed by the script may start this far inside, or after, the one
+# before it (rounding) and is moved to start exactly where that one ends.
+HELD_OVERLAP_SLACK_S = 0.25
 BROLL_ZOOM_MIN = 0.06
 BROLL_ZOOM_MAX = 0.14
 BROLL_PAN = 0.04
@@ -215,8 +218,11 @@ def place_broll(timeline: Timeline, beats: List[Beat], assets: List[Asset],
         )
 
         # Stills get the move. A generated clip already moves, and adding a zoom
-        # on top of its own motion looks like a mistake.
-        if asset.kind == "image":
+        # on top of its own motion looks like a mistake. A designed layout
+        # stays still: its speaker slot is drawn at a fixed place.
+        if beat.kind in ("statement_card", "canvas_card"):
+            item.label = f"layout: {beat.kind}"
+        elif asset.kind == "image":
             _apply_ken_burns(timeline, item.id, index, rng, duration_s)
 
         placed.append((start_s, start_s + duration_s))
@@ -236,6 +242,8 @@ def _window_for(beat: Beat, asset: Asset, program: Program,
                 cuts: Optional[List[float]] = None) -> Tuple[float, float, str]:
     """(start, duration, reason) — duration 0 with the reason when it cannot run."""
     start_s = max(0.0, beat.start_s)
+    if beat.data.get("hold") and beat.planned_duration_s:
+        return _held_window(beat, asset, program, placed, start_s)
     # Land on a word boundary. Cutting away mid-syllable draws attention to the
     # cut itself, the same instinct behind snapping audio cuts to a quiet moment.
     following = [w for w in program.words if w.tl_start_s >= start_s - 0.15]
@@ -269,10 +277,41 @@ def _window_for(beat: Beat, asset: Asset, program: Program,
     # The planner already spaced the beats; this is a safety net, so it runs
     # 0.2s looser than the planning gap — the word-boundary snap above can move
     # a start slightly, and a hair's drift must not throw a budgeted shot away.
-    gap = max(0.0, settings.cutaway_gap_s - 0.2)
+    # Density-scaled (see PresentationSettings.crowd_gap_s), not the larger
+    # coverage-derived cutaway_gap_s — busy/max allows back-to-back cutaways,
+    # and this safety net must not re-reject what budgeting already allowed.
+    gap = max(0.0, settings.crowd_gap_s - 0.2)
     for other_start, other_end in placed:
         if start_s < other_end + gap and other_start < start_s + duration_s:
             return start_s, 0.0, "would overlap or crowd the previous cutaway"
+    return start_s, duration_s, ""
+
+
+def _held_window(beat: Beat, asset: Asset, program: Program,
+                 placed: List[Tuple[float, float]], start_s: float) -> Tuple[float, float, str]:
+    """A shot the script timed itself (`seconds=`): it starts on its word and
+    runs exactly its length. The caller spaced these shots, often back to
+    back, so no snapping or sliding -- either could open a one-frame gap of
+    the speaker between two shots or push one onto the next. Only a sliver of
+    overlap (float rounding) is trimmed rather than the shot thrown away."""
+    duration_s = min(beat.planned_duration_s, max(0.0, program.duration_s - start_s))
+    if asset.kind == "video" and asset.duration_s > 0:
+        duration_s = min(duration_s, asset.duration_s)
+    for other_start, other_end in placed:
+        if other_start <= start_s < other_end:
+            if other_end - start_s > HELD_OVERLAP_SLACK_S:
+                return start_s, 0.0, "would overlap the previous cutaway"
+            duration_s -= other_end - start_s
+            start_s = other_end
+        elif 0.0 < start_s - other_end <= HELD_OVERLAP_SLACK_S:
+            # Meant to follow straight on: close the sliver, or the speaker
+            # flashes up for a frame between two shots.
+            duration_s += start_s - other_end
+            start_s = other_end
+        elif start_s < other_start < start_s + duration_s:
+            duration_s = other_start - start_s
+    if duration_s < BROLL_SECONDS_FLOOR:
+        return start_s, 0.0, "no room inside the beat's span"
     return start_s, duration_s, ""
 
 
@@ -295,7 +334,7 @@ def _shift_to_cover_cuts(start_s: float, duration_s: float, beat: Beat,
     if hi <= lo:
         return start_s
 
-    gap = max(0.0, settings.cutaway_gap_s - 0.2)
+    gap = max(0.0, settings.crowd_gap_s - 0.2)
 
     def clear(candidate: float) -> bool:
         end = candidate + duration_s

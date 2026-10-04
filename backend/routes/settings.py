@@ -1,7 +1,10 @@
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from store.app_settings import app_settings
+from store.app_settings import (
+    app_settings, OVERRIDE_MODES, get_presentation_overrides_state,
+    set_presentation_overrides,
+)
 from store.project_store import ProjectStore
 from config import PROJECTS_DIR
 
@@ -11,6 +14,11 @@ project_store = ProjectStore(base_dir=str(PROJECTS_DIR))
 
 class SetLastProjectRequest(BaseModel):
     project_id: Optional[str] = None
+
+
+class PresentationOverridesRequest(BaseModel):
+    presentation_overrides: Dict[str, Any] = {}
+    override_mode: str = "off"
 
 
 class AutoSaveRequest(BaseModel):
@@ -80,6 +88,23 @@ async def auto_save_project(body: AutoSaveRequest):
         "project_id": project_id,
         "timestamp": app_settings.get("last_save_timestamp")
     }
+
+
+@router.get("/presentation_overrides")
+async def get_presentation_overrides():
+    """BuzzEdit-side presentation defaults that win over whatever
+    BuzzcafStudio sends for a presentation job — see
+    store.app_settings.apply_presentation_overrides."""
+    return get_presentation_overrides_state()
+
+
+@router.put("/presentation_overrides")
+async def put_presentation_overrides(body: PresentationOverridesRequest):
+    if body.override_mode not in OVERRIDE_MODES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"override_mode must be one of {OVERRIDE_MODES}")
+    return set_presentation_overrides(body.presentation_overrides, body.override_mode)
 
 
 @router.get("/recovery_state")

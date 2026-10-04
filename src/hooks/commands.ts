@@ -15,7 +15,7 @@ import { create } from 'zustand';
  * command rather than a hardcoded one.
  */
 
-export type CommandGroup = 'File' | 'Edit' | 'View' | 'Help';
+export type CommandGroup = 'File' | 'Edit' | 'Timeline' | 'Playback' | 'View' | 'Help';
 
 export interface CommandDef {
   id: string;
@@ -23,6 +23,12 @@ export interface CommandDef {
   group: CommandGroup;
   /** Canonical chord, e.g. "Ctrl+S", "Ctrl+Shift+E", "Delete", "S". */
   defaultChord?: string;
+  /** Further default chords that also fire it (S beside Ctrl+B for split).
+   *  They stop applying once the user rebinds the command. */
+  extraChords?: string[];
+  /** Clipboard keys: leave them to the browser while the user has text selected,
+   *  so copying a sentence out of the transcript still works. */
+  yieldsToTextSelection?: boolean;
 }
 
 // The catalogue. Order within a group is the order shown in the menu.
@@ -36,11 +42,58 @@ export const COMMANDS: CommandDef[] = [
   { id: 'app.preferences', label: 'Preferences…', group: 'File', defaultChord: 'Ctrl+,' },
 
   // Edit
+  { id: 'edit.undo', label: 'Undo', group: 'Edit', defaultChord: 'Ctrl+Z' },
+  { id: 'edit.redo', label: 'Redo', group: 'Edit', defaultChord: 'Ctrl+Y', extraChords: ['Ctrl+Shift+Z'] },
+  { id: 'edit.cut', label: 'Cut', group: 'Edit', defaultChord: 'Ctrl+X', yieldsToTextSelection: true },
+  { id: 'edit.copy', label: 'Copy', group: 'Edit', defaultChord: 'Ctrl+C', yieldsToTextSelection: true },
+  { id: 'edit.paste', label: 'Paste', group: 'Edit', defaultChord: 'Ctrl+V' },
+  { id: 'edit.pasteInsert', label: 'Paste Insert (push clips right)', group: 'Edit', defaultChord: 'Ctrl+Shift+V' },
+  { id: 'edit.duplicate', label: 'Duplicate', group: 'Edit', defaultChord: 'Ctrl+D' },
+  { id: 'edit.deleteClip', label: 'Delete', group: 'Edit', defaultChord: 'Delete', extraChords: ['Backspace'] },
+  { id: 'edit.rippleDelete', label: 'Ripple Delete', group: 'Edit', defaultChord: 'Shift+Delete', extraChords: ['Shift+Backspace'] },
+  { id: 'edit.selectAll', label: 'Select All Clips', group: 'Edit', defaultChord: 'Ctrl+A' },
+  { id: 'edit.deselectAll', label: 'Deselect All', group: 'Edit', defaultChord: 'Escape' },
   { id: 'edit.transcribe', label: 'Transcribe', group: 'Edit', defaultChord: 'Ctrl+T' },
   { id: 'edit.analyze', label: 'Analyze', group: 'Edit', defaultChord: 'Ctrl+Shift+A' },
   { id: 'edit.autoEdit', label: 'Auto Edit', group: 'Edit', defaultChord: 'Ctrl+E' },
-  { id: 'edit.deleteClip', label: 'Delete Clip', group: 'Edit', defaultChord: 'Delete' },
-  { id: 'edit.splitAtPlayhead', label: 'Split at Playhead', group: 'Edit', defaultChord: 'S' },
+
+  // Timeline
+  { id: 'edit.splitAtPlayhead', label: 'Split at Playhead', group: 'Timeline', defaultChord: 'Ctrl+B', extraChords: ['S'] },
+  { id: 'timeline.trimStart', label: 'Trim Start to Playhead', group: 'Timeline', defaultChord: 'Alt+[' },
+  { id: 'timeline.trimEnd', label: 'Trim End to Playhead', group: 'Timeline', defaultChord: 'Alt+]' },
+  { id: 'timeline.rippleTrimStart', label: 'Ripple Trim Start to Playhead', group: 'Timeline', defaultChord: 'Q' },
+  { id: 'timeline.rippleTrimEnd', label: 'Ripple Trim End to Playhead', group: 'Timeline', defaultChord: 'W' },
+  { id: 'timeline.closeGap', label: 'Close Gap at Playhead', group: 'Timeline' },
+  { id: 'timeline.selectForward', label: 'Select Clips After Playhead', group: 'Timeline' },
+  { id: 'timeline.link', label: 'Link / Unlink Audio & Video', group: 'Timeline', defaultChord: 'Ctrl+L' },
+  { id: 'timeline.detachAudio', label: 'Detach Audio', group: 'Timeline', defaultChord: 'Ctrl+Alt+D' },
+  { id: 'timeline.compound', label: 'Create Compound Clip', group: 'Timeline', defaultChord: 'Alt+G' },
+  { id: 'timeline.uncompound', label: 'Break Apart Compound Clip', group: 'Timeline', defaultChord: 'Alt+Shift+G' },
+  { id: 'timeline.toggleEnabled', label: 'Enable / Disable Clip', group: 'Timeline', defaultChord: 'Shift+E' },
+  { id: 'timeline.toggleMute', label: 'Mute / Unmute Clip Audio', group: 'Timeline', defaultChord: 'Ctrl+Shift+M' },
+  { id: 'timeline.toggleLock', label: 'Lock / Unlock Clip', group: 'Timeline' },
+  { id: 'timeline.rename', label: 'Rename Clip', group: 'Timeline', defaultChord: 'F2' },
+  { id: 'timeline.rotateCW', label: 'Rotate 90° Clockwise', group: 'Timeline' },
+  { id: 'timeline.rotateCCW', label: 'Rotate 90° Counter-clockwise', group: 'Timeline' },
+  { id: 'timeline.flipH', label: 'Flip Horizontal', group: 'Timeline' },
+  { id: 'timeline.flipV', label: 'Flip Vertical', group: 'Timeline' },
+  { id: 'timeline.resetTransform', label: 'Reset Transform', group: 'Timeline' },
+  { id: 'timeline.nudgeLeft', label: 'Nudge Clip Left 1 Frame', group: 'Timeline', defaultChord: 'Alt+ArrowLeft' },
+  { id: 'timeline.nudgeRight', label: 'Nudge Clip Right 1 Frame', group: 'Timeline', defaultChord: 'Alt+ArrowRight' },
+  { id: 'timeline.toggleSnap', label: 'Snapping', group: 'Timeline', defaultChord: 'N' },
+  { id: 'edit.markIn', label: 'Mark In', group: 'Timeline', defaultChord: 'I' },
+  { id: 'edit.markOut', label: 'Mark Out', group: 'Timeline', defaultChord: 'O' },
+
+  // Playback
+  { id: 'playback.playPause', label: 'Play / Pause', group: 'Playback', defaultChord: 'Space' },
+  { id: 'playback.prevFrame', label: 'Previous Frame', group: 'Playback', defaultChord: 'ArrowLeft' },
+  { id: 'playback.nextFrame', label: 'Next Frame', group: 'Playback', defaultChord: 'ArrowRight' },
+  { id: 'playback.back1s', label: 'Back 1 Second', group: 'Playback', defaultChord: 'Shift+ArrowLeft' },
+  { id: 'playback.fwd1s', label: 'Forward 1 Second', group: 'Playback', defaultChord: 'Shift+ArrowRight' },
+  { id: 'playback.prevEdit', label: 'Previous Edit Point', group: 'Playback', defaultChord: 'ArrowUp' },
+  { id: 'playback.nextEdit', label: 'Next Edit Point', group: 'Playback', defaultChord: 'ArrowDown' },
+  { id: 'playback.start', label: 'Go to Start', group: 'Playback', defaultChord: 'Home' },
+  { id: 'playback.end', label: 'Go to End', group: 'Playback', defaultChord: 'End' },
 
   // View
   { id: 'view.panel.transcript', label: 'Toggle Transcript', group: 'View', defaultChord: 'Ctrl+1' },
@@ -57,13 +110,14 @@ export const COMMANDS: CommandDef[] = [
   { id: 'view.resetLayout', label: 'Reset Layout', group: 'View' },
   { id: 'view.zoomIn', label: 'Timeline Zoom In', group: 'View', defaultChord: 'Ctrl+=' },
   { id: 'view.zoomOut', label: 'Timeline Zoom Out', group: 'View', defaultChord: 'Ctrl+-' },
+  { id: 'view.zoomFit', label: 'Zoom Timeline to Fit', group: 'View', defaultChord: 'Shift+Z' },
 
   // Help
   { id: 'help.diagnostics', label: 'Diagnostics', group: 'Help' },
   { id: 'help.shortcuts', label: 'Keyboard Shortcuts', group: 'Help' },
 ];
 
-export const COMMAND_GROUPS: CommandGroup[] = ['File', 'Edit', 'View', 'Help'];
+export const COMMAND_GROUPS: CommandGroup[] = ['File', 'Edit', 'Timeline', 'Playback', 'View', 'Help'];
 
 const KEYMAP_STORAGE = 'buzzedit.keymap.v1';
 
@@ -131,10 +185,13 @@ export const useCommandStore = create<CommandState>((set, get) => ({
       // A chord is unique: assigning it to one command clears it from any other.
       const keymap = { ...s.keymap };
       for (const other of COMMANDS) {
+        if (other.id === id) continue;
         const current = keymap[other.id] ?? DEFAULT_CHORDS[other.id];
-        if (other.id !== id && current === chord) {
-          // Shadow the clashing default with an empty binding ("unbound").
-          keymap[other.id] = '';
+        const extraClash = !(other.id in keymap) && (other.extraChords ?? []).includes(chord);
+        if (current === chord || extraClash) {
+          // Pin the other command to what it keeps — its main chord, unless that
+          // was the clash ("unbound"). Any override also retires extra chords.
+          keymap[other.id] = current === chord ? '' : current ?? '';
         }
       }
       keymap[id] = chord;

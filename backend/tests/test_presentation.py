@@ -495,6 +495,68 @@ def test_the_bundled_video_workflow_is_recognised_and_configured():
     assert built["z_unet"]["inputs"]["unet_name"] == "z_image_turbo_bf16.safetensors"
 
 
+def test_the_upgraded_video_workflow_doubles_frames_and_falls_back_to_the_old_one():
+    """The 2026-10 HQ graph (Q5_K_M, 1022 LoRAs, hi-res first frame, ESRGAN,
+    RIFE x2) is not the active one, but stays selectable with the original as
+    its fallback. RIFE doubles the frames, so the clip is saved at 2x the fps."""
+    assert workflows.resolve("broll_video").file == "zimage_wan22_i2v.json", "the old graph is active"
+    manifest = dict(workflows.load_manifest()["roles"]["broll_video"],
+                    fallback_file="zimage_wan22_i2v.json")
+    resolved = workflows._bind("broll_video", "zimage_wan22_i2v_hq.json", manifest)
+    resolved.fallback = workflows._bind("broll_video", "zimage_wan22_i2v.json", manifest)
+    assert resolved.file == "zimage_wan22_i2v_hq.json"
+    assert resolved.frame_multiplier == 2
+    built = resolved.build(positive="mist toward a door", width=1024, height=576,
+                           seed=11, length=81, fps=16, prefix="beat_b02",
+                           out_width=1920, out_height=1080)
+    assert built["v_create"]["inputs"]["fps"] == 32
+    assert (built["u_scale"]["inputs"]["width"], built["u_scale"]["inputs"]["height"]) == (1920, 1080)
+    assert built["u_frames"]["inputs"]["image"] == ["w_decode", 0], "upscale before RIFE: 81 frames, not 161"
+    assert built["r_run"]["inputs"]["images"] == ["u_scale", 0]
+    assert built["w_i2v"]["inputs"]["length"] == 81, "length counts generated frames"
+    assert built["z_sample2"]["inputs"]["seed"] == 11
+    assert built["r_run"]["inputs"]["interp_model"] == ["r_model", 0]
+    assert "Q5_K_M" in built["w_unet_high"]["inputs"]["unet_name"]
+
+    old = resolved.fallback
+    assert old is not None and old.file == "zimage_wan22_i2v.json"
+    assert old.frame_multiplier == 1
+    built = old.build(positive="p", width=832, height=480, seed=3, length=81, fps=16)
+    assert built["v_create"]["inputs"]["fps"] == 16
+    assert built["z_sample"]["inputs"]["seed"] == 3
+    assert "Q4_K_S" in built["w_unet_high"]["inputs"]["unet_name"]
+
+
+def test_clips_are_delivered_full_hd_in_the_media_aspect():
+    from presentation.assets import _video_output_size
+    assert _video_output_size((1920, 1080)) == (1920, 1080)
+    assert _video_output_size((3840, 2160)) == (1920, 1080), "4K stays 1080p-class"
+    assert _video_output_size((1080, 1920)) == (1080, 1920), "a vertical short stays vertical"
+    assert _video_output_size(None) == (1920, 1080)
+
+
+def test_a_clip_of_another_size_is_fitted_to_full_hd(tmp_path):
+    import shutil
+    import subprocess
+    from presentation.assets import _fit_clip, _probe
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not installed")
+    clip = tmp_path / "c.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=1024x576:rate=16:duration=1",
+                    "-pix_fmt", "yuv420p", str(clip)], check=True)
+    assert _fit_clip(clip, 1920, 1080)
+    w, h, duration = _probe(clip)
+    assert (w, h) == (1920, 1080)
+    assert abs(duration - 1.0) < 0.15
+
+
+def test_the_hires_still_workflow_keeps_one_seed_and_step_binding():
+    detail = workflows.describe("zimage1_hq.json")
+    assert detail["valid"] and detail["roles_ok"]["broll_image"]
+    assert detail["bindings"]["positive"] == ["70", "inputs", "text"]
+    assert detail["bindings"]["steps"] == ["69", "inputs", "steps"],         "a steps override must reach the base pass, not the 4-step refine"
+
+
 def test_an_unresolvable_binding_is_skipped_rather_than_raising():
     """A workflow with no steps input keeps its own step count. That is a working
     generation; refusing to run would not be."""
@@ -662,22 +724,217 @@ def _wire_assets(monkeypatch, tmp_path, queue):
 
 
 @pytest.mark.asyncio
-async def test_repeated_failures_abort_the_night_instead_of_burning_it(tmp_path, monkeypatch):
+async def test_failures_on_a_live_comfyui_get_twice_the_limit_before_aborting(tmp_path, monkeypatch):
+    # ComfyUI still answers, so each failure has been cleared off its queue and
+    # the pass keeps going -- aborting at three cost a real run 52 of 67 pictures
+    # to an LLM squatting on the GPU. Twice the limit means the workflow is bad.
     queue = _FakeComfyQueue(script=["boom"])
     assets_stage = _wire_assets(monkeypatch, tmp_path, queue)
-    # Distinct ids (as validate_plan assigns) so each beat is its own generation
-    # rather than a cache hit on the first.
+    beats = [_beat(id=f"b{i:02d}", topic=f"topic {i}",
+                   start_s=5.0 + 8 * i, end_s=11.0 + 8 * i) for i in range(9)]
+
+    generated, failures = await assets_stage.generate_assets(
+        beats, tmp_path, PresentationSettings())
+
+    limit = 2 * assets_stage.MAX_CONSECUTIVE_FAILURES
+    assert generated == []
+    assert queue.submissions == limit
+    assert len(failures) == 9, "every beat is accounted for, attempted or not"
+    assert sum("not attempted" in f["reason"] for f in failures) == 9 - limit
+
+
+@pytest.mark.asyncio
+async def test_an_offline_comfyui_ends_the_night_at_the_limit(tmp_path, monkeypatch):
+    queue = _FakeComfyQueue(script=["boom"])
+    # Up for the pre-flight check, gone once the failures start.
+    answers = iter([True])
+    queue.is_connected = lambda timeout=10.0: next(answers, False)
+    assets_stage = _wire_assets(monkeypatch, tmp_path, queue)
     beats = [_beat(id=f"b{i:02d}", topic=f"topic {i}",
                    start_s=5.0 + 8 * i, end_s=11.0 + 8 * i) for i in range(6)]
 
     generated, failures = await assets_stage.generate_assets(
         beats, tmp_path, PresentationSettings())
 
-    assert generated == []
-    assert queue.submissions == assets_stage.MAX_CONSECUTIVE_FAILURES, \
-        "after three straight failures no further beat may be attempted"
-    assert len(failures) == 6, "every beat is accounted for, attempted or not"
-    assert sum("not attempted" in f["reason"] for f in failures) == 3
+    assert queue.submissions == assets_stage.MAX_CONSECUTIVE_FAILURES
+    assert sum("ComfyUI offline" in f["reason"] for f in failures) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_failed_video_clip_keeps_its_still_and_stills_go_first(tmp_path, monkeypatch):
+    from presentation import assets as assets_stage_mod
+
+    class _VideoFails(_FakeComfyQueue):
+        async def submit_and_wait(self, graph, timeout=0):
+            self.submissions += 1
+            self.order.append("video" if timeout == assets_stage_mod.VIDEO_TIMEOUT else "image")
+            if timeout == assets_stage_mod.VIDEO_TIMEOUT:
+                raise TimeoutError("Wan clip timed out")
+            return [str(self._output)]
+
+    queue = _VideoFails(script=["ok"])
+    queue.order = []
+    assets_stage = _wire_assets(monkeypatch, tmp_path, queue)
+    video_wf = workflows.ResolvedWorkflow("broll_video", "fakev.json", {}, {}, "video")
+    monkeypatch.setattr(assets_stage.workflows, "resolve",
+                        lambda role: {"broll_image": _fake_image_workflow(),
+                                      "broll_video": video_wf}.get(role))
+    beats = [_beat(id="v1", kind="broll_video", topic="clip", start_s=5.0, end_s=11.0),
+             _beat(id="i1", topic="still", start_s=20.0, end_s=26.0)]
+
+    generated, failures = await assets_stage.generate_assets(
+        beats, tmp_path, PresentationSettings())
+
+    assert failures == []
+    assert {a.beat_id for a in generated} == {"v1", "i1"}
+    assert all(a.kind == "image" for a in generated)
+    # Every beat's still first (the video beat's included), then the clip --
+    # tried twice (a timeout frees the card and retries once) before its still stays.
+    assert queue.order == ["image", "image", "video", "video"]
+
+
+def _video_queue(assets_stage_mod, tmp_path, fail_video_with=None):
+    """A fake ComfyUI where video submissions return an .mp4 (or raise)."""
+    class _Queue(_FakeComfyQueue):
+        async def submit_and_wait(self, graph, timeout=0):
+            self.submissions += 1
+            is_video = timeout == assets_stage_mod.VIDEO_TIMEOUT
+            self.order.append("video" if is_video else "image")
+            self.graphs.append(graph)
+            if is_video:
+                if fail_video_with:
+                    raise fail_video_with
+                return [str(self._clip)]
+            return [str(self._output)]
+
+        def upload_image(self, path):
+            self.uploaded.append(path)
+            return "uploaded_still.png"
+
+    queue = _Queue(script=["ok"])
+    queue.order, queue.graphs, queue.uploaded = [], [], []
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"not really an mp4")
+    queue._clip = clip
+    return queue
+
+
+def _i2v_workflow():
+    graph = {"z_decode": {"class_type": "VAEDecode", "inputs": {}},
+             "w_i2v": {"class_type": "WanImageToVideo", "inputs": {"start_image": ["z_decode", 0]}}}
+    return workflows.ResolvedWorkflow("broll_video", "fakev.json", graph, {}, "video")
+
+
+@pytest.mark.asyncio
+async def test_a_video_clip_replaces_its_still_and_starts_from_that_still(tmp_path, monkeypatch):
+    from presentation import assets as assets_stage_mod
+    queue = _video_queue(assets_stage_mod, tmp_path)
+    assets_stage = _wire_assets(monkeypatch, tmp_path, queue)
+    monkeypatch.setattr(assets_stage.workflows, "resolve",
+                        lambda role: {"broll_image": _fake_image_workflow(),
+                                      "broll_video": _i2v_workflow()}.get(role))
+    monkeypatch.setattr(assets_stage, "_probe", lambda path: (832, 480, 3.0))
+    beats = [_beat(id="v1", kind="broll_video", topic="clip", start_s=5.0, end_s=11.0)]
+    stats = {}
+
+    generated, failures = await assets_stage.generate_assets(
+        beats, tmp_path, PresentationSettings(), stats=stats)
+
+    assert failures == []
+    assert [(a.beat_id, a.kind) for a in generated] == [("v1", "video")]
+    assert queue.order == ["image", "video"]
+    assert len(queue.uploaded) == 1, "the phase-1 still is the clip's first frame"
+    video_graph = queue.graphs[-1]
+    assert video_graph["w_i2v"]["inputs"]["start_image"] == ["bz_start_image", 0]
+    assert video_graph["bz_start_image"]["inputs"]["image"] == "uploaded_still.png"
+    assert stats["video_phase"]["made"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_starved_card_skips_the_video_phase_and_keeps_stills(tmp_path, monkeypatch):
+    from presentation import assets as assets_stage_mod
+    from runtime import gpu_handover
+    queue = _video_queue(assets_stage_mod, tmp_path)
+    assets_stage = _wire_assets(monkeypatch, tmp_path, queue)
+    monkeypatch.setattr(assets_stage.workflows, "resolve",
+                        lambda role: {"broll_image": _fake_image_workflow(),
+                                      "broll_video": _i2v_workflow()}.get(role))
+
+    async def starved(name, need_vram_mb, need_ram_mb, settle_s=3.0):
+        ok = name != "video"
+        return {"phase": name, "ready": ok, "reason": "" if ok else "5.5 GB VRAM free, needs 11.7 GB"}
+
+    monkeypatch.setattr(gpu_handover, "prepare_for_phase", starved)
+    beats = [_beat(id="v1", kind="broll_video", topic="clip", start_s=5.0, end_s=11.0)]
+    stats = {}
+
+    generated, failures = await assets_stage.generate_assets(
+        beats, tmp_path, PresentationSettings(), stats=stats)
+
+    assert [(a.beat_id, a.kind) for a in generated] == [("v1", "image")]
+    assert "video" not in queue.order, "no clip is attempted on a starved card"
+    assert "VRAM" in stats["video_phase"]["skipped_reason"]
+
+
+@pytest.mark.asyncio
+async def test_one_timed_out_clip_ends_the_video_phase(tmp_path, monkeypatch):
+    from presentation import assets as assets_stage_mod
+    queue = _video_queue(assets_stage_mod, tmp_path,
+                         fail_video_with=TimeoutError("ComfyUI job x timed out after 900 seconds"))
+    assets_stage = _wire_assets(monkeypatch, tmp_path, queue)
+    monkeypatch.setattr(assets_stage.workflows, "resolve",
+                        lambda role: {"broll_image": _fake_image_workflow(),
+                                      "broll_video": _i2v_workflow()}.get(role))
+    beats = [_beat(id=f"v{i}", kind="broll_video", topic=f"clip {i}",
+                   start_s=5.0 + 10 * i, end_s=11.0 + 10 * i) for i in range(4)]
+    stats = {}
+
+    generated, _ = await assets_stage.generate_assets(
+        beats, tmp_path, PresentationSettings(), stats=stats)
+
+    # One retry after freeing the card, then the phase ends: a second timeout
+    # means a starved card, so stop paying 15 min per clip.
+    assert queue.order.count("video") == 2
+    assert {a.beat_id for a in generated} == {"v0", "v1", "v2", "v3"}
+    assert all(a.kind == "image" for a in generated)
+    assert "timed out" in stats["video_phase"]["skipped_reason"]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_upgraded_video_workflow_falls_back_to_the_old_one(tmp_path, monkeypatch):
+    """An upgrade whose node is not installed yet must not cost every clip:
+    the failed beat is retried on the fallback, which runs the rest of the pass."""
+    from presentation import assets as assets_stage_mod
+    queue = _video_queue(assets_stage_mod, tmp_path)
+    plain_submit = queue.submit_and_wait
+
+    async def submit(graph, timeout=0):
+        if "u_vsr" in graph:
+            queue.order.append("video-hq")
+            raise RuntimeError("Cannot execute because node FlashVSRNode does not exist")
+        return await plain_submit(graph, timeout=timeout)
+
+    queue.submit_and_wait = submit
+    assets_stage = _wire_assets(monkeypatch, tmp_path, queue)
+    old = _i2v_workflow()
+    hq_graph = dict(old.graph, u_vsr={"class_type": "FlashVSRNode", "inputs": {}})
+    hq = workflows.ResolvedWorkflow("broll_video", "fakev_hq.json", hq_graph, {}, "video",
+                                    fallback=old)
+    monkeypatch.setattr(assets_stage.workflows, "resolve",
+                        lambda role: {"broll_image": _fake_image_workflow(),
+                                      "broll_video": hq}.get(role))
+    monkeypatch.setattr(assets_stage, "_probe", lambda path: (832, 480, 3.0))
+    beats = [_beat(id=f"v{i}", kind="broll_video", topic=f"clip {i}",
+                   start_s=5.0 + 10 * i, end_s=11.0 + 10 * i) for i in range(2)]
+    stats = {}
+
+    generated, failures = await assets_stage.generate_assets(
+        beats, tmp_path, PresentationSettings(), stats=stats)
+
+    assert sorted((a.beat_id, a.kind) for a in generated) == [("v0", "video"), ("v1", "video")]
+    assert queue.order.count("video-hq") == 1, "the upgrade is tried once, not per clip"
+    assert stats["video_phase"]["fallback"]["to"] == "fakev.json"
+    assert stats["video_phase"]["made"] == 2
 
 
 @pytest.mark.asyncio
@@ -758,7 +1015,7 @@ async def test_the_pass_still_delivers_with_no_llm_and_no_comfyui(tmp_path, monk
 
     monkeypatch.setattr(director, "PROJECTS_DIR", tmp_path)
     # No model, no picture generator, no render — the three external things.
-    monkeypatch.setattr(director, "_llm_asker", lambda: _none())
+    monkeypatch.setattr(director, "_llm_asker", lambda *a, **k: _none())
     monkeypatch.setattr(director, "_comfyui_online", lambda: False)
     monkeypatch.setattr(director.assets_stage, "generate_assets", _empty_assets)
 
@@ -938,3 +1195,164 @@ def test_the_title_overlay_draws_the_thumbnail_title():
     assert intros and "SPOTLIGHT EFFECT" in intros[0].text.content
     # The default preset is an overlay: nothing shifted, no card in front.
     assert timeline.program_offset_frames == 0
+
+
+def test_the_video_budget_grows_with_the_clips_planned(monkeypatch):
+    from presentation import assets as assets_stage_mod
+    per_clip = assets_stage_mod.VIDEO_PHASE_SECONDS_PER_CLIP
+    # 113 clips (70% of a 13.5-min video) must not be capped at the 45-min floor.
+    assert max(assets_stage_mod.VIDEO_PHASE_BUDGET_S, 113 * per_clip) > 10 * 3600
+    assert max(assets_stage_mod.VIDEO_PHASE_BUDGET_S, 3 * per_clip) == assets_stage_mod.VIDEO_PHASE_BUDGET_S
+
+
+# --- one face for the story's main character ---------------------------------
+
+def _lead(gender="male"):
+    from presentation.models import Character
+    return Character(name="Inspector Raghav", gender=gender,
+                     description="a 45-year-old Indian man with short salt-and-pepper hair, "
+                                 "a thick black moustache and a khaki police uniform")
+
+
+def test_the_face_swap_goes_between_the_decode_and_the_save():
+    from presentation import character as ch
+    graph = {"dec": {"class_type": "VAEDecode", "inputs": {}},
+             "save": {"class_type": "SaveImage", "inputs": {"images": ["dec", 0], "filename_prefix": "x"}}}
+    out = ch.with_face_swap(graph, "ref.png", gender="male")
+    assert out["save"]["inputs"]["images"] == ["bz_face_swap", 0]
+    swap = out["bz_face_swap"]["inputs"]
+    assert swap["input_image"] == ["dec", 0] and swap["source_image"] == ["bz_face_ref", 0]
+    assert swap["detect_gender_input"] == swap["detect_gender_source"] == "male"
+    assert out["bz_face_ref"]["inputs"]["image"] == "ref.png"
+    assert graph["save"]["inputs"]["images"] == ["dec", 0], "the workflow itself is untouched"
+    assert ch.with_face_swap(graph, "ref.png")["bz_face_swap"]["inputs"]["detect_gender_input"] == "no"
+    assert ch.with_face_swap({"v": {"class_type": "SaveVideo", "inputs": {}}}, "ref.png") == \
+        {"v": {"class_type": "SaveVideo", "inputs": {}}}
+
+
+def test_only_tagged_beats_carry_the_lead_and_no_lead_clears_every_tag():
+    from presentation import character as ch
+    lead = _lead()
+    beats = [_beat(id="a", shows_character=True, image_prompt="standing on a misty platform"),
+             _beat(id="b", image_prompt="an empty corridor"),
+             _beat(id="c", kind="popup", shows_character=True, popup_text="x", image_prompt=None)]
+    out = ch.apply_to_beats(beats, lead)
+    assert out[0].image_prompt.startswith(lead.description)
+    assert out[1].image_prompt == "an empty corridor" and not out[1].shows_character
+    assert not out[2].shows_character, "only generated pictures can carry a face"
+    assert ch.apply_to_beats(out, lead)[0].image_prompt == out[0].image_prompt, "never added twice"
+    assert not any(b.shows_character for b in ch.apply_to_beats(beats, None))
+
+
+def test_a_caller_named_lead_is_used_and_an_empty_one_means_none():
+    from presentation import character as ch
+    lead = ch.from_settings({"name": "Meera", "gender": "Female",
+                             "description": "a young Indian woman in a green salwar kameez with a long braid"})
+    assert lead.name == "Meera" and lead.gender == "female"
+    assert ch.from_settings({}) is None
+    assert ch.from_settings({"name": "X", "description": "too short"}) is None
+    assert ch.from_settings({"name": "X", "gender": "robot",
+                             "description": "an old man with a white beard and a walking stick"}).gender == ""
+
+
+def test_face_main_on_a_direction_tags_the_shot_and_stays_out_of_the_prompt():
+    from presentation import script as script_stage
+    ctx = script_stage.ScriptContext(
+        paragraphs=[script_stage.ScriptParagraph(index=0, tl_start_s=0, tl_end_s=30, text="x")],
+        directives=[
+            script_stage.ScriptDirective(kind="broll", arg="the inspector at his desk | face=main", tl_at_s=2.0),
+            script_stage.ScriptDirective(kind="video", arg="the inspector turns | face=main", tl_at_s=8.0),
+            script_stage.ScriptDirective(kind="broll", arg="an empty railway platform", tl_at_s=14.0),
+            script_stage.ScriptDirective(kind="video", arg="a woman runs | seconds=6", tl_at_s=20.0)])
+    beats = script_stage.directive_beats(ctx, build_program(_timeline()), PresentationSettings())["beats"]
+    by_prompt = {b.image_prompt: b for b in beats}
+    assert by_prompt["the inspector at his desk"].shows_character
+    assert by_prompt["the inspector turns"].shows_character
+    assert by_prompt["the inspector turns"].video_prompt == "the inspector turns"
+    assert not by_prompt["an empty railway platform"].shows_character
+    assert not by_prompt["a woman runs"].shows_character
+
+
+@pytest.mark.asyncio
+async def test_the_beat_writer_tags_the_lead_only_when_the_story_has_one():
+    from presentation import shotplan
+    from presentation.models import Topic
+    topics = [Topic(start_s=0, end_s=10, topic="On the platform", summary="s", visual="v", priority=0.8),
+              Topic(start_s=10, end_s=20, topic="The empty yard", summary="s", visual="v", priority=0.8)]
+    seen = {}
+
+    async def ask(system, user, schema=None):
+        seen["fields"] = list(schema["schema"]["properties"]["beats"]["items"]["properties"])
+        return json.dumps({"beats": [
+            {"topic": "On the platform", "kind": "broll_image", "image_prompt": "a man on a platform",
+             "video_prompt": None, "popup_text": None, "negative_prompt": "text",
+             "style_hint": "photoreal", "shows_main_character": True},
+            {"topic": "The empty yard", "kind": "broll_image", "image_prompt": "an empty yard",
+             "video_prompt": None, "popup_text": None, "negative_prompt": "text",
+             "style_hint": "photoreal", "shows_main_character": False}]})
+
+    beats = await shotplan.write_beats(topics, ask, character=_lead())
+    assert "shows_main_character" in seen["fields"]
+    assert [b.shows_character for b in beats] == [True, False]
+    beats = await shotplan.write_beats(topics, ask)
+    assert "shows_main_character" not in seen["fields"], "no lead, the plain schema"
+    assert not any(b.shows_character for b in beats)
+
+
+@pytest.mark.asyncio
+async def test_a_main_character_setting_skips_the_model_call():
+    from presentation import character as ch
+    calls = []
+
+    async def ask(system, user, schema=None):
+        calls.append(system)
+        return None
+
+    plan = await plan_shots(_program(), PresentationSettings(main_character={}), ask, genre="general")
+    assert plan.character is None
+    named = {"name": "Raghav", "gender": "male",
+             "description": "a 45-year-old Indian man with a thick moustache in a khaki uniform"}
+    plan = await plan_shots(_program(), PresentationSettings(main_character=named), ask, genre="general")
+    assert plan.character is not None and plan.character.name == "Raghav"
+    assert ch.CHARACTER_SYSTEM not in calls
+
+
+@pytest.mark.asyncio
+async def test_only_stills_of_the_lead_get_the_face_and_a_missing_reactor_swaps_nothing(tmp_path, monkeypatch):
+    queue = _FakeComfyQueue(script=["ok"])
+    graphs = []
+    plain_submit = queue.submit_and_wait
+
+    async def submit(graph, timeout=0):
+        graphs.append(graph)
+        return await plain_submit(graph, timeout=timeout)
+
+    queue.submit_and_wait = submit
+    queue.has_node = lambda class_type, timeout=15: True
+    queue.upload_image = lambda path, timeout=60: "bz_ref_uploaded.png"
+    assets_stage = _wire_assets(monkeypatch, tmp_path, queue)
+    still_graph = {"dec": {"class_type": "VAEDecode", "inputs": {}},
+                   "save": {"class_type": "SaveImage", "inputs": {"images": ["dec", 0], "filename_prefix": "x"}}}
+    monkeypatch.setattr(assets_stage.workflows, "resolve",
+                        lambda role: workflows.ResolvedWorkflow("broll_image", "fake.json", still_graph, {}, "image")
+                        if role == "broll_image" else None)
+    beats = [_beat(id="lead", topic="lead", shows_character=True, start_s=5, end_s=11),
+             _beat(id="other", topic="other", image_prompt="a crowd", start_s=20, end_s=26)]
+    stats = {}
+    generated, failures = await assets_stage.generate_assets(
+        beats, tmp_path, PresentationSettings(), stats=stats, character=_lead())
+    assert failures == []
+    reference, lead_still, other_still = graphs
+    assert "bz_face_swap" not in reference, "the reference portrait itself is never swapped"
+    assert lead_still["bz_face_swap"]["inputs"]["detect_gender_input"] == "male"
+    assert lead_still["bz_face_ref"]["inputs"]["image"] == "bz_ref_uploaded.png"
+    assert "bz_face_swap" not in other_still
+    assert stats["character"]["beats"] == 1 and stats["character"]["reference"]
+
+    graphs.clear()
+    queue.has_node = lambda class_type, timeout=15: False
+    stats = {}
+    await assets_stage.generate_assets(beats, tmp_path / "p2", PresentationSettings(),
+                                       stats=stats, character=_lead())
+    assert not any("bz_face_swap" in g for g in graphs)
+    assert "not installed" in stats["character"]["skipped_reason"]

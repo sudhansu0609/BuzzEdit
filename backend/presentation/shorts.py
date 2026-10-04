@@ -13,6 +13,7 @@ overlaps the slice trimmed to it. They render as separate files next to the
 main output.
 """
 
+import asyncio
 import copy
 import logging
 from pathlib import Path
@@ -151,21 +152,59 @@ def slice_timeline(timeline: Timeline, start_s: float, end_s: float) -> Timeline
     return out
 
 
+# A word that closes a sentence: trailing full stop / question / exclamation /
+# danda, or a real breath (a pause this long) before the next word.
+_SENTENCE_END_CHARS = (".", "?", "!", "।", "…")
+_SENTENCE_PAUSE_S = 0.7
+# How far past a topic's end a short may run to finish the sentence it cuts into.
+_FINISH_SENTENCE_S = 4.0
+
+
+def _sentence_bounds(words) -> Tuple[List[float], List[float]]:
+    """(sentence start times, sentence end times) over the programme words."""
+    starts: List[float] = []
+    ends: List[float] = []
+    at_sentence_start = True
+    for i, w in enumerate(words):
+        if at_sentence_start:
+            starts.append(w.tl_start_s)
+        nxt = words[i + 1] if i + 1 < len(words) else None
+        at_sentence_start = (w.text.strip().rstrip("\"'”’").endswith(_SENTENCE_END_CHARS)
+                             or nxt is None or nxt.tl_start_s - w.tl_end_s >= _SENTENCE_PAUSE_S)
+        if at_sentence_start:
+            ends.append(w.tl_end_s)
+    return starts, ends
+
+
 def pick_shorts(topics: Sequence[Topic], program: Program, count: int = 3) -> List[Tuple[float, float, Topic]]:
-    """The best `count` topics as (start, end, topic), longest-first trimmed to the limit."""
+    """The best `count` topics as (start, end, topic).
+
+    A short has to land its point, so every clip ends on a sentence boundary
+    (running up to `_FINISH_SENTENCE_S` past the topic to finish the sentence
+    the topic's edge cuts into). A topic longer than `SHORT_MAX_S` is trimmed
+    from the FRONT, to a sentence start, so the clip keeps the topic's
+    conclusion rather than stopping mid-argument at the 58 s mark."""
+    words = sorted(program.words, key=lambda w: w.tl_start_s)
+    sentence_starts, sentence_ends = _sentence_bounds(words)
     candidates = []
     for topic in topics:
         if (topic.act or "") == "cta":
             continue
         start = max(0.0, topic.start_s)
         end = min(program.duration_s, topic.end_s)
+        # Begin on the sentence the topic opens in, end on the one it closes in.
+        before = [t for t in sentence_starts if start - 2.0 <= t <= start + 0.2]
+        if before:
+            start = max(0.0, before[-1] - 0.1)
+        after = [t for t in sentence_ends if end - 0.3 <= t <= end + _FINISH_SENTENCE_S]
+        if after:
+            end = min(program.duration_s, after[0] + 0.3)
+        if end - start > SHORT_MAX_S:
+            # Keep the payoff: the last sentence-aligned SHORT_MAX_S of the topic.
+            tail = [t for t in sentence_starts if end - SHORT_MAX_S <= t < end - SHORT_MIN_S]
+            start = (tail[0] - 0.1) if tail else end - SHORT_MAX_S
         if end - start < SHORT_MIN_S:
             continue
-        end = min(end, start + SHORT_MAX_S)
-        # Land the end on a word boundary so the clip does not stop mid-word.
-        words = program.words_between(start, end)
-        if words:
-            end = min(end, words[-1].tl_end_s + 0.3)
         candidates.append((topic.priority, start, end, topic))
     candidates.sort(key=lambda c: (-c[0], c[1]))
     picked = [(s, e, t) for _, s, e, t in candidates[:max(0, count)]]
@@ -191,22 +230,29 @@ async def render_shorts(timeline: Timeline, program: Program, topics: Sequence[T
                         "seconds": round(frame_to_time(vertical.duration_frames,
                                                        vertical.fps_num, vertical.fps_den), 2)})
 
-    for index, (start, end, topic) in enumerate(pick_shorts(topics, program, settings.shorts_clips)):
+    # The Shorts are independent renders: run them together rather than one
+    # after another (~4.6 min back to back on a real run). Each ffmpeg keeps
+    # to its own few threads and the GPU encoder takes several sessions.
+    pad_s = frame_to_time(timeline.program_offset_frames, timeline.fps_num, timeline.fps_den)
+
+    async def one(index: int, start: float, end: float, topic) -> Optional[Dict[str, object]]:
         # Topic times are on the programme's clock; the timeline may carry a
         # cold open / title pad in front of it.
-        pad_s = frame_to_time(timeline.program_offset_frames, timeline.fps_num, timeline.fps_den)
         clip = slice_timeline(vertical, start + pad_s, end + pad_s)
         if clip.duration_frames <= 0:
-            continue
+            return None
         path = f"{output_stem}_short{index + 1}.mp4"
         try:
             await render_timeline_async(clip, path, progress_callback=progress,
                                         output_resolution=f"{SHORT_W}x{SHORT_H}")
         except Exception as e:
             logger.warning("Short %d (%s) failed: %s", index + 1, topic.topic, e)
-            results.append({"kind": "short", "topic": topic.topic, "error": str(e)[:200]})
-            continue
-        results.append({"kind": "short", "path": path, "topic": topic.topic,
-                        "from_s": round(start + offset_s, 2), "seconds": round(end - start, 2)})
+            return {"kind": "short", "topic": topic.topic, "error": str(e)[:200]}
         logger.info("Short %d: %r %.1fs → %s", index + 1, topic.topic, end - start, path)
+        return {"kind": "short", "path": path, "topic": topic.topic,
+                "from_s": round(start + offset_s, 2), "seconds": round(end - start, 2)}
+
+    picked = pick_shorts(topics, program, settings.shorts_clips)
+    done = await asyncio.gather(*(one(i, s, e, t) for i, (s, e, t) in enumerate(picked)))
+    results.extend(r for r in done if r is not None)
     return results

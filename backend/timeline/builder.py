@@ -17,6 +17,7 @@ def build_timeline_from_transcript(
     pause_padding_seconds: Optional[float] = None,
     energy_envelope: Optional[Dict[str, Any]] = None,
     default_transition: Optional[Transition] = None,
+    keep_full_source: bool = False,
 ) -> Timeline:
     """
     Build an initial Timeline object from source video metadata and timestamped words.
@@ -72,6 +73,7 @@ def build_timeline_from_transcript(
         sources={source_id: source_file},
         words=words,
         default_transition=default_transition,
+        keep_full_source=keep_full_source,
     )
 
     # Speech regions let the rebuild cut silence out of the middle of a word,

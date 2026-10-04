@@ -232,12 +232,13 @@ def compose_frame(project_id: str, timeline: Timeline, seconds: float,
         script = tmp / "graph.txt"
         script.write_text(graph, encoding="utf-8")
 
-        proc = subprocess.run(
+        from render.cmdline import fit_command
+        with fit_command(
             [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", *inputs,
              "-filter_complex_script", str(script), "-map", "[fx_out]",
-             "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "4", "pipe:1"],
-            capture_output=True, creationflags=NO_WINDOW,
-        )
+             "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "4", "pipe:1"]
+        ) as (cmd, cwd):
+            proc = subprocess.run(cmd, capture_output=True, cwd=cwd, creationflags=NO_WINDOW)
 
     if proc.returncode != 0 or not proc.stdout:
         logger.info("preview frame %d failed: %s", frame,
@@ -312,7 +313,8 @@ def _run_proxy(project_id: str, timeline: Timeline, height: int) -> None:
         script_path.write_text(graph, encoding="utf-8")
 
         partial = dest.with_suffix(".partial.mp4")
-        proc = subprocess.run(
+        from render.cmdline import fit_command
+        with fit_command(
             [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", *inputs,
              "-filter_complex_script", str(script_path),
              "-map", "[fx_v]", "-map", a_label,
@@ -320,9 +322,9 @@ def _run_proxy(project_id: str, timeline: Timeline, height: int) -> None:
              # GOP is what keeps scrubbing it responsive.
              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-g", "15",
              "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-             "-c:a", "aac", "-b:a", "96k", str(partial)],
-            capture_output=True, creationflags=NO_WINDOW,
-        )
+             "-c:a", "aac", "-b:a", "96k", str(partial)]
+        ) as (cmd, cwd):
+            proc = subprocess.run(cmd, capture_output=True, cwd=cwd, creationflags=NO_WINDOW)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode(errors="replace")[-600:])
         # Swapped in only once complete, so the player never picks up a

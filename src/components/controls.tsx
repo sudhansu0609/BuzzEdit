@@ -70,14 +70,19 @@ export function ColorField({ label, value, onChange, allowAlpha = true }: {
   );
 }
 
-export function Section({ title, children, defaultOpen = true, action }: {
+export function Section({ title, children, defaultOpen = true, action, onToggle }: {
   title: string; children: React.ReactNode; defaultOpen?: boolean; action?: React.ReactNode;
+  onToggle?: (open: boolean) => void;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
     <div className="insp-section">
       <div className="insp-section-head">
-        <button className="insp-section-toggle" onClick={() => setOpen(!open)}>
+        <button className="insp-section-toggle" onClick={() => {
+          const next = !open;
+          setOpen(next);
+          onToggle?.(next);
+        }}>
           <span className={`insp-caret ${open ? 'open' : ''}`}>▸</span>{title}
         </button>
         {action}

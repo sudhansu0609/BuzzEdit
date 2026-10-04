@@ -48,19 +48,41 @@ ZOOM_TRACK = "V2"
 ZOOMS_PER_MINUTE = 60.0
 # Minimum segment length to receive a zoom move.
 MIN_ZOOM_SEGMENT_SECONDS = 0.5
+# ...and the most. A segment move exists to disguise a jump cut: a clip of a
+# few seconds drifts tighter so the next one can step back wide. On one long
+# take (a recording that arrives already cut) it became a single 1.00 -> 1.31
+# drift across all 473 s of a real render -- invisible as motion (0.07%/s),
+# 31% softer by the end, and a 3x-supersampled zoompan on every one of ~11,800
+# frames, the costliest chain in the whole render. Longer shots get their
+# movement from the punch-ins instead.
+MAX_ZOOM_SEGMENT_SECONDS = 20.0
 
 # --- the punches -----------------------------------------------------------
 
 # How loud, relative to the speaker's own average, counts as emphasis.
 PUNCH_Z_THRESHOLD = 1.2
-PUNCH_MIN_SECONDS = 0.8
+# Long enough for an ease in, a hold and an ease out that all read as motion
+# rather than a twitch (see `_punch_envelope`).
+PUNCH_MIN_SECONDS = 1.2
 PUNCH_MAX_SECONDS = 2.5
 # Past this a 1080p source visibly softens when blown up.
 PUNCH_DEPTH_MAX = 0.25
 MIN_PUNCH_GAP_SECONDS = 6.0
+# Historical fallback when settings carry neither an explicit rate nor a
+# density (see PresentationSettings.effective_punch_rate_per_minute).
 MAX_PUNCHES_PER_MINUTE = 1.5
 # A punch that begins on a cut reads as a mistake rather than a choice.
 PUNCH_EDGE_MARGIN = 0.5
+# When there are too few peaks at PUNCH_Z_THRESHOLD to fill the allowance, the
+# threshold eases down rather than leaving punches unfilled — but never below
+# this, or "emphasis" stops meaning anything.
+PUNCH_Z_FLOOR = 0.6
+PUNCH_Z_STEP = 0.1
+# A quick, shallow-duration "whip" push on top of an already-chosen punch —
+# busy/max density only, every 4th push-in, alternating with pull-backs.
+WHIP_MAX_SECONDS = 0.5
+WHIP_DEPTH_BONUS = 0.05
+WHIP_EVERY = 4
 
 # --- the face --------------------------------------------------------------
 
@@ -208,10 +230,11 @@ def plan_zooms(program: Program, settings: PresentationSettings,
     # At high B-roll coverage, even partially visible clips receive transforms.
     visible_floor = max(MIN_ZOOM_SEGMENT_SECONDS, 0.4)
     eligible = [s for s in program.segments
-                if s.duration_s >= MIN_ZOOM_SEGMENT_SECONDS
+                if MIN_ZOOM_SEGMENT_SECONDS <= s.duration_s <= MAX_ZOOM_SEGMENT_SECONDS
                 and _uncovered_seconds(s.tl_start_s, s.tl_end_s, busy) >= visible_floor]
     if not eligible:
-        eligible = [s for s in program.segments if s.duration_s >= MIN_ZOOM_SEGMENT_SECONDS]
+        eligible = [s for s in program.segments
+                    if MIN_ZOOM_SEGMENT_SECONDS <= s.duration_s <= MAX_ZOOM_SEGMENT_SECONDS]
 
     segment_zooms: List[SegmentZoom] = []
     if eligible:
@@ -240,7 +263,7 @@ def plan_zooms(program: Program, settings: PresentationSettings,
                     depth=round(min(0.6, max(0.06, depth * jitter)), 3),
                 ))
 
-    window_zooms = _plan_punches(program, busy, seed, stats)
+    window_zooms = _plan_punches(program, busy, settings, seed, stats)
     logger.info("Zooms planned: %d segment moves, %d punch-ins",
                 len(segment_zooms), len(window_zooms))
     return segment_zooms, window_zooms
@@ -276,21 +299,32 @@ def _trim_outside(start: float, end: float,
 
 
 def _plan_punches(program: Program, busy: List[Tuple[float, float]],
+                  settings: Optional[PresentationSettings],
                   seed: int, stats: Optional[Dict[str, int]] = None) -> List[WindowZoom]:
     """Emphasis peaks that deserve a punch-in, after every safety filter."""
     if not program.has_energy or not program.words:
         return []
 
+    settings = settings or PresentationSettings()
     counters = stats if stats is not None else {}
     counters.setdefault("suppressed", 0)
 
-    peaks = [w for w in program.words if w.emphasis_z >= PUNCH_Z_THRESHOLD]
+    minutes = max(1.0, program.duration_s / 60.0)
+    allowance = max(1, int(round(minutes * settings.effective_punch_rate_per_minute)))
+
+    # Too few peaks at the strict threshold to fill the allowance: ease the
+    # threshold down rather than leaving a busy/max programme under-punched.
+    # Strength (below) still measures against PUNCH_Z_THRESHOLD, so an eased-in
+    # peak still gets the short, shallow end of the scale it earned.
+    threshold = PUNCH_Z_THRESHOLD
+    peaks = [w for w in program.words if w.emphasis_z >= threshold]
+    while len(peaks) < allowance and threshold > PUNCH_Z_FLOOR:
+        threshold = max(PUNCH_Z_FLOOR, round(threshold - PUNCH_Z_STEP, 2))
+        peaks = [w for w in program.words if w.emphasis_z >= threshold]
     if not peaks:
         return []
     peaks.sort(key=lambda w: -w.emphasis_z)
 
-    minutes = max(1.0, program.duration_s / 60.0)
-    allowance = max(1, int(round(minutes * MAX_PUNCHES_PER_MINUTE)))
     chosen: List[WindowZoom] = []
 
     for word in peaks:
@@ -301,7 +335,7 @@ def _plan_punches(program: Program, busy: List[Tuple[float, float]],
             continue
 
         # Scale the length and the depth with how emphatic the moment is.
-        strength = min(1.0, (word.emphasis_z - PUNCH_Z_THRESHOLD) / 1.5)
+        strength = max(0.0, min(1.0, (word.emphasis_z - PUNCH_Z_THRESHOLD) / 1.5))
         length = PUNCH_MIN_SECONDS + strength * (PUNCH_MAX_SECONDS - PUNCH_MIN_SECONDS)
         start = word.tl_start_s - 0.3
         end = start + length
@@ -333,7 +367,31 @@ def _plan_punches(program: Program, busy: List[Tuple[float, float]],
         ))
 
     chosen.sort(key=lambda w: w.start_s)
-    return chosen
+    return _shape_punches(chosen, settings)
+
+
+def _shape_punches(chosen: List[WindowZoom],
+                   settings: PresentationSettings) -> List[WindowZoom]:
+    """Direction and the occasional whip, applied in chronological order.
+
+    Every other punch (by time, not by how it was chosen) pulls back instead
+    of pushing in, so consecutive punches read as two different moves rather
+    than one repeated one. At busy/max density, every WHIP_EVERY-th push-in
+    additionally shortens and deepens into a quick whip on the same moment.
+    """
+    density = (settings.density or "").strip().lower()
+    whip_eligible = density in ("busy", "max")
+    shaped: List[WindowZoom] = []
+    for index, zoom in enumerate(chosen):
+        push_in = index % 2 == 0
+        updates: Dict[str, object] = {"push_in": push_in}
+        if whip_eligible and push_in and index > 0 and (index // 2) % WHIP_EVERY == 0:
+            whip_len = min(zoom.end_s - zoom.start_s, WHIP_MAX_SECONDS)
+            updates["end_s"] = zoom.start_s + whip_len
+            updates["depth"] = min(PUNCH_DEPTH_MAX, zoom.depth + WHIP_DEPTH_BONUS)
+            updates["reason"] = f"whip {zoom.reason}"
+        shaped.append(zoom.model_copy(update=updates))
+    return shaped
 
 
 def _overlaps(start: float, end: float, windows: List[Tuple[float, float]]) -> bool:
@@ -373,14 +431,12 @@ def apply_zooms(timeline: Timeline, segment_zooms: List[SegmentZoom],
         segment = _segment_item_at(timeline, zoom.start_s)
         anchor_x, anchor_y = anchors.get(segment, (0.0, 0.0)) if segment else (0.0, 0.0)
         try:
-            item = clip_ops.add_adjustment_item(timeline, start_frame, duration,
-                                                track=ZOOM_TRACK)
-            item.origin = ZOOM_ORIGIN
-            clip_ops.set_transform(timeline, item.id, {
-                "scale": 1.0, "scale_end": 1.0 + zoom.depth,
-                "pos_x": 0.0, "pos_x_end": anchor_x,
-                "pos_y": 0.0, "pos_y_end": anchor_y,
-            })
+            for offset, frames, values in _punch_envelope(duration, zoom.depth,
+                                                          anchor_x, anchor_y):
+                item = clip_ops.add_adjustment_item(timeline, start_frame + offset, frames,
+                                                    track=ZOOM_TRACK)
+                item.origin = ZOOM_ORIGIN
+                clip_ops.set_transform(timeline, item.id, values)
             applied_windows += 1
         except Exception as e:
             logger.debug("Could not add a punch-in at %.1fs: %s", zoom.start_s, e)
@@ -388,6 +444,42 @@ def apply_zooms(timeline: Timeline, segment_zooms: List[SegmentZoom],
     logger.info("Zooms applied: %d segment moves, %d punch-ins",
                 applied_segments, applied_windows)
     return applied_segments, applied_windows
+
+
+# Share of a punch spent easing in, and again easing out; the rest holds.
+PUNCH_EASE_SHARE = 0.3
+# Frames below which a punch is one straight ease in (no room for a hold).
+_PUNCH_MIN_ENVELOPE_FRAMES = 9
+
+
+def _punch_envelope(duration: int, depth: float, anchor_x: float, anchor_y: float
+                    ) -> List[Tuple[int, int, Dict[str, float]]]:
+    """(frame offset, frames, transform) pieces for one punch: ease in to the
+    face, hold, ease back out to where the shot was.
+
+    A punch used to be a single push-in whose window then simply ended, so the
+    frame snapped from 1.25x straight back to 1.0x on the next frame -- and a
+    pull-back did the same at its start. Each piece's own move is smoothstep-
+    eased by the renderer, so joining them end-to-start at the same scale gives
+    one continuous in-hold-out move with no jump at either edge.
+    """
+    tight = {"scale": 1.0 + depth, "pos_x": anchor_x, "pos_y": anchor_y}
+    wide = {"scale": 1.0, "pos_x": 0.0, "pos_y": 0.0}
+
+    def move(a: Dict[str, float], b: Dict[str, float]) -> Dict[str, float]:
+        return {"scale": a["scale"], "scale_end": b["scale"],
+                "pos_x": a["pos_x"], "pos_x_end": b["pos_x"],
+                "pos_y": a["pos_y"], "pos_y_end": b["pos_y"]}
+
+    if duration < _PUNCH_MIN_ENVELOPE_FRAMES:
+        return [(0, duration, move(wide, tight))]
+    ease = max(3, int(round(duration * PUNCH_EASE_SHARE)))
+    hold = duration - 2 * ease
+    pieces = [(0, ease, move(wide, tight))]
+    if hold > 0:
+        pieces.append((ease, hold, dict(tight)))
+    pieces.append((ease + max(0, hold), ease, move(tight, wide)))
+    return pieces
 
 
 def _segment_item_at(timeline: Timeline, time_s: float) -> Optional[str]:

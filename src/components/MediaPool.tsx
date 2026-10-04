@@ -3,13 +3,19 @@ import { useProjectStore } from '../hooks/store';
 import { useCommand } from '../hooks/commands';
 import {
   useElectron, listMedia, importMedia, removeMedia, renameMedia, relinkMedia,
-  getMediaWaveform, mediaThumbUrl, mediaStreamUrl, addMedia,
-  MediaEntry, MEDIA_FILTERS, WaveformData,
+  getMediaWaveform, mediaThumbUrl, mediaStreamUrl, addMedia, getProject,
+  startEyeContact, getEyeContactStatus, cancelEyeContact, revertEyeContact,
+  getEyeContactSetup, saveEyeContactSetup, startEyeContactPreview,
+  MediaEntry, MEDIA_FILTERS, WaveformData, EyeContactJob, EyeContactSetup, EyeContactPreview,
 } from '../hooks/api';
 
 export const MEDIA_DND_TYPE = 'application/x-buzzedit-media';
 
 type KindFilter = 'all' | 'video' | 'audio' | 'image';
+
+/** The backend now tags B-roll/music/cards it added to the library itself;
+ *  api.ts's MediaEntry hasn't caught up yet, so extend it locally. */
+type LibraryEntry = MediaEntry & { generated?: boolean };
 
 const KIND_ICON: Record<string, string> = { audio: '🎵', image: '🖼', video: '🎞' };
 
@@ -109,10 +115,299 @@ function VideoPoster({ entry, projectId }: { entry: MediaEntry; projectId: strin
   );
 }
 
+/**
+ * Where the prompter sits relative to the lens decides how far the eyes get re-aimed:
+ * reading text 30 cm beside a lens at 1.1 m is a ~15 degree look away. Saved once,
+ * pre-filled here every time, editable per run.
+ */
+const PREVIEW_SECONDS = 10;
+/** What changes the eyes; quality only changes the full run's file size. */
+const setupKey = ({ quality, ...rest }: EyeContactSetup) => JSON.stringify(rest);
+type CompareMode = 'before' | 'after' | 'split';
+
+/**
+ * Before/after of a corrected stretch. "After" is the clock and carries the audio;
+ * "before" follows it, and lands on the exact same frame whenever playback pauses, so
+ * flipping between the two while paused shows only what the correction moved.
+ * Click the picture to zoom 3x on that spot (both sides zoom together).
+ */
+function EyePreviewPlayer({ preview }: { preview: EyeContactPreview }) {
+  const before = useRef<HTMLVideoElement>(null);
+  const after = useRef<HTMLVideoElement>(null);
+  const [mode, setMode] = useState<CompareMode>('after');
+  const [zoom, setZoom] = useState<{ x: number; y: number } | null>(null);
+  const [playing, setPlaying] = useState(true);
+  const [time, setTime] = useState(0);
+  const [aspect, setAspect] = useState(16 / 9);
+
+  useEffect(() => {
+    let raf = 0;
+    const tick = () => {
+      const a = after.current, b = before.current;
+      if (a && b) {
+        setTime(a.currentTime);
+        if (!a.paused && Math.abs(b.currentTime - a.currentTime) > 0.1) b.currentTime = a.currentTime;
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  const lockstep = () => {
+    const a = after.current, b = before.current;
+    if (a && b) b.currentTime = a.currentTime;
+  };
+  const togglePlay = () => {
+    const a = after.current, b = before.current;
+    if (!a || !b) return;
+    if (a.paused) {
+      lockstep();
+      a.play().catch(() => {});
+      b.play().catch(() => {});
+      setPlaying(true);
+    } else {
+      a.pause();
+      b.pause();
+      lockstep();
+      setPlaying(false);
+    }
+  };
+  const seek = (t: number) => {
+    if (after.current) after.current.currentTime = t;
+    if (before.current) before.current.currentTime = t;
+    setTime(t);
+  };
+  const onPictureClick = (e: React.MouseEvent<HTMLVideoElement>) => {
+    if (zoom) { setZoom(null); return; }
+    const r = e.currentTarget.getBoundingClientRect();
+    setZoom({ x: ((e.clientX - r.left) / r.width) * 100, y: ((e.clientY - r.top) / r.height) * 100 });
+  };
+  const zoomStyle: React.CSSProperties = zoom
+    ? { transform: 'scale(3)', transformOrigin: `${zoom.x}% ${zoom.y}%` } : {};
+  const video = (which: 'before' | 'after') => (
+    <video
+      ref={which === 'before' ? before : after}
+      src={mediaStreamUrl(which === 'before' ? preview.before_path : preview.after_path)}
+      autoPlay loop playsInline preload="auto" muted={which === 'before'}
+      style={zoomStyle}
+      onClick={onPictureClick}
+      onSeeked={which === 'after' ? () => { if (after.current?.paused) lockstep(); } : undefined}
+      onLoadedMetadata={which === 'after'
+        ? (e) => setAspect(e.currentTarget.videoWidth / Math.max(1, e.currentTarget.videoHeight)) : undefined}
+    />
+  );
+
+  return (
+    <div className="eye-compare">
+      <div className={`eye-compare-stage ${mode === 'split' ? 'split' : ''}`}
+        style={{ aspectRatio: mode === 'split' ? `${aspect * 2}` : `${aspect}` }}>
+        <div className={`eye-compare-cell ${mode === 'after' ? 'hidden' : ''}`}>
+          {video('before')}
+          <span className="eye-compare-label">Before</span>
+        </div>
+        <div className={`eye-compare-cell ${mode === 'before' ? 'hidden' : ''}`}>
+          {video('after')}
+          <span className="eye-compare-label after">After</span>
+        </div>
+      </div>
+      <div className="eye-compare-controls">
+        <button className="btn btn-xs" onClick={togglePlay}>{playing ? '❚❚' : '▶'}</button>
+        <input type="range" min={0} max={preview.duration_s} step={0.01} value={time}
+          onChange={(e) => seek(Number(e.target.value))} />
+        <span className="text-xs text-muted">{time.toFixed(1)}s</span>
+        <div className="eye-compare-modes">
+          {(['before', 'after', 'split'] as CompareMode[]).map((m) => (
+            <button key={m} className={`btn btn-xs ${mode === m ? 'btn-primary' : ''}`}
+              onClick={() => setMode(m)}>
+              {m === 'split' ? 'Side by side' : m[0].toUpperCase() + m.slice(1)}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="text-xs text-muted">
+        {fmtDuration(preview.start_s)}–{fmtDuration(preview.start_s + preview.duration_s)}:
+        face found {preview.face_found_pct}%, re-aimed {preview.prompter_offset_deg}°
+        ({preview.median_shift_px}px), reading sweep {preview.reading_sweep_deg}°.
+        Pause and flip Before/After to compare one frame; click the picture to zoom on the eyes.
+      </div>
+    </div>
+  );
+}
+
+function EyeContactDialog({ entry, projectId, onRun, onClose }: {
+  entry: MediaEntry;
+  projectId: string;
+  onRun: (setup: EyeContactSetup) => void;
+  onClose: () => void;
+}) {
+  const [setup, setSetup] = useState<EyeContactSetup | null>(null);
+  const maxStart = Math.max(0, Math.floor((entry.duration || 0) - PREVIEW_SECONDS));
+  const [startS, setStartS] = useState(() => Math.floor(maxStart / 2));
+  const [previewJob, setPreviewJob] = useState<EyeContactJob | null>(null);
+  const [preview, setPreview] = useState<{ result: EyeContactPreview; setupKey: string } | null>(null);
+  const jobRef = useRef<EyeContactJob | null>(null);
+  jobRef.current = previewJob;
+
+  useEffect(() => {
+    getEyeContactSetup().then(setSetup).catch(() => setSetup({
+      prompter_side: 'left', angle_deg: 0, prompter_cm: 30, camera_cm: 110, steadiness: 0.7, aim_deg: 0,
+      quality: 'high',
+    }));
+  }, []);
+
+  // a preview still running when the dialog goes away is wasted GPU time
+  useEffect(() => () => {
+    const j = jobRef.current;
+    if (j && (j.status === 'queued' || j.status === 'running')) cancelEyeContact(j.id).catch(() => {});
+  }, []);
+
+  const previewSetupKey = useRef('');
+  const jobId = previewJob?.id;
+  const jobActive = previewJob?.status === 'queued' || previewJob?.status === 'running';
+  useEffect(() => {
+    if (!jobId || !jobActive) return;
+    const timer = setInterval(async () => {
+      try {
+        const next = await getEyeContactStatus(jobId);
+        setPreviewJob(next);
+        if (next.status === 'completed' && next.result) {
+          setPreview({ result: next.result as EyeContactPreview, setupKey: previewSetupKey.current });
+        }
+      } catch (err) {
+        console.warn('Eye contact preview poll failed:', err);
+      }
+    }, 600);
+    return () => clearInterval(timer);
+  }, [jobId, jobActive]);
+
+  if (!setup) return null;
+
+  const runPreview = async () => {
+    if (jobRef.current && jobActive) await cancelEyeContact(jobRef.current.id).catch(() => {});
+    previewSetupKey.current = setupKey(setup);
+    try {
+      const { job_id } = await startEyeContactPreview(projectId, entry.id, setup, startS, PREVIEW_SECONDS);
+      setPreviewJob({ id: job_id, media_id: entry.id, status: 'queued', progress: 0,
+        stage: 'Starting', result: null, error: null });
+    } catch (err: any) {
+      setPreviewJob({ id: '', media_id: entry.id, status: 'failed', progress: 0, stage: 'Failed',
+        result: null, error: err.message || 'Could not start the preview' });
+    }
+  };
+  const stale = preview && preview.setupKey !== setupKey(setup);
+  const showPreviewPane = Boolean(preview || jobActive);
+  const set = (patch: Partial<EyeContactSetup>) => setSetup({ ...setup, ...patch });
+  const fromDistances = Math.round(Math.atan2(setup.prompter_cm, Math.max(setup.camera_cm, 1)) * 180 / Math.PI);
+  const angle = setup.prompter_side === 'auto' ? null
+    : (setup.angle_deg > 0 ? setup.angle_deg : fromDistances);
+  return (
+    <div className="eye-dialog-backdrop" onClick={onClose}>
+      <div className={`eye-dialog ${showPreviewPane ? 'wide' : ''}`} onClick={(e) => e.stopPropagation()}>
+        <div className="eye-dialog-settings">
+        <div className="eye-dialog-title">Fix eye contact: {entry.name}</div>
+        <label>
+          Prompter is on your
+          <select value={setup.prompter_side}
+            onChange={(e) => set({ prompter_side: e.target.value as EyeContactSetup['prompter_side'] })}>
+            <option value="left">left of the lens</option>
+            <option value="right">right of the lens</option>
+            <option value="auto">guess from my eyes</option>
+          </select>
+        </label>
+        {setup.prompter_side !== 'auto' && (
+          <>
+            <label>
+              Re-aim angle (degrees): lower it if the eyes overshoot the lens
+              <input type="number" min={1} max={45} step={0.5} value={angle ?? fromDistances}
+                onChange={(e) => set({ angle_deg: Number(e.target.value) })} />
+            </label>
+            <div className="text-xs text-muted">or work it out from distances:</div>
+            <label>
+              Sideways distance, lens to text (cm)
+              <input type="number" min={0} max={200} step={1} value={setup.prompter_cm}
+                onChange={(e) => set({ prompter_cm: Number(e.target.value), angle_deg: 0 })} />
+            </label>
+            <label>
+              Your distance from the camera (cm)
+              <input type="number" min={20} max={1000} step={5} value={setup.camera_cm}
+                onChange={(e) => set({ camera_cm: Number(e.target.value), angle_deg: 0 })} />
+            </label>
+          </>
+        )}
+        <label>
+          Fine aim (degrees, + = toward your left)
+          <input type="number" min={-15} max={15} step={0.5} value={setup.aim_deg}
+            onChange={(e) => set({ aim_deg: Number(e.target.value) })} />
+        </label>
+        <label>
+          Steadiness {Math.round(setup.steadiness * 100)}%
+          <input type="range" min={0} max={1} step={0.05} value={setup.steadiness}
+            onChange={(e) => set({ steadiness: Number(e.target.value) })} />
+        </label>
+        <label>
+          Quality
+          <select value={setup.quality}
+            onChange={(e) => set({ quality: e.target.value as EyeContactSetup['quality'] })}>
+            <option value="standard">standard (smaller file)</option>
+            <option value="high">high (about the source size)</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+        <div className="text-xs text-muted">
+          {angle !== null ? `Re-aims your eyes about ${angle}° toward the lens. ` : ''}
+          Steadiness calms the left-right reading sweep; 0% keeps it, 100% locks the eyes on the lens.
+        </div>
+        <div className="eye-preview-row">
+          {maxStart > 0 && (
+            <label>
+              Preview {PREVIEW_SECONDS} s starting at {fmtDuration(startS) || '0:00'}
+              <input type="range" min={0} max={maxStart} step={1} value={startS}
+                onChange={(e) => setStartS(Number(e.target.value))} />
+            </label>
+          )}
+          <button className="btn btn-sm" onClick={runPreview} disabled={jobActive}
+            title="Correct just this stretch on the GPU and compare before/after. Nothing in the project changes.">
+            {jobActive ? 'Previewing…' : preview ? 'Preview again' : `Preview ${PREVIEW_SECONDS} s`}
+          </button>
+          {previewJob?.status === 'failed' && (
+            <div className="text-xs eye-preview-error">Preview failed: {previewJob.error}</div>
+          )}
+        </div>
+        <div className="eye-dialog-buttons">
+          <button className="btn btn-sm" onClick={onClose}>Cancel</button>
+          <button className="btn btn-sm btn-primary" onClick={() => onRun(setup)}>Fix eye contact</button>
+        </div>
+        </div>
+        {showPreviewPane && (
+          <div className="eye-dialog-preview">
+            {jobActive && previewJob && (
+              <div className="media-eye-progress eye-preview-progress">
+                <div>{previewJob.stage} {Math.round(previewJob.progress * 100)}%</div>
+                <div className="media-eye-progress-bar">
+                  <div style={{ width: `${Math.round(previewJob.progress * 100)}%` }} />
+                </div>
+              </div>
+            )}
+            {preview && (
+              <>
+                {stale && !jobActive && (
+                  <div className="text-xs eye-preview-stale">Settings changed since this preview: preview again to see them.</div>
+                )}
+                <EyePreviewPlayer key={preview.result.after_path} preview={preview.result} />
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function MediaPool() {
   const { project, setError, currentTime, updateProject } = useProjectStore();
   const { pickFiles, pickFolders } = useElectron();
-  const [media, setMedia] = useState<MediaEntry[]>([]);
+  const [media, setMedia] = useState<LibraryEntry[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [filter, setFilter] = useState<KindFilter>('all');
@@ -122,6 +417,9 @@ export default function MediaPool() {
   const [waves, setWaves] = useState<Record<string, WaveformData>>({});
   const [renaming, setRenaming] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  // Eye-contact jobs by media id, while they run on the GPU.
+  const [eyeJobs, setEyeJobs] = useState<Record<string, EyeContactJob>>({});
+  const [eyeDialog, setEyeDialog] = useState<MediaEntry | null>(null);
 
   const projectId = project?.id;
   const fps = (project?.timeline as any)?.fps_num
@@ -239,6 +537,81 @@ export default function MediaPool() {
     }
   }, [projectId, pickFiles, refresh, setError]);
 
+  /** The swap changed the project's source and timeline sources server-side: pull them in. */
+  const reloadSources = useCallback(async () => {
+    if (!projectId) return;
+    await refresh();
+    try {
+      const fresh = await getProject(projectId);
+      updateProject({ source_video: fresh.source_video, timeline: fresh.timeline } as any);
+    } catch (err) {
+      console.warn('Failed to reload the project after an eye-contact swap:', err);
+    }
+  }, [projectId, refresh, updateProject]);
+
+  const handleEyeContact = useCallback(async (entry: MediaEntry, setup: EyeContactSetup) => {
+    setEyeDialog(null);
+    if (!projectId || eyeJobs[entry.id]) return;
+    try {
+      await saveEyeContactSetup(setup);
+      const { job_id } = await startEyeContact(projectId, entry.id, setup);
+      setEyeJobs(prev => ({ ...prev, [entry.id]: {
+        id: job_id, media_id: entry.id, status: 'queued', progress: 0,
+        stage: 'Waiting for the GPU', result: null, error: null,
+      } }));
+    } catch (err: any) {
+      setError(err.message || 'Could not start eye contact correction');
+    }
+  }, [projectId, eyeJobs, setError]);
+
+  const handleRevertEyeContact = useCallback(async (entry: MediaEntry) => {
+    if (!projectId) return;
+    try {
+      const res = await revertEyeContact(projectId, entry.id);
+      setMedia(res.media || []);
+      await reloadSources();
+      setNote(`${entry.name}: original eyes restored`);
+    } catch (err: any) {
+      setError(err.message);
+    }
+  }, [projectId, reloadSources, setError]);
+
+  // Poll running eye-contact jobs; a finished one has already swapped the corrected file in.
+  const activeEyeJobs = Object.values(eyeJobs).filter(j => j.status === 'queued' || j.status === 'running');
+  const activeEyeKey = activeEyeJobs.map(j => j.id).join(',');
+  useEffect(() => {
+    if (!activeEyeKey) return;
+    const ids = activeEyeKey.split(',');
+    const timer = setInterval(async () => {
+      for (const jobId of ids) {
+        try {
+          const next = await getEyeContactStatus(jobId);
+          if (next.status === 'completed' || next.status === 'failed' || next.status === 'cancelled') {
+            setEyeJobs(prev => {
+              const rest = { ...prev };
+              delete rest[next.media_id];
+              return rest;
+            });
+            if (next.status === 'completed') {
+              await reloadSources();
+              const r = next.result;
+              setNote(r
+                ? `Eye contact fixed: eyes re-aimed ${r.prompter_offset_deg}° toward the lens (${r.median_shift_px}px), reading sweep ${r.reading_sweep_deg}° calmed, ${Math.round(r.seconds)}s`
+                : 'Eye contact fixed');
+            } else if (next.status === 'failed') {
+              setError(`Eye contact correction failed: ${next.error}`);
+            }
+          } else {
+            setEyeJobs(prev => ({ ...prev, [next.media_id]: next }));
+          }
+        } catch (err) {
+          console.warn('Eye contact status poll failed:', err);
+        }
+      }
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [activeEyeKey, reloadSources, setError]);
+
   /** Drop straight onto the timeline at the playhead, for people who'd rather click. */
   const handleAddToTimeline = useCallback(async (entry: MediaEntry) => {
     if (!projectId || entry.missing) return;
@@ -274,8 +647,8 @@ export default function MediaPool() {
   const tabs: { id: KindFilter; label: string }[] = [
     { id: 'all', label: `All (${media.length})` },
     { id: 'video', label: `Video (${counts.video ?? 0})` },
-    { id: 'audio', label: `Music (${counts.audio ?? 0})` },
     { id: 'image', label: `Images (${counts.image ?? 0})` },
+    { id: 'audio', label: `Music (${counts.audio ?? 0})` },
   ];
 
   return (
@@ -372,13 +745,43 @@ export default function MediaPool() {
                 )}
 
                 <span className="media-kind">{KIND_ICON[entry.kind]}</span>
+                {entry.generated && (
+                  <span className="media-generated-badge" title="Added automatically from the timeline">
+                    generated
+                  </span>
+                )}
                 {entry.duration > 0 && <span className="media-duration">{fmtDuration(entry.duration)}</span>}
+                {entry.eye_contact && !eyeJobs[entry.id] && (
+                  <span className="media-eye-badge" title={`Eyes re-aimed at the lens. Original: ${entry.eye_contact.original_path}`}>
+                    eye contact
+                  </span>
+                )}
+                {eyeJobs[entry.id] && (
+                  <div className="media-eye-progress" onClick={(e) => e.stopPropagation()}>
+                    <div>{eyeJobs[entry.id].stage} {Math.round(eyeJobs[entry.id].progress * 100)}%</div>
+                    <div className="media-eye-progress-bar">
+                      <div style={{ width: `${Math.round(eyeJobs[entry.id].progress * 100)}%` }} />
+                    </div>
+                    <button className="btn btn-xs" onClick={() => cancelEyeContact(eyeJobs[entry.id].id)}>Cancel</button>
+                  </div>
+                )}
 
                 <div className="media-actions">
                   <button className="media-action" title="Add at playhead"
                     onClick={(e) => { e.stopPropagation(); handleAddToTimeline(entry); }}>＋</button>
                   <button className="media-action" title="Rename"
                     onClick={(e) => { e.stopPropagation(); setRenaming(entry.id); }}>✎</button>
+                  {entry.kind === 'video' && !entry.missing && !eyeJobs[entry.id] && (
+                    <button className="media-action"
+                      title={entry.eye_contact
+                        ? 'Re-run eye contact correction (from the original recording)'
+                        : 'Fix eye contact: re-aim teleprompter gaze at the lens (GPU)'}
+                      onClick={(e) => { e.stopPropagation(); setEyeDialog(entry); }}>👁</button>
+                  )}
+                  {entry.eye_contact && !eyeJobs[entry.id] && (
+                    <button className="media-action" title="Revert to the original eyes"
+                      onClick={(e) => { e.stopPropagation(); handleRevertEyeContact(entry); }}>↺</button>
+                  )}
                   <button className="media-action danger" title={entry.linked ? 'Remove from library' : 'Remove and delete the copy'}
                     onClick={(e) => { e.stopPropagation(); handleRemove(entry); }}>✕</button>
                 </div>
@@ -416,6 +819,11 @@ export default function MediaPool() {
       )}
 
       {dropActive && <div className="media-dropzone">Drop media to add it to the library</div>}
+      {eyeDialog && projectId && (
+        <EyeContactDialog entry={eyeDialog} projectId={projectId}
+          onRun={(setup) => handleEyeContact(eyeDialog, setup)}
+          onClose={() => setEyeDialog(null)} />
+      )}
     </div>
   );
 }

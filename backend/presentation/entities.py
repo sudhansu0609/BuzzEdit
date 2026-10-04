@@ -117,6 +117,15 @@ DEFINITION_SECONDS = 5.0
 QUOTE_SECONDS = 5.0
 CHAPTER_SECONDS = 2.6
 END_SCREEN_SECONDS = 12.0
+NEWSPAPER_SECONDS = 4.5
+CASE_FILE_SECONDS = 4.5
+
+# Newspaper clippings and case files are stylistically loaded, so they are
+# gated to the genres where they read as intentional rather than a mistake — a
+# dated event becomes a clipping broadly; a classified dossier stays in the
+# investigative genres.
+_NEWSPAPER_GENRES = {"true_crime", "horror", "news", "general"}
+_CASE_FILE_GENRES = {"true_crime", "horror", "news"}
 
 _YEAR_RE = re.compile(r"\b(1[6-9]\d{2}|20\d{2})\b")
 _PERCENT_RE = re.compile(
@@ -292,6 +301,17 @@ def _stat_data(text: str) -> Dict[str, Any]:
     return _stat_data(text)
 
 
+def _headline(topic: Topic, record: Dict[str, Any]) -> str:
+    """A short newspaper headline for the topic: a quote if one was named,
+    otherwise the topic's own name, capped to a readable length."""
+    quotes = record.get("quotes") or []
+    if quotes and quotes[0].get("text"):
+        words = quotes[0]["text"].split()
+        return " ".join(words[:9]).strip().upper()
+    name = (topic.topic or "").strip()
+    return " ".join(name.split()[:9]).upper() if name else "BREAKING NEWS"
+
+
 def _rank_number(number: Dict[str, Any]) -> int:
     text = number["text"].lower()
     if "%" in text or "percent" in text:
@@ -384,6 +404,37 @@ def entity_beats(records: Sequence[Dict[str, Any]], topics: Sequence[Topic],
             at = anchor_time(program, topic, quote["text"])
             beats.append(make("quote_card", at, QUOTE_SECONDS, text=f"“{quote['text']}”",
                               subtext=quote.get("who") or None))
+
+        # A dated event becomes a full-frame newspaper clipping — a broadly
+        # usable historical beat, but only where the look fits the genre.
+        if settings.newspapers and record["dates"] and genre in _NEWSPAPER_GENRES:
+            date = record["dates"][0]
+            headline = _headline(topic, record)
+            at = anchor_time(program, topic, date)
+            beats.append(make("newspaper", at, NEWSPAPER_SECONDS, priority=0.72,
+                              text=headline,
+                              data={"headline": headline, "dateline": str(date).upper(),
+                                    "highlight": headline}))
+
+        # A cited case, source or a named cast becomes a classified dossier —
+        # kept to the investigative genres, where a case file reads as intent.
+        if settings.case_files and genre in _CASE_FILE_GENRES and (
+                record["people"] or record["sources"]):
+            fields: List[Dict[str, str]] = []
+            for person in record["people"][:4]:
+                if person.get("role"):
+                    fields.append({"label": person["role"][:18].upper(),
+                                   "value": person["name"]})
+            if record["dates"]:
+                fields.append({"label": "DATE", "value": str(record["dates"][0])})
+            if record["sources"]:
+                fields.append({"label": "SOURCE", "value": record["sources"][0]["source"]})
+            if fields:
+                at = anchor_time(program, topic, topic.topic)
+                beats.append(make("case_file", at, CASE_FILE_SECONDS, priority=0.68,
+                                  text=(topic.topic or "CASE FILE"),
+                                  data={"title": f"CASE FILE — {(topic.topic or '')[:28].upper()}",
+                                        "fields": fields, "stamp": "CLASSIFIED"}))
 
     return beats
 

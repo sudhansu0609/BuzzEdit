@@ -128,7 +128,7 @@ RECIPES: Dict[str, Dict[str, Any]] = {
     "reveal": {
         "color": {"contrast": 1.06, "vignette": 0.18},
         "push": 0.05,
-        "hit": {"visual": ["flash"], "sfx": "stinger"},
+        "hit": {"visual": ["flash", "shutter"], "sfx": "stinger"},
         "riser": True,
         "transition": ("fadewhite", 0.35),
     },
@@ -136,7 +136,7 @@ RECIPES: Dict[str, Dict[str, Any]] = {
         "color": {"saturation": 0.78, "vignette": 0.42, "contrast": 1.16, "temperature": -0.2},
         "push": 0.09,
         "atmosphere": [("lightning", 0.5), ("flicker", 0.35)],
-        "hit": {"visual": ["flash", "shake", "glitch"], "sfx": "thunder"},
+        "hit": {"visual": ["flash", "shutter", "shake", "glitch"], "sfx": "thunder"},
         "riser": True,
         "loop": ("heartbeat", 0.35),
         "transition": ("fadeblack", 0.6),
@@ -162,6 +162,7 @@ RECIPES: Dict[str, Dict[str, Any]] = {
 HIT_FLASH_S = 0.08
 HIT_SHAKE_S = 0.55
 HIT_GLITCH_S = 0.35
+HIT_SHUTTER_S = 0.14
 RISER_S = 3.2
 
 
@@ -331,13 +332,14 @@ def apply_moods(timeline: Timeline, topics: Sequence[Topic], program: Program,
         if loop:
             plan.loops.append((start, end, loop[0], loop[1] * scale))
 
-        hit = recipe.get("hit")
+        hit = recipe.get("hit") if settings.mood_hits else None
         key = topic.key_moment_s if topic.key_moment_s is not None else start
         key = max(start, min(end - 0.5, key))
         if hit:
             for kind in hit.get("visual", []):
-                seconds = {"flash": HIT_FLASH_S, "shake": HIT_SHAKE_S, "glitch": HIT_GLITCH_S}.get(kind, 0.2)
-                level = {"flash": 0.9, "shake": 0.7, "glitch": 0.6}.get(kind, 0.5) * min(1.0, scale)
+                seconds = {"flash": HIT_FLASH_S, "shake": HIT_SHAKE_S, "glitch": HIT_GLITCH_S,
+                          "shutter": HIT_SHUTTER_S}.get(kind, 0.2)
+                level = {"flash": 0.9, "shake": 0.7, "glitch": 0.6, "shutter": 0.95}.get(kind, 0.5) * min(1.0, scale)
                 item = clip_ops.add_adjustment_item(
                     timeline, time_to_frame(key, fps_num, fps_den),
                     max(1, time_to_frame(seconds, fps_num, fps_den)), track=HIT_TRACK)
@@ -349,7 +351,7 @@ def apply_moods(timeline: Timeline, topics: Sequence[Topic], program: Program,
             if hit.get("sfx"):
                 plan.sfx.append((key, hit["sfx"]))
             plan.hits += 1
-        if recipe.get("riser") and key - start >= 1.5:
+        if settings.mood_hits and recipe.get("riser") and key - start >= 1.5:
             plan.sfx.append((max(start, key - RISER_S), "riser"))
 
     timeline.recalculate_duration()

@@ -14,6 +14,7 @@ from .schema import (
 from .ops import (
     add_broll_item,
     audit_cut_coverage,
+    cut_program_range,
     rebuild_primary_tracks,
     toggle_word,
     toggle_word_range,
@@ -34,6 +35,7 @@ __all__ = [
     "time_to_frame",
     "frame_to_time",
     "rebuild_primary_tracks",
+    "cut_program_range",
     "audit_cut_coverage",
     "toggle_word",
     "toggle_word_range",

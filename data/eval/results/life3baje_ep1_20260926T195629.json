@@ -1,0 +1,122 @@
+{
+  "source": "B:/youtubeProjects/life3Baje/ep1/eptemFullRaw.mp4",
+  "ground_truth_file": "B:\\youtubeProjects\\Buzzcaf_Media\\BuzzEdit\\data\\eval\\life3baje_ep1.json",
+  "no_rerun": false,
+  "iou_threshold": 0.5,
+  "runs": [
+    {
+      "span": {
+        "matched": 11,
+        "predicted_total": 169,
+        "ground_truth_total": 30,
+        "precision": 0.0650887573964497,
+        "recall": 0.36666666666666664,
+        "f1": 0.11055276381909547
+      },
+      "seconds": {
+        "predicted_total_s": 413.44,
+        "ground_truth_total_s": 371.679,
+        "overlap_s": 267.851,
+        "precision_s": 0.6479,
+        "recall_s": 0.7207,
+        "content_wrongly_removed_s": 145.589,
+        "missed_debris_s": 103.828
+      },
+      "per_kind": {
+        "editorial": {
+          "matched": 6,
+          "total": 10,
+          "recall": 0.6
+        },
+        "false_start": {
+          "matched": 1,
+          "total": 7,
+          "recall": 0.14285714285714285
+        },
+        "retake": {
+          "matched": 0,
+          "total": 6,
+          "recall": 0.0
+        },
+        "silence": {
+          "matched": 4,
+          "total": 7,
+          "recall": 0.5714285714285714
+        }
+      }
+    }
+  ],
+  "aggregate": {
+    "runs": 1,
+    "span": {
+      "matched": {
+        "mean": 11.0,
+        "stdev": 0.0
+      },
+      "predicted_total": {
+        "mean": 169.0,
+        "stdev": 0.0
+      },
+      "ground_truth_total": {
+        "mean": 30.0,
+        "stdev": 0.0
+      },
+      "precision": {
+        "mean": 0.0651,
+        "stdev": 0.0
+      },
+      "recall": {
+        "mean": 0.3667,
+        "stdev": 0.0
+      },
+      "f1": {
+        "mean": 0.1106,
+        "stdev": 0.0
+      }
+    },
+    "seconds": {
+      "predicted_total_s": {
+        "mean": 413.44,
+        "stdev": 0.0
+      },
+      "ground_truth_total_s": {
+        "mean": 371.679,
+        "stdev": 0.0
+      },
+      "overlap_s": {
+        "mean": 267.851,
+        "stdev": 0.0
+      },
+      "precision_s": {
+        "mean": 0.6479,
+        "stdev": 0.0
+      },
+      "recall_s": {
+        "mean": 0.7207,
+        "stdev": 0.0
+      },
+      "content_wrongly_removed_s": {
+        "mean": 145.589,
+        "stdev": 0.0
+      },
+      "missed_debris_s": {
+        "mean": 103.828,
+        "stdev": 0.0
+      }
+    },
+    "per_kind": {
+      "editorial": {
+        "mean_recall": 0.6
+      },
+      "false_start": {
+        "mean_recall": 0.1429
+      },
+      "retake": {
+        "mean_recall": 0.0
+      },
+      "silence": {
+        "mean_recall": 0.5714
+      }
+    }
+  }
+}

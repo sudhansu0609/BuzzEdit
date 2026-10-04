@@ -1,19 +1,185 @@
 {
   "roles": {
+    "audio": {
+      "file": "stable_audio_sfx.json",
+      "bindings": {
+        "positive": [
+          "3",
+          "inputs",
+          "text"
+        ],
+        "negative": [
+          "4",
+          "inputs",
+          "text"
+        ],
+        "seed": [
+          "6",
+          "inputs",
+          "seed"
+        ],
+        "length": [
+          "5",
+          "inputs",
+          "seconds"
+        ],
+        "prefix": [
+          "8",
+          "inputs",
+          "filename_prefix"
+        ],
+        "steps": [
+          "6",
+          "inputs",
+          "steps"
+        ],
+        "cfg": [
+          "6",
+          "inputs",
+          "cfg"
+        ],
+        "model": [
+          "1",
+          "inputs",
+          "ckpt_name"
+        ]
+      }
+    },
     "broll_video": {
       "file": "zimage_wan22_i2v.json",
       "bindings": {
-        "positive": [["z_pos", "inputs", "text"], ["w_pos", "inputs", "text"]],
-        "negative": ["w_neg", "inputs", "text"],
-        "width": [["z_latent", "inputs", "width"], ["w_i2v", "inputs", "width"]],
-        "height": [["z_latent", "inputs", "height"], ["w_i2v", "inputs", "height"]],
-        "seed": [["z_sample", "inputs", "seed"], ["w_sample_high", "inputs", "noise_seed"], ["w_sample_low", "inputs", "noise_seed"]],
-        "length": ["w_i2v", "inputs", "length"],
-        "fps": ["v_create", "inputs", "fps"],
-        "prefix": ["v_save", "inputs", "filename_prefix"],
+        "positive": [
+          [
+            "z_pos",
+            "inputs",
+            "text"
+          ],
+          [
+            "w_pos",
+            "inputs",
+            "text"
+          ]
+        ],
+        "negative": [
+          "w_neg",
+          "inputs",
+          "text"
+        ],
+        "width": [
+          [
+            "z_latent",
+            "inputs",
+            "width"
+          ],
+          [
+            "w_i2v",
+            "inputs",
+            "width"
+          ]
+        ],
+        "height": [
+          [
+            "z_latent",
+            "inputs",
+            "height"
+          ],
+          [
+            "w_i2v",
+            "inputs",
+            "height"
+          ]
+        ],
+        "seed": [
+          [
+            "z_sample",
+            "inputs",
+            "seed"
+          ],
+          [
+            "z_sample2",
+            "inputs",
+            "seed"
+          ],
+          [
+            "w_sample_high",
+            "inputs",
+            "noise_seed"
+          ],
+          [
+            "w_sample_low",
+            "inputs",
+            "noise_seed"
+          ]
+        ],
+        "length": [
+          "w_i2v",
+          "inputs",
+          "length"
+        ],
+        "fps": [
+          "v_create",
+          "inputs",
+          "fps"
+        ],
+        "prefix": [
+          "v_save",
+          "inputs",
+          "filename_prefix"
+        ],
         "steps": [],
         "cfg": [],
-        "model": []
+        "model": [],
+        "out_width": [
+          "u_scale",
+          "inputs",
+          "width"
+        ],
+        "out_height": [
+          "u_scale",
+          "inputs",
+          "height"
+        ]
+      }
+    },
+    "music": {
+      "file": "ace_step_music.json",
+      "bindings": {
+        "positive": [
+          "3",
+          "inputs",
+          "tags"
+        ],
+        "negative": [],
+        "seed": [
+          "6",
+          "inputs",
+          "seed"
+        ],
+        "length": [
+          "5",
+          "inputs",
+          "seconds"
+        ],
+        "prefix": [
+          "8",
+          "inputs",
+          "filename_prefix"
+        ],
+        "steps": [
+          "6",
+          "inputs",
+          "steps"
+        ],
+        "cfg": [
+          "6",
+          "inputs",
+          "cfg"
+        ],
+        "model": [
+          "1",
+          "inputs",
+          "ckpt_name"
+        ]
       }
     }
   }

@@ -12,7 +12,7 @@ from timeline import build_timeline_from_transcript, Timeline, generate_captions
 from timeline.ops import apply_auto_zoom
 from timeline.schema import Transition
 from asr import whisper_engine
-from asr.auto_edit import extract_project_audio, plan_auto_edit, record_cut_coverage
+from asr.auto_edit import extract_project_audio, pacing_kwargs, plan_auto_edit, record_cut_coverage
 from store.project_store import ProjectStore
 from utils.ffmpeg_utils import get_video_info
 
@@ -60,7 +60,8 @@ class EditAgent:
 
         report(0.35, "Planning the edit")
         aggressiveness = float(agent_settings.get("fumble_aggressiveness", 0.5))
-        plan = await plan_auto_edit(words, audio_path, aggressiveness=aggressiveness)
+        plan = await plan_auto_edit(words, audio_path, aggressiveness=aggressiveness,
+                                    settings=agent_settings)
         edit_report = plan.report
 
         tl = build_timeline_from_transcript(
@@ -74,6 +75,7 @@ class EditAgent:
             has_audio=v_info.get("audio_codec") not in (None, "none"),
             speech_regions=edit_report.get("speech"),
             energy_envelope=edit_report.get("energy"),
+            **pacing_kwargs(agent_settings),
         )
         record_cut_coverage(tl, edit_report)
         results["edit_report"] = plan.public_report

@@ -79,6 +79,10 @@ class Project(BaseModel):
     # project, which silently killed the thumbnail stage each night.
     status: Literal["draft", "transcribed", "analyzed", "presented", "rendered",
                     "error"] = "draft"
+    # When the presentation pass saved the timeline (just before rendering).
+    # BuzzcafStudio compares it with a failed job's start to re-render the
+    # saved edit instead of running the whole pass again.
+    presented_at: Optional[str] = None
 
     @field_validator("transcript", mode="before")
     @classmethod
@@ -122,6 +126,35 @@ class TranscribeJob(BaseModel):
     project_id: str
     model: str = "large-v3"
     language: Optional[str] = None  # None = auto-detect the spoken language
+    # The recording is already cut: transcribe it, but keep every frame (see
+    # Timeline.keep_full_source). Stored on the project's settings so later
+    # passes (the presentation pass's own auto-edit) honour it too.
+    precut: Optional[bool] = None
+    # Auto-edit pacing, per channel (the Studio sends its channel profile's
+    # `auto_edit` block). Measured from the creator's own reference cut of
+    # Life3Baje ep1: pauses up to ~1.1s are left in, ~0.35s of room stays
+    # either side of a cut. Stored on project settings like `precut`, so the
+    # timeline rebuild and later passes keep the same pacing. None = keep
+    # whatever the project already has (or the Timeline defaults).
+    max_pause_seconds: Optional[float] = None
+    pause_padding_seconds: Optional[float] = None
+    fumble_aggressiveness: Optional[float] = None
+    # What the recording is (the Studio sends its channel profile's genre). When
+    # no pacing was chosen, the genre's own applies -- horror keeps its pauses
+    # (presentation.genre.pacing_for). None = the model reads the transcript and
+    # decides. Stored on project settings like `precut`.
+    genre: Optional[str] = None
+    # Latin words from the user's own script (proper nouns, brand names,
+    # loanwords) -- fed to the Hinglish romanizer as a first-preference
+    # source for restoring English words Whisper wrote out in Devanagari,
+    # and to Whisper itself as `initial_prompt`. Stored on project settings
+    # like `language`, so a later respell reuses it without the caller
+    # having to resend it.
+    vocabulary: Optional[List[str]] = None
+    # Channel key selecting a glossary file (data/glossary/<key>.json) whose
+    # entries override both the common-word table and the loanword restore.
+    # Stored on project settings like `language`.
+    glossary: Optional[str] = None
 
 
 class AnalyzeJob(BaseModel):

@@ -10,8 +10,9 @@ from config import PROJECTS_DIR, OUTPUT_DIR
 from utils.ffmpeg_utils import extract_audio, get_video_info
 from asr import whisper_engine, detect_speech_silence_intervals
 from asr.auto_edit import plan_auto_edit, public_report, record_cut_coverage
-from timeline import build_timeline_from_transcript, toggle_word, Timeline
-from timeline.schema import SourceFile, time_to_frame
+from timeline import build_timeline_from_transcript, cut_program_range, rebuild_primary_tracks, toggle_word, Timeline
+from timeline.schema import AudioMaster, SourceFile, time_to_frame
+from render.audio import EQ_PRESETS, VOICE_FX_RECIPES, _REVERB_RECIPES
 from timeline import authoring, clip_ops
 from store import media_pool
 from render import render_timeline_async
@@ -26,25 +27,81 @@ class ToggleWordRequest(BaseModel):
     enabled: bool
 
 
+class ProgramCutRequest(BaseModel):
+    start_frame: int
+    end_frame: int
+
+
 class SplitRequest(BaseModel):
     item_id: str
     at_frame: int
+    linked: bool = True                # split the linked audio/video with it
+
+
+class SplitManyRequest(BaseModel):
+    item_ids: List[str]
+    at_frame: int
+    linked: bool = True
 
 
 class DeleteClipRequest(BaseModel):
     item_id: str
+    ripple: bool = False               # close the hole it leaves
+    linked: bool = True
+
+
+class DeleteManyRequest(BaseModel):
+    item_ids: List[str]
+    ripple: bool = False
+    linked: bool = True
 
 
 class MoveClipRequest(BaseModel):
     item_id: str
     timeline_start_frame: int
     track: Optional[str] = None
+    linked: bool = True
+
+
+class MoveManyRequest(BaseModel):
+    item_ids: List[str]
+    delta_frames: int
+    track_map: Dict[str, str] = {}     # item_id -> new lane (same kind)
+    linked: bool = True
 
 
 class TrimClipRequest(BaseModel):
     item_id: str
     edge: str  # "start" | "end"
     timeline_frame: int
+    linked: bool = True
+    ripple: bool = False
+
+
+class TrimManyRequest(BaseModel):
+    item_ids: List[str]
+    edge: str
+    at_frame: int
+    ripple: bool = False
+
+
+class LinkRequest(BaseModel):
+    item_ids: List[str]
+
+
+class PasteRequest(BaseModel):
+    items: List[Dict[str, Any]]
+    at_frame: int
+    insert: bool = False
+
+
+class CloseGapRequest(BaseModel):
+    track: str
+    at_frame: int
+
+
+class ReplaceTimelineRequest(BaseModel):
+    timeline: Dict[str, Any]
 
 
 class AddMediaRequest(BaseModel):
@@ -121,6 +178,10 @@ class ItemFlagsRequest(BaseModel):
     mute: Optional[bool] = None
     volume: Optional[float] = None
     label: Optional[str] = None
+    loop: Optional[bool] = None
+    audio_fade_in: Optional[float] = None
+    audio_fade_out: Optional[float] = None
+    duck: Optional[float] = None
 
 
 class TransitionRequest(BaseModel):
@@ -168,6 +229,10 @@ class IntroRequest(BaseModel):
     preset: str
     title: str = ""
     subtitle: str = ""
+
+
+class AudioMasterRequest(BaseModel):
+    updates: Dict[str, Any] = {}
 
 
 def _load_timeline(project_id: str):
@@ -238,7 +303,8 @@ async def generate_timeline(project_id: str):
 
     # 4. Disfluency Analysis (deterministic + LLM adjudication, fail-safe)
     aggressiveness = float(settings.get("fumble_aggressiveness", 0.5))
-    plan = await plan_auto_edit(words, audio_path, aggressiveness=aggressiveness)
+    plan = await plan_auto_edit(words, audio_path, aggressiveness=aggressiveness,
+                                settings=settings)
     edit_report = plan.report
 
     # 5. Build Timeline
@@ -348,6 +414,31 @@ async def toggle_word_endpoint(project_id: str, body: ToggleWordRequest):
 
     return {"status": "success", "timeline": tl}
 
+
+@router.post("/{project_id}/program/cut")
+async def cut_program(project_id: str, body: ProgramCutRequest):
+    """Delete a span of the finished programme — every track, not just the words."""
+    p_data, tl = _load_timeline(project_id)
+    primary_src_id = list(tl.sources.keys())[0]
+    try:
+        cut_program_range(tl, body.start_frame, body.end_frame, primary_src_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _save_timeline(project_id, p_data, tl)
+    return {"status": "success", "timeline": tl}
+
+
+@router.post("/{project_id}/program/restore_cuts")
+async def restore_program_cuts(project_id: str):
+    """Undo every manual program cut, restoring V1/A1 to what the words imply."""
+    p_data, tl = _load_timeline(project_id)
+    primary_src_id = list(tl.sources.keys())[0]
+    tl.manual_cuts = []
+    rebuild_primary_tracks(tl, primary_src_id)
+    _save_timeline(project_id, p_data, tl)
+    return {"status": "success", "timeline": tl}
+
+
 @router.post("/{project_id}/render")
 async def render_project_timeline(project_id: str):
     p_data = project_store.get_project(project_id)
@@ -390,24 +481,101 @@ def _clip_op(project_id: str, fn):
 
 @router.post("/{project_id}/clip/split")
 async def split_clip(project_id: str, body: SplitRequest):
-    return _clip_op(project_id, lambda tl: clip_ops.split_item(tl, body.item_id, body.at_frame))
+    return _clip_op(project_id, lambda tl: clip_ops.split_item(
+        tl, body.item_id, body.at_frame, linked=body.linked))
+
+
+@router.post("/{project_id}/clip/split_many")
+async def split_clips(project_id: str, body: SplitManyRequest):
+    """Split every listed clip the frame falls inside — one undo step, one save."""
+    return _clip_op(project_id, lambda tl: clip_ops.split_items(
+        tl, body.item_ids, body.at_frame, linked=body.linked))
 
 
 @router.post("/{project_id}/clip/delete")
 async def delete_clip(project_id: str, body: DeleteClipRequest):
-    return _clip_op(project_id, lambda tl: clip_ops.delete_item(tl, body.item_id))
+    return _clip_op(project_id, lambda tl: clip_ops.delete_item(
+        tl, body.item_id, ripple=body.ripple, linked=body.linked))
+
+
+@router.post("/{project_id}/clip/delete_many")
+async def delete_clips(project_id: str, body: DeleteManyRequest):
+    """Delete (or ripple-delete) a selection of clips with their linked partners."""
+    return _clip_op(project_id, lambda tl: clip_ops.delete_items(
+        tl, body.item_ids, ripple=body.ripple, linked=body.linked))
 
 
 @router.post("/{project_id}/clip/move")
 async def move_clip(project_id: str, body: MoveClipRequest):
     return _clip_op(project_id, lambda tl: clip_ops.move_item(
-        tl, body.item_id, body.timeline_start_frame, body.track))
+        tl, body.item_id, body.timeline_start_frame, body.track, linked=body.linked))
+
+
+@router.post("/{project_id}/clip/move_many")
+async def move_clips(project_id: str, body: MoveManyRequest):
+    """Slide a selection of clips (and their linked partners) together."""
+    return _clip_op(project_id, lambda tl: clip_ops.move_items(
+        tl, body.item_ids, body.delta_frames, body.track_map, linked=body.linked))
 
 
 @router.post("/{project_id}/clip/trim")
 async def trim_clip(project_id: str, body: TrimClipRequest):
     return _clip_op(project_id, lambda tl: clip_ops.trim_item(
-        tl, body.item_id, body.edge, body.timeline_frame))
+        tl, body.item_id, body.edge, body.timeline_frame,
+        linked=body.linked, ripple=body.ripple))
+
+
+@router.post("/{project_id}/clip/trim_many")
+async def trim_clips(project_id: str, body: TrimManyRequest):
+    """Trim start/end of the listed clips to a frame (trim to playhead)."""
+    return _clip_op(project_id, lambda tl: clip_ops.trim_items(
+        tl, body.item_ids, body.edge, body.at_frame, ripple=body.ripple))
+
+
+@router.post("/{project_id}/clip/link")
+async def link_clips(project_id: str, body: LinkRequest):
+    return _clip_op(project_id, lambda tl: clip_ops.link_items(tl, body.item_ids))
+
+
+@router.post("/{project_id}/clip/unlink")
+async def unlink_clips(project_id: str, body: LinkRequest):
+    return _clip_op(project_id, lambda tl: clip_ops.unlink_items(tl, body.item_ids))
+
+
+@router.post("/{project_id}/clip/paste")
+async def paste_clips(project_id: str, body: PasteRequest):
+    """Paste clipboard clips at a frame; `insert` pushes later clips right."""
+    p_data, tl = _ensure_timeline(project_id)
+    try:
+        pasted = clip_ops.paste_items(tl, body.items, body.at_frame, insert=body.insert)
+    except clip_ops.ClipOpError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _save_timeline(project_id, p_data, tl)
+    return {"status": "success", "item_ids": [c.id for c in pasted], "timeline": tl}
+
+
+@router.post("/{project_id}/track/close_gap")
+async def close_track_gap(project_id: str, body: CloseGapRequest):
+    """Ripple-delete the empty stretch of a track under a frame."""
+    return _clip_op(project_id, lambda tl: clip_ops.close_gap(tl, body.track, body.at_frame))
+
+
+@router.post("/{project_id}/replace")
+async def replace_timeline(project_id: str, body: ReplaceTimelineRequest):
+    """Put back a whole timeline the editor held earlier — the undo/redo path.
+
+    The revision always moves forward, never back to the snapshot's own number:
+    preview frames and proxies are keyed by revision, and reusing an old number
+    could serve a picture of a different edit.
+    """
+    p_data, current = _ensure_timeline(project_id)
+    try:
+        tl = Timeline.model_validate(body.timeline)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Not a timeline: {e}")
+    tl.revision = max(current.revision, tl.revision) + 1
+    _save_timeline(project_id, p_data, tl)
+    return {"status": "success", "timeline": tl}
 
 
 @router.post("/{project_id}/clip/detach_audio")
@@ -431,10 +599,12 @@ async def uncompound_clip(project_id: str, body: DeleteClipRequest):
 
 @router.post("/{project_id}/clip/flags")
 async def set_clip_flags(project_id: str, body: ItemFlagsRequest):
-    """Toggle enabled / locked / mute, set volume or rename a clip."""
+    """Toggle enabled / locked / mute / loop, set volume, fades, ducking or rename a clip."""
     return _clip_op(project_id, lambda tl: clip_ops.set_item_flags(
         tl, body.item_id, enabled=body.enabled, locked=body.locked,
-        mute=body.mute, volume=body.volume, label=body.label))
+        mute=body.mute, volume=body.volume, label=body.label,
+        loop=body.loop, audio_fade_in=body.audio_fade_in,
+        audio_fade_out=body.audio_fade_out, duck=body.duck))
 
 
 @router.post("/{project_id}/transform")
@@ -506,6 +676,28 @@ async def add_adjustment(project_id: str, body: AddAdjustmentRequest):
 async def set_aspect(project_id: str, body: AspectRequest):
     """Letterbox the programme to a cinematic aspect ratio (null clears it)."""
     return _clip_op(project_id, lambda tl: clip_ops.set_aspect_bars(tl, body.ratio))
+
+
+@router.get("/{project_id}/audio_master")
+async def get_audio_master(project_id: str):
+    """The programme's voice/loudness treatment, plus the catalogues the UI needs."""
+    _p_data, tl = _load_timeline(project_id)
+    return {
+        "audio_master": (tl.audio_master or AudioMaster()).model_dump(),
+        "eq_presets": list(EQ_PRESETS),
+        "reverbs": list(_REVERB_RECIPES),
+        "voice_fx": list(VOICE_FX_RECIPES),
+        "enhance_modes": ["auto", "off", "deepfilter", "rnnoise", "ffmpeg"],
+    }
+
+
+@router.post("/{project_id}/audio_master")
+async def set_audio_master(project_id: str, body: AudioMasterRequest):
+    """Patch the programme's voice/loudness treatment."""
+    p_data, tl = _load_timeline(project_id)
+    tl.audio_master = clip_ops._merged(AudioMaster, tl.audio_master, body.updates)
+    _save_timeline(project_id, p_data, tl)
+    return {"status": "success", "timeline": tl}
 
 
 # --- Dressed previews ------------------------------------------------------
@@ -691,37 +883,73 @@ async def add_media(project_id: str, body: AddMediaRequest):
     # On an empty timeline the first clip becomes the program itself, so a project
     # built purely by dragging media in still renders. Transcribing later rebuilds
     # V1/A1 from the words, which is the documented behaviour of the primary tracks.
+    lane_kind = "A" if kind == "audio" else "V"
     primary = "A1" if kind == "audio" else "V1"
+    if body.track and clip_ops.track_kind(body.track) != lane_kind:
+        raise HTTPException(status_code=400,
+                            detail=f"{kind} media can only go on a {lane_kind} track")
     has_primary = any(i.track == primary for i in tl.items)
-    track = body.track or (primary if not has_primary
-                           else clip_ops.next_track(tl, "A" if kind == "audio" else "V"))
+    track = body.track or (None if has_primary else primary)
     source_end_frame = max(1, time_to_frame(duration, tl.fps_num, tl.fps_den))
+
+    # The first clip of a timeline starts it — there is nothing to play before
+    # it, and V1 renders gapless anyway, so a drop at 0:12 would only mislead.
+    has_media = any(i.kind == "media" for i in tl.items)
+    start = max(0, body.timeline_start_frame) if has_media else 0
+
+    # A transcript-built spine is not a place to drop clips: it is rebuilt from
+    # the words. A drop aimed at it goes on the first free overlay lane instead.
+    if track in ("V1", "A1") and clip_ops.track_has_auto(tl, track):
+        track = None
+    if track == clip_ops.MAIN_TRACK:
+        # Magnetic main track: land on the nearest edit point and push the rest along.
+        start = clip_ops.main_track_insert_frame(tl, start)
+    elif track is None or not clip_ops.track_fits(tl, track, start, start + source_end_frame):
+        # Never stack a clip on top of another on the same lane: take the first
+        # lane (the one aimed at, if it is free) with room for it.
+        track = clip_ops.free_track(tl, lane_kind, start, start + source_end_frame,
+                                    prefer=[track] if track else [])
 
     try:
         item = clip_ops.add_media_item(
             tl,
             source_id=source_id,
             track=track,
-            timeline_start_frame=body.timeline_start_frame,
+            timeline_start_frame=start,
             source_start_frame=0,
             source_end_frame=source_end_frame,
+            origin="manual",
         )
     except clip_ops.ClipOpError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    item.label = src_path.name
+    placed = [item]
 
-    # Video tracks carry picture only, so a clip that becomes the program needs its
-    # sound placed on A1 as well — otherwise dropping a video onto an empty
-    # timeline would render silent.
-    if track == "V1" and kind == "video" and source.has_audio:
-        if not any(i.track == "A1" for i in tl.items):
-            clip_ops.add_media_item(
+    # Video tracks carry picture only, so a video's own sound goes on an audio
+    # lane beside it — linked, so the two move, trim, split and delete as one
+    # clip until the user unlinks them.
+    if kind == "video" and source.has_audio:
+        if track == clip_ops.MAIN_TRACK and clip_ops.a1_follows_v1(tl)                 and clip_ops.track_fits(tl, "A1", item.timeline_start_frame, item.timeline_end_frame):
+            audio_track = "A1"
+        else:
+            twin = f"A{''.join(c for c in track if c.isdigit()) or '2'}"
+            audio_track = clip_ops.free_track(tl, "A", item.timeline_start_frame,
+                                              item.timeline_end_frame, prefer=[twin])
+        try:
+            audio = clip_ops.add_media_item(
                 tl,
                 source_id=source_id,
-                track="A1",
+                track=audio_track,
                 timeline_start_frame=item.timeline_start_frame,
                 source_start_frame=item.source_start_frame,
                 source_end_frame=item.source_end_frame,
+                origin="manual",
             )
+        except clip_ops.ClipOpError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        audio.label = src_path.name
+        item.link_id = audio.link_id = clip_ops.new_link_id()
+        placed.append(audio)
 
     _save_timeline(project_id, p_data, tl)
-    return {"status": "success", "item": item, "timeline": tl}
+    return {"status": "success", "item": item, "item_ids": [p.id for p in placed], "timeline": tl}

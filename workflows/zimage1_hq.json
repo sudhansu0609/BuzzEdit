@@ -1,0 +1,178 @@
+{
+  "64": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    },
+    "_meta": {
+      "title": "VAELoader"
+    }
+  },
+  "65": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "hires",
+        0
+      ],
+      "vae": [
+        "64",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "VAEDecode"
+    }
+  },
+  "66": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "_meta": {
+      "title": "EmptySD3LatentImage"
+    }
+  },
+  "67": {
+    "class_type": "ModelSamplingAuraFlow",
+    "inputs": {
+      "model": [
+        "72",
+        0
+      ],
+      "shift": 3
+    },
+    "_meta": {
+      "title": "ModelSamplingAuraFlow"
+    }
+  },
+  "68": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen_3_4b.safetensors",
+      "type": "lumina2",
+      "device": "default"
+    },
+    "_meta": {
+      "title": "CLIPLoader"
+    }
+  },
+  "69": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "67",
+        0
+      ],
+      "positive": [
+        "70",
+        0
+      ],
+      "negative": [
+        "71",
+        0
+      ],
+      "latent_image": [
+        "66",
+        0
+      ],
+      "seed": 566975184784045,
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "res_multistep",
+      "scheduler": "simple",
+      "denoise": 1
+    },
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "70": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "68",
+        0
+      ],
+      "text": "2D animation illustration, wide angle landscape shot. A young Indian man (Vyom) in modern casual clothes sits hunched on a small concrete bridge over a dry riverbed. Rural Bihar setting, vast yellow mustard fields stretching to the horizon. The sun is a deep orange orb setting behind him. The atmosphere is quiet and golden."
+    },
+    "_meta": {
+      "title": "CLIPTextEncode"
+    }
+  },
+  "71": {
+    "class_type": "ConditioningZeroOut",
+    "inputs": {
+      "conditioning": [
+        "70",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "ConditioningZeroOut"
+    }
+  },
+  "72": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "z_image_turbo_bf16.safetensors",
+      "weight_dtype": "fp8_e4m3fn"
+    },
+    "_meta": {
+      "title": "UNETLoader"
+    }
+  },
+  "9": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "65",
+        0
+      ],
+      "filename_prefix": "z-image-turbo-hq"
+    },
+    "_meta": {
+      "title": "SaveImage"
+    }
+  },
+  "up": {
+    "class_type": "LatentUpscaleBy",
+    "inputs": {
+      "samples": [
+        "69",
+        0
+      ],
+      "upscale_method": "bislerp",
+      "scale_by": 1.5
+    }
+  },
+  "hires": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "67",
+        0
+      ],
+      "positive": [
+        "70",
+        0
+      ],
+      "negative": [
+        "71",
+        0
+      ],
+      "latent_image": [
+        "up",
+        0
+      ],
+      "seed": 566975184784045,
+      "steps": 4,
+      "cfg": 1,
+      "sampler_name": "res_multistep",
+      "scheduler": "simple",
+      "denoise": 0.4
+    }
+  }
+}

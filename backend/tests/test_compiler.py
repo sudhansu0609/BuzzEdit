@@ -68,3 +68,77 @@ def test_every_programme_audio_join_is_declicked():
     _, fc, _, _ = FilterGraphCompiler(tl).compile()
     assert fc.count("afade=t=in:st=0:d=0.008") == 2
     assert fc.count("afade=t=out:st=1.992:d=0.008") == 2
+
+
+def test_overlay_cut_ahead_of_its_slot_gets_a_seeked_input():
+    """The cold open: a hook from deep inside the programme shown at t=0. Cut
+    from the shared decoded stream, the overlay could not produce a frame until
+    the decoder reached the hook, and everything V1 made meanwhile piled up in
+    RAM (gigabytes within a minute) until the memory guardian killed FFmpeg. So
+    a video overlay whose source time runs ahead of its slot decodes from its
+    own `-ss` input. So does one shown LATER than its source time (a replay,
+    every B-roll clip): on the shared stream ffmpeg read it first -- lowest
+    timestamp -- and held every frame until its slot (a real render peaked at
+    14.7 GB). Each seeked input is stamped with its slot via `-itsoffset`."""
+    from backend.timeline.schema import Timeline, SourceFile, TimelineItem
+    from backend.render.compiler import FilterGraphCompiler
+
+    src = SourceFile(id="s", path="C:/m.mp4", duration_seconds=120, width=1920, height=1080)
+    items = [
+        TimelineItem(id="v1", track="V1", source_id="s",
+                     source_start_frame=0, source_end_frame=3000,
+                     timeline_start_frame=0, timeline_end_frame=3000),
+        TimelineItem(id="a1", track="A1", source_id="s",
+                     source_start_frame=0, source_end_frame=3000,
+                     timeline_start_frame=0, timeline_end_frame=3000),
+        # Cold open: source 39.12s-42.16s shown at 0s -- 39s ahead of its slot.
+        TimelineItem(id="hook", track="V2", source_id="s",
+                     source_start_frame=978, source_end_frame=1054,
+                     timeline_start_frame=0, timeline_end_frame=76),
+        # Replay of an earlier moment: source 10s shown at 60s -- behind, fine.
+        TimelineItem(id="replay", track="V2", source_id="s",
+                     source_start_frame=250, source_end_frame=300,
+                     timeline_start_frame=1500, timeline_end_frame=1550),
+    ]
+    tl = Timeline(fps_num=25, fps_den=1, sources={"s": src}, items=items)
+    tl.recalculate_duration()
+
+    inputs, fc, _, _ = FilterGraphCompiler(tl).compile()
+
+    assert inputs[:2] == ["-i", "C:/m.mp4"]
+    assert inputs[2:12] == ["-itsoffset", "0.000", "-ss", "39.120", "-t", "3.140",
+                            "-threads", "1", "-i", "C:/m.mp4"]
+    assert inputs[12:] == ["-itsoffset", "60.000", "-ss", "10.000", "-t", "2.100",
+                           "-threads", "1", "-i", "C:/m.mp4"]
+    assert "[1:v]trim=duration=3.040,setpts=PTS-STARTPTS" in fc
+    assert "[2:v]trim=duration=2.000,setpts=PTS-STARTPTS" in fc
+    assert "trim=start=39.120" not in fc and "trim=start=10.000" not in fc
+
+
+def test_adjustment_copy_is_padded_so_the_base_never_waits_on_it():
+    """An adjustment's treated copy is trimmed to its window. Unpadded, overlay
+    could not pass a single base frame until that copy's first frame existed,
+    so the whole programme before the window sat in RAM. The copy is padded
+    with black from t=0 (never composited: the overlay is disabled there)."""
+    from backend.timeline.schema import Timeline, SourceFile, TimelineItem, Transform
+    from backend.render.compiler import FilterGraphCompiler
+
+    src = SourceFile(id="s", path="C:/m.mp4", duration_seconds=200, width=1920, height=1080)
+    items = [
+        TimelineItem(id="v1", track="V1", source_id="s",
+                     source_start_frame=0, source_end_frame=5000,
+                     timeline_start_frame=0, timeline_end_frame=5000),
+        TimelineItem(id="a1", track="A1", source_id="s",
+                     source_start_frame=0, source_end_frame=5000,
+                     timeline_start_frame=0, timeline_end_frame=5000),
+        TimelineItem(id="punch", kind="adjustment", track="V2",
+                     timeline_start_frame=2723, timeline_end_frame=2746,
+                     transform=Transform(scale=1.1)),
+    ]
+    tl = Timeline(fps_num=25, fps_den=1, sources={"s": src}, items=items)
+    tl.recalculate_duration()
+
+    _, fc, _, _ = FilterGraphCompiler(tl).compile()
+
+    assert "[adjfx_0]setpts=PTS-STARTPTS,tpad=start_mode=add:start_duration=108.920:color=black[adjpad_0]" in fc
+    assert "[adjbase_0][adjpad_0]overlay=x=0:y=0:eof_action=pass:enable='between(t,108.920,109.840)'[adj_0]" in fc

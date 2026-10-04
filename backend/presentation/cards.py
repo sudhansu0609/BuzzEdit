@@ -17,15 +17,27 @@ import logging
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from timeline import clip_ops
+from timeline.presets import TEXT_ZONE_MAX_POS_Y
 from timeline.authoring import clear_generated
 from timeline.schema import Timeline, time_to_frame
 
+from . import genre as genre_mod
 from .models import Beat, PresentationSettings, Program
 
 logger = logging.getLogger("presentation.cards")
 
 CARD_TRACK = "TX"
 CARD_ORIGIN = "card"
+
+# Kinds placed dead centre — exactly where a talking head's face usually sits
+# — so they are the ones the "text_clear_of_face" render check catches. Below
+# this, `_dodge_face` nudges them into the upper or lower band instead,
+# whichever the speaker's face is farther from at that moment.
+FACE_AVOID_KINDS = {"chapter_title", "stat_callout", "definition_card", "quote_card", "end_screen"}
+# Half the face box verify.py checks against (its own FACE_HALF_H), doubled
+# for room to spare rather than a graze.
+_FACE_BAND = 0.32
+_STAT_LABEL_OFFSET = 0.27
 
 ZONES: Dict[str, str] = {
     "chapter_title": "centre",
@@ -46,6 +58,33 @@ SLIDE_MAX_S = 4.0
 MIN_CARD_S = 1.2
 
 # Per-genre restyling of a kind's preset. Sparse on purpose.
+# Which card kinds a genre reaches for on its own: a motivational video wants
+# its quote or its stat to win a shared centre slot over a plain chapter
+# title, true crime wants its case file and its sources to. Blended with
+# `genre_secondary` the same ~65/35 way as genre.py's blended_fx_palette (see
+# `_affinity_boost`), so a vlog+motivational video leans toward motivational's
+# favourites without vlog (which favours nothing in particular) losing out.
+_KIND_AFFINITY: Dict[str, Tuple[str, ...]] = {
+    "motivational": ("quote_card", "stat_callout"),
+    "finance": ("stat_callout", "source_card"),
+    "true_crime": ("case_file", "source_card", "quote_card"),
+    "horror": ("quote_card",),
+    "mystery": ("quote_card", "source_card"),
+    "news": ("source_card", "stat_callout"),
+    "science_education": ("definition_card", "stat_callout", "source_card"),
+    "geopolitics": ("source_card", "stat_callout"),
+    "documentary": ("quote_card", "source_card"),
+    "devotional": ("quote_card",),
+    "health_fitness": ("stat_callout",),
+    "tech": ("stat_callout",),
+}
+# A primary-genre favourite outranks an equal-priority rival outright; a
+# secondary-genre favourite gets the same ~35/65 fraction of that boost that
+# genre.py's own blend gives a secondary genre's names.
+_AFFINITY_PRIMARY_BOOST = 0.20
+_AFFINITY_SECONDARY_BOOST = _AFFINITY_PRIMARY_BOOST * (
+    genre_mod._BLEND_SECONDARY_WEIGHT / genre_mod._BLEND_PRIMARY_WEIGHT)
+
 GENRE_STYLES: Dict[str, Dict[str, Dict[str, object]]] = {
     "horror": {
         "chapter_title": {"font_family": "Georgia", "bold": False, "color": "#D8D0C4",
@@ -86,12 +125,51 @@ def _style_for(kind: str, genre: str) -> Dict[str, object]:
     return dict(GENRE_STYLES.get(genre, {}).get(kind, {}))
 
 
+def _affinity_boost(kind: str, genre: str, genre_secondary: Optional[str]) -> float:
+    """How much `kind` outranks an equal-priority rival for a shared zone
+    slot, given the genre blend — 0.0 when neither genre reaches for it."""
+    if kind in _KIND_AFFINITY.get(genre, ()):
+        return _AFFINITY_PRIMARY_BOOST
+    normalised_secondary = genre_mod.normalise(genre_secondary) if genre_secondary else None
+    if normalised_secondary and normalised_secondary not in ("general", genre_mod.normalise(genre)):
+        if kind in _KIND_AFFINITY.get(normalised_secondary, ()):
+            return _AFFINITY_SECONDARY_BOOST
+    return 0.0
+
+
+def _dodge_face(face_anchors: Optional[Dict[str, Tuple[float, float]]], program: Program,
+                at_s: float) -> Optional[float]:
+    """`pos_y` for a centre card at this moment, or None to leave the preset
+    alone — no anchor for the segment on screen there means nothing to dodge."""
+    if not face_anchors:
+        return None
+    segment = program.segment_at(at_s)
+    anchor = face_anchors.get(segment.item_id) if segment else None
+    if anchor is None:
+        return None
+    # Dodging down stops short of the caption band, with room for a stat's
+    # label under its value (`_STAT_LABEL_OFFSET`).
+    return -_FACE_BAND if anchor[1] >= 0.0 else min(_FACE_BAND, TEXT_ZONE_MAX_POS_Y - _STAT_LABEL_OFFSET + 0.1)
+
+
 def place_cards(timeline: Timeline, beats: Sequence[Beat], program: Program,
                 settings: PresentationSettings, genre: str = "general",
-                popup_windows: Optional[Sequence[Tuple[float, float]]] = None) -> Dict[str, int]:
+                genre_secondary: Optional[str] = None,
+                popup_windows: Optional[Sequence[Tuple[float, float]]] = None,
+                face_anchors: Optional[Dict[str, Tuple[float, float]]] = None) -> Dict[str, int]:
     """Put every text beat on the timeline that can be placed without a clash.
 
     Returns counts per kind. Beats of other kinds are ignored.
+
+    `face_anchors` (segment item id -> (x, y), from facezoom.detect_faces) is
+    optional: with it, a centre-zone card (chapter title, stat, definition,
+    quote, end screen) sharing a moment with a detected face nudges up or down
+    out of its way; without it every card keeps its preset's position exactly
+    as before.
+
+    `genre_secondary`, when given, biases which kind wins a shared zone slot
+    at a tie — see `_KIND_AFFINITY` / `_affinity_boost` — without changing
+    anything else about placement.
     """
     clear_generated(timeline, CARD_ORIGIN)
     cards = [b for b in beats if b.is_text and (b.text or "").strip()]
@@ -107,7 +185,10 @@ def place_cards(timeline: Timeline, beats: Sequence[Beat], program: Program,
         placed["centre"].append((0.0, TITLE_ZONE_S))
     counts: Dict[str, int] = {}
 
-    for beat in sorted(cards, key=lambda b: (b.start_s, -b.priority)):
+    def _sort_key(b: Beat) -> Tuple[float, float]:
+        return b.start_s, -(b.priority + _affinity_boost(b.kind, genre, genre_secondary))
+
+    for beat in sorted(cards, key=_sort_key):
         zone = ZONES.get(beat.kind, "centre")
         duration = max(MIN_CARD_S, beat.duration_s)
         limit = program.duration_s - duration
@@ -118,7 +199,8 @@ def place_cards(timeline: Timeline, beats: Sequence[Beat], program: Program,
             logger.info("Card %s %r skipped: zone %s busy", beat.kind, beat.text, zone)
             continue
         end = start + duration
-        _create(timeline, beat, start, duration, genre, fps_num, fps_den)
+        pos_y = (_dodge_face(face_anchors, program, start) if beat.kind in FACE_AVOID_KINDS else None)
+        _create(timeline, beat, start, duration, genre, fps_num, fps_den, pos_y_override=pos_y)
         placed[zone].append((start, end))
         counts[beat.kind] = counts.get(beat.kind, 0) + 1
         logger.info("Card %s %r at %.1fs", beat.kind, (beat.text or "")[:30], start)
@@ -141,10 +223,13 @@ def _slot(wanted: float, duration: float, busy: List[Tuple[float, float]],
 
 
 def _create(timeline: Timeline, beat: Beat, start_s: float, duration_s: float,
-            genre: str, fps_num: int, fps_den: int) -> None:
+            genre: str, fps_num: int, fps_den: int,
+            pos_y_override: Optional[float] = None) -> None:
     start_frame = time_to_frame(start_s, fps_num, fps_den)
     frames = max(1, time_to_frame(duration_s, fps_num, fps_den))
     style = _style_for(beat.kind, genre)
+    if pos_y_override is not None:
+        style["pos_y"] = pos_y_override
 
     if beat.kind == "stat_callout" and beat.data.get("value") is not None:
         item = clip_ops.add_text_item(timeline, beat.text or "", start_frame, frames,
@@ -158,9 +243,15 @@ def _create(timeline: Timeline, beat: Beat, start_s: float, duration_s: float,
             "seconds": min(1.4, max(0.6, duration_s * 0.4)),
         }
         if beat.subtext:
+            label_style = _style_for("stat_label", genre)
+            if pos_y_override is not None:
+                # Keep the label's usual offset below the value rather than
+                # collapsing both onto the same line (presets:
+                # stat_callout pos_y=-0.05, stat_label pos_y=0.22).
+                label_style["pos_y"] = min(pos_y_override + _STAT_LABEL_OFFSET, TEXT_ZONE_MAX_POS_Y + 0.1)
             label = clip_ops.add_text_item(timeline, beat.subtext, start_frame, frames,
                                            track=CARD_TRACK, preset="stat_label",
-                                           style=_style_for("stat_label", genre))
+                                           style=label_style)
             label.origin = CARD_ORIGIN
             label.label = f"stat label: {beat.subtext[:30]}"
         return

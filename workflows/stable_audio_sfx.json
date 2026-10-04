@@ -1,0 +1,90 @@
+{
+  "1": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "stable-audio-open-1.0.safetensors"
+    },
+    "_meta": {
+      "title": "Load Stable Audio Open Checkpoint"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "t5_base.safetensors",
+      "type": "stable_audio",
+      "device": "default"
+    },
+    "_meta": {
+      "title": "CLIPLoader (T5 base)"
+    }
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": ["2", 0],
+      "text": "fast cinematic air whoosh transition, swipe sound effect"
+    },
+    "_meta": {
+      "title": "Positive Prompt"
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": ["2", 0],
+      "text": ""
+    },
+    "_meta": {
+      "title": "Negative Prompt"
+    }
+  },
+  "5": {
+    "class_type": "EmptyLatentAudio",
+    "inputs": {
+      "seconds": 10.0,
+      "batch_size": 1
+    },
+    "_meta": {
+      "title": "EmptyLatentAudio"
+    }
+  },
+  "6": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["1", 0],
+      "positive": ["3", 0],
+      "negative": ["4", 0],
+      "latent_image": ["5", 0],
+      "seed": 0,
+      "steps": 50,
+      "cfg": 5.0,
+      "sampler_name": "dpmpp_3m_sde",
+      "scheduler": "exponential",
+      "denoise": 1
+    },
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "7": {
+    "class_type": "VAEDecodeAudio",
+    "inputs": {
+      "samples": ["6", 0],
+      "vae": ["1", 2]
+    },
+    "_meta": {
+      "title": "VAEDecodeAudio"
+    }
+  },
+  "8": {
+    "class_type": "SaveAudio",
+    "inputs": {
+      "audio": ["7", 0],
+      "filename_prefix": "buzzedit_audio/sfx"
+    },
+    "_meta": {
+      "title": "SaveAudio"
+    }
+  }
+}
