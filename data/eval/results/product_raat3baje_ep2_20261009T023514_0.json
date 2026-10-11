@@ -1,0 +1,36 @@
+{
+ "result": {
+  "wrongly_removed_s": 176.8,
+  "missed_s": 26.0,
+  "caught_pct": 90.9,
+  "cuts": 183,
+  "wrong_by_reason": {
+   "retake": 141.7,
+   "stutter": 36.7,
+   "filler": 1.6
+  },
+  "recording": "raat3baje_ep2",
+  "run": 0,
+  "mode": "product",
+  "seconds": 422.3,
+  "tokens_in": 382108,
+  "tokens_out": 117460,
+  "usd": 3.878,
+  "reads": 3,
+  "removed_takes": 206,
+  "trims": 241,
+  "kept_by_minority": 19,
+  "style_examples": 8,
+  "untranscribed_cut_s": 4.0,
+  "refused": 2,
+  "repeats_remaining": 0,
+  "false_starts_remaining": 0,
+  "candidates": 32,
+  "verified_removed": 4,
+  "sweep_groups": 84,
+  "final_read_removed": 0,
+  "final_read_restored": 5,
+  "steps_failed": []
+ },
+ "review": []
+}

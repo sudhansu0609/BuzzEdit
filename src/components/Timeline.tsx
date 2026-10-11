@@ -17,6 +17,9 @@ import { useTimelineHistory } from '../hooks/history';
 import { effectiveTransitions } from '../lib/programme';
 import { prettyTransition } from './TransitionsPanel';
 import ContextMenu, { MenuEntry } from './ContextMenu';
+import { useLayoutStore } from '../hooks/layout';
+import { formatTime as formatSeconds } from './audio/Transport';
+import { convertVoiceFromSelection } from '../hooks/voiceApi';
 
 // Build a filled mirrored-waveform SVG path for a source-time slice of peaks.
 function buildWavePath(peaks: number[], pps: number, startSec: number, endSec: number, width: number, height: number): string {
@@ -106,6 +109,18 @@ const SNAP_PX = 8;
 /** Movement (px) before a press on a clip becomes a drag rather than a click. */
 const DRAG_THRESHOLD_PX = 3;
 
+/** The audio range (the Audio panel's `audioSelection`) snaps to 10 ms. */
+const snapRange = (t: number) => Math.round(t * 100) / 100;
+/** How the audio range is made and cleared: on the band's tooltip and the Range button. */
+const RANGE_HELP = 'Make it with Shift+drag on an audio lane or the ruler, with I / O at the playhead, '
+  + 'or switch on Range in the toolbar and drag. Esc, or a click without dragging, clears it.';
+const RANGE_FILL = 'rgba(16,185,129,0.14)';
+const RANGE_EDGE = '1px solid rgba(16,185,129,0.85)';
+const RANGE_LABEL: React.CSSProperties = {
+  position: 'absolute', top: 2, padding: '0 4px', borderRadius: 3, fontSize: 10, lineHeight: '14px',
+  background: 'rgba(6,78,59,0.88)', color: '#d1fae5', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums',
+};
+
 interface TItem {
   id: string;
   track: string;
@@ -185,6 +200,19 @@ interface Marquee {
 }
 
 interface MenuState { x: number; y: number; items: MenuEntry[] }
+
+/** A drag that selects the audio range (Shift, or Range on), from the ruler or an audio lane's empty space. */
+interface RangeDrag {
+  /** Programme seconds under the press, and under the pointer now. */
+  anchor: number;
+  at: number;
+  x0: number;
+  moved: boolean;
+  from: 'ruler' | 'lane';
+  /** A lane press that ends as a click does what a click on empty lane always did. */
+  additive: boolean;
+  track: string | null;
+}
 
 /** Clips copied with Ctrl+C. Kept in memory — clips are not text, so the OS
  *  clipboard is the wrong place — and shared by every timeline in the session. */
@@ -357,7 +385,7 @@ export default function Timeline() {
   const {
     project, updateProject, currentTime, setCurrentTime, selectedClipId, selectedClipIds,
     setSelection, zoom, setZoom, setError, isPlaying,
-    setScrubbing: setStoreScrubbing,
+    setScrubbing: setStoreScrubbing, audioSelection, setAudioSelection,
   } = useProjectStore();
   const { pickFile } = useElectron();
   const clipboardItems = useClipboard((s) => s.items);
@@ -392,6 +420,12 @@ export default function Timeline() {
   const [followMode, setFollowModeState] = useState<FollowMode>(loadFollowMode);
   const [markIn, setMarkIn] = useState<number | null>(null);
   const [markOut, setMarkOut] = useState<number | null>(null);
+  // Range on: a plain drag on the ruler or an audio lane selects the audio range. Off by
+  // default, so a drag keeps scrubbing the ruler and box-selecting on the lanes.
+  const [rangeMode, setRangeMode] = useState(false);
+  const [rangeDrag, setRangeDrag] = useState<RangeDrag | null>(null);
+  const rangeDragRef = useRef<RangeDrag | null>(null);
+  rangeDragRef.current = rangeDrag;
   const programmaticScrollRef = useRef(false);
   const lastManualScrollAtRef = useRef(0);
 
@@ -811,6 +845,84 @@ export default function Timeline() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drag?.id, drag?.mode, projectId]);
 
+  // --- Audio range (AUDIO_SUITE_PLAN.md §2.4) ----------------------------------
+  // The Audio panel's `audioSelection`, in programme seconds: what the ruler shows. Shift+drag
+  // (or a plain drag while Range is on) on the ruler or an audio lane's empty space, or I / O,
+  // make it; Esc or a click without dragging clears it.
+
+  const secondsAtClientX = (clientX: number) => {
+    const rect = lanesRef.current?.getBoundingClientRect();
+    if (!rect) return 0;
+    const end = maxEndFrame > 0 ? maxEndFrame / fps : durationSec;
+    return Math.min(end, Math.max(0, (clientX - rect.left) / pixelsPerSecond));
+  };
+
+  const startRange = (e: React.MouseEvent, from: RangeDrag['from'], track: string | null) => {
+    e.preventDefault();
+    const t = secondsAtClientX(e.clientX);
+    setRangeDrag({
+      anchor: t, at: t, x0: e.clientX, moved: false, from, track,
+      additive: e.ctrlKey || e.metaKey || e.shiftKey,
+    });
+  };
+
+  useEffect(() => {
+    if (!rangeDrag) return;
+    const onMove = (e: MouseEvent) => {
+      const r = rangeDragRef.current;
+      if (!r) return;
+      setRangeDrag({
+        ...r, at: secondsAtClientX(e.clientX),
+        moved: r.moved || Math.abs(e.clientX - r.x0) > DRAG_THRESHOLD_PX,
+      });
+    };
+    const onUp = (e: MouseEvent) => {
+      const r = rangeDragRef.current;
+      setRangeDrag(null);
+      if (!r) return;
+      if (!r.moved) {
+        // A click: no range, plus what a click there always did.
+        setAudioSelection(null);
+        if (r.from === 'ruler') setCurrentTime(r.anchor);
+        else {
+          if (!r.additive) setSelection([]);
+          if (r.track) setSelectedTrack(r.track);
+        }
+        return;
+      }
+      const at = secondsAtClientX(e.clientX);
+      const start = snapRange(Math.min(r.anchor, at));
+      const end = snapRange(Math.max(r.anchor, at));
+      setAudioSelection(end > start ? { start_s: start, end_s: end } : null);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rangeDrag != null]);
+
+  /** I / O: one end of the audio range at the playhead, Premiere-style. The other end is the
+   *  range's own, else the other mark; an end that crosses it leaves no range until it is set. */
+  const setRangeEdge = (edge: 'start' | 'end', t: number) => {
+    const sel = useProjectStore.getState().audioSelection;
+    const other = edge === 'start' ? (sel ? sel.end_s : markOut) : (sel ? sel.start_s : markIn);
+    if (other == null) return;
+    const start = snapRange(edge === 'start' ? t : other);
+    const end = snapRange(edge === 'start' ? other : t);
+    setAudioSelection(end > start ? { start_s: start, end_s: end } : null);
+  };
+
+  const openAudioPanel = () => {
+    useLayoutStore.getState().toggleVisible('audio', true);
+    // Focus it once it is on screen, so Space plays the range there.
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>('.audio-panel')?.focus({ preventScroll: true });
+    });
+  };
+
   // --- Box (marquee) selection on empty lane area ---------------------------
 
   const laneAtY = (clientY: number): string | null => {
@@ -823,6 +935,13 @@ export default function Timeline() {
     if (e.button !== 0) return;
     const rect = lanesRef.current?.getBoundingClientRect();
     if (!rect) return;
+    // Shift (or Range on) on an audio lane's empty space selects the audio range instead.
+    // Presses on clips never get here: their own handlers stop the event.
+    const pressed = laneAtY(e.clientY);
+    if ((e.shiftKey || rangeMode) && pressed && trackKind(pressed) === 'A') {
+      startRange(e, 'lane', pressed);
+      return;
+    }
     e.preventDefault();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
@@ -1230,8 +1349,9 @@ export default function Timeline() {
   };
 
   // --- Mark in/out and cutting the auto-edited spine ---
-  const handleMarkIn = () => setMarkIn(currentTime);
-  const handleMarkOut = () => setMarkOut(currentTime);
+  // I / O also set the audio range's start / end at the playhead.
+  const handleMarkIn = () => { setMarkIn(currentTime); setRangeEdge('start', currentTime); };
+  const handleMarkOut = () => { setMarkOut(currentTime); setRangeEdge('end', currentTime); };
 
   const handleCutRange = async () => {
     if (!projectId || markIn == null || markOut == null) return;
@@ -1261,7 +1381,7 @@ export default function Timeline() {
     'edit.deleteClip': () => handleDelete(false),
     'edit.rippleDelete': () => handleDelete(true),
     'edit.selectAll': () => setSelection(items.map(i => i.id)),
-    'edit.deselectAll': () => setSelection([]),
+    'edit.deselectAll': () => { setSelection([]); setAudioSelection(null); },
     'edit.splitAtPlayhead': handleSplit,
     'edit.markIn': handleMarkIn,
     'edit.markOut': handleMarkOut,
@@ -1318,6 +1438,15 @@ export default function Timeline() {
     setStoreScrubbing(true);
     scrubToClientX(e.clientX);
   }, [scrubToClientX, setStoreScrubbing]);
+
+  /** The ruler scrubs; with Shift (or Range on) a drag on it selects the audio range instead. */
+  const handleRulerMouseDown = (e: React.MouseEvent) => {
+    if (e.button === 0 && (e.shiftKey || rangeMode)) {
+      startRange(e, 'ruler', null);
+      return;
+    }
+    handleScrubStart(e);
+  };
 
   // Continuous scrub while dragging on the ruler / playhead strip.
   useEffect(() => {
@@ -1390,6 +1519,26 @@ export default function Timeline() {
   });
   const sep: MenuEntry = { separator: true };
 
+  /** The audio range's own entries. */
+  const rangeMenu = (): MenuEntry[] => [
+    { label: 'Audio effects on selection…', onClick: openAudioPanel },
+    // A pending voice region over the range (default voice/preset), then the Voice panel's Regions tab.
+    { label: 'Convert voice…', onClick: () => { void convertVoiceFromSelection(); } },
+    { label: 'Clear Audio Range', chord: chordOf('edit.deselectAll'), onClick: () => setAudioSelection(null) },
+  ];
+  /** A right-click inside the audio range on an audio lane: its entries come first. */
+  const rangeEntries = (clientX: number, track: string): MenuEntry[] => {
+    const sel = useProjectStore.getState().audioSelection;
+    if (!sel || trackKind(track) !== 'A') return [];
+    const t = secondsAtClientX(clientX);
+    return t >= sel.start_s && t <= sel.end_s ? [...rangeMenu(), sep] : [];
+  };
+  const openRangeMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenu({ x: e.clientX, y: e.clientY, items: rangeMenu() });
+  };
+
   const openClipMenu = (e: React.MouseEvent, item: TItem) => {
     e.preventDefault();
     e.stopPropagation();
@@ -1417,6 +1566,7 @@ export default function Timeline() {
     const why = isAutoCut(item) ? 'AI-managed clip — edit it from the transcript' : 'Locked';
 
     setMenu({ x: e.clientX, y: e.clientY, items: [
+      ...rangeEntries(e.clientX, item.track),
       cmdEntry('edit.cut', canDelete),
       cmdEntry('edit.copy', all.length > 0),
       cmdEntry('edit.paste', hasClipboard),
@@ -1485,6 +1635,7 @@ export default function Timeline() {
     setSelectedTrack(track);
 
     setMenu({ x: e.clientX, y: e.clientY, items: [
+      ...rangeEntries(e.clientX, track),
       { label: 'Paste Here', chord: chordOf('edit.paste'), disabled: !hasClipboard,
         hint: 'Copy a clip first', onClick: () => handlePaste(false, frame) },
       { label: 'Paste Insert Here', chord: chordOf('edit.pasteInsert'), disabled: !hasClipboard,
@@ -1556,6 +1707,22 @@ export default function Timeline() {
   const laneOf = (item: TItem) =>
     (drag?.moved && drag.mode === 'move' && item.id === drag.id ? drag.previewTrack : item.track);
 
+  // The audio range as drawn: the drag in progress, else the store's.
+  const shownRange = rangeDrag?.moved
+    ? {
+      start_s: snapRange(Math.min(rangeDrag.anchor, rangeDrag.at)),
+      end_s: snapRange(Math.max(rangeDrag.anchor, rangeDrag.at)),
+    }
+    : audioSelection;
+  const rangeSpan = shownRange
+    ? `${formatSeconds(shownRange.start_s)}–${formatSeconds(shownRange.end_s)}` : '';
+  const rangeLength = shownRange ? `${(shownRange.end_s - shownRange.start_s).toFixed(2)} s` : '';
+  const rangeTitle = shownRange
+    ? `Audio range ${rangeSpan} (${rangeLength}, programme time): what the Audio panel loops, analyses `
+      + `and processes. ${RANGE_HELP} Right-click it for Audio effects on selection…`
+    : '';
+  const firstAudioLane = orderedTracks.findIndex(t => trackKind(t) === 'A');
+
   return (
     <div className="timeline-container multitrack">
       <div className="timeline-header" style={{ gap: 8, flexWrap: 'wrap' }}>
@@ -1607,14 +1774,22 @@ export default function Timeline() {
           </button>
         </div>
         <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-          <button className="btn btn-sm" disabled={busy} onClick={handleMarkIn} title="Mark In (I)">⏵| In</button>
-          <button className="btn btn-sm" disabled={busy} onClick={handleMarkOut} title="Mark Out (O)">|⏴ Out</button>
+          <button className="btn btn-sm" disabled={busy} onClick={handleMarkIn}
+            title="Mark In (I): also the start of the audio range">⏵| In</button>
+          <button className="btn btn-sm" disabled={busy} onClick={handleMarkOut}
+            title="Mark Out (O): also the end of the audio range">|⏴ Out</button>
           <button className="btn btn-sm" disabled={busy || markIn == null || markOut == null}
             onClick={handleCutRange} title="Ripple-cut the marked range out of the programme">✂ Cut range</button>
           {!!tl?.manual_cuts?.length && (
             <button className="btn btn-sm" disabled={busy} onClick={handleRestoreCuts}
               title="Undo every ripple cut made on the auto-edited program">↺ Restore cuts</button>
           )}
+          <button className={`btn btn-sm ${rangeMode ? 'btn-toggle-on' : ''}`} onClick={() => setRangeMode(on => !on)}
+            title={rangeMode
+              ? 'Range on: a plain drag on the ruler or an audio lane selects the audio range (the ruler does not scrub and audio lanes do not box-select). Click to switch off.'
+              : `Range off: a drag scrubs the ruler and box-selects on the lanes. Switch on to select the audio range with a plain drag. ${RANGE_HELP}`}>
+            ⇹ Range
+          </button>
         </div>
         {/* What is dressed on the *programme* — not on any one clip, so there is
             nowhere else on the lanes for it to show. Without this, a rain effect
@@ -1719,8 +1894,21 @@ export default function Timeline() {
         <div ref={containerRef} className="timeline-scroll" style={{ flex: 1, overflowX: 'auto', overflowY: 'hidden' }}
           onWheel={handleWheel} onScroll={handleContainerScroll}>
           <div style={{ width: `${trackWidth}px`, position: 'relative' }}>
-            {/* Ruler (click or drag to scrub) */}
-            <div className="timeline-ruler" style={{ height: 22, position: 'relative', cursor: 'ew-resize', background: 'var(--surface-2,#161616)', userSelect: 'none' }} onMouseDown={handleScrubStart}>
+            {/* Ruler (click or drag to scrub; Shift+drag, or a drag with Range on, selects the audio range) */}
+            <div className="timeline-ruler" style={{ height: 22, position: 'relative', cursor: 'ew-resize', background: 'var(--surface-2,#161616)', userSelect: 'none' }} onMouseDown={handleRulerMouseDown}>
+              {/* The audio range's strip on the ruler: its tooltip and right-click menu. A left
+                  press goes on to the ruler; any other button stays here, so a right-click does
+                  not move the playhead. */}
+              {shownRange && (
+                <div className="audio-range-ruler" title={rangeTitle} onContextMenu={openRangeMenu}
+                  onMouseDown={(e) => { if (e.button !== 0) e.stopPropagation(); }}
+                  style={{
+                    position: 'absolute', top: 0, bottom: 0, boxSizing: 'border-box',
+                    left: `${shownRange.start_s * pixelsPerSecond}px`,
+                    width: `${Math.max(1, (shownRange.end_s - shownRange.start_s) * pixelsPerSecond)}px`,
+                    background: 'rgba(16,185,129,0.32)', borderLeft: RANGE_EDGE, borderRight: RANGE_EDGE,
+                  }} />
+              )}
               {getTimeMarkers().map(t => (
                 <div key={t} className="timeline-marker" style={{ left: `${t * pixelsPerSecond}px`, position: 'absolute' }}>
                   <span className="marker-label">{formatTime(t)}</span>
@@ -1728,7 +1916,8 @@ export default function Timeline() {
               ))}
             </div>
 
-            {/* Lanes — press on empty space and drag to box-select */}
+            {/* Lanes — press on empty space and drag to box-select (Shift, or Range on, selects
+                the audio range on an audio lane instead) */}
             <div ref={lanesRef} style={{ position: 'relative' }} onMouseDown={handleLanesMouseDown}>
               {orderedTracks.map(track => {
                 const laneState = trackFlags(track);
@@ -1847,6 +2036,33 @@ export default function Timeline() {
                   width: Math.abs(marquee.x1 - marquee.x0), height: Math.abs(marquee.y1 - marquee.y0),
                 }} />
               )}
+
+              {/* The audio range across the audio lanes, with its start, length and end. It takes
+                  no pointer events, so the clips under it drag and trim as ever; its tooltip and
+                  menu are on its ruler strip, and a right-click inside it on a lane puts its
+                  entries at the top of that lane's or clip's menu. */}
+              {shownRange && (() => {
+                const width = Math.max(1, (shownRange.end_s - shownRange.start_s) * pixelsPerSecond);
+                const audioLanes = firstAudioLane >= 0 ? orderedTracks.length - firstAudioLane : orderedTracks.length;
+                return (
+                  <div className="audio-range-band" style={{
+                    position: 'absolute', zIndex: 4, pointerEvents: 'none', boxSizing: 'border-box',
+                    top: Math.max(0, firstAudioLane) * LANE_HEIGHT, height: audioLanes * LANE_HEIGHT,
+                    left: shownRange.start_s * pixelsPerSecond, width,
+                    background: RANGE_FILL, borderLeft: RANGE_EDGE, borderRight: RANGE_EDGE,
+                  }}>
+                    {width >= 170 ? (
+                      <>
+                        <span style={{ ...RANGE_LABEL, left: 2 }}>{formatSeconds(shownRange.start_s)}</span>
+                        <span style={{ ...RANGE_LABEL, left: '50%', transform: 'translateX(-50%)' }}>{rangeLength}</span>
+                        <span style={{ ...RANGE_LABEL, right: 2 }}>{formatSeconds(shownRange.end_s)}</span>
+                      </>
+                    ) : (
+                      <span style={{ ...RANGE_LABEL, left: '100%', marginLeft: 3 }}>{rangeSpan} · {rangeLength}</span>
+                    )}
+                  </div>
+                );
+              })()}
 
               {/* Playhead — glide smoothly between coarse timeupdate steps
                   during playback; follow the cursor instantly while scrubbing. */}

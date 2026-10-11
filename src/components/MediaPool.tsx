@@ -8,6 +8,8 @@ import {
   getEyeContactSetup, saveEyeContactSetup, startEyeContactPreview,
   MediaEntry, MEDIA_FILTERS, WaveformData, EyeContactJob, EyeContactSetup, EyeContactPreview,
 } from '../hooks/api';
+import ContextMenu, { MenuEntry } from './ContextMenu';
+import { mediaPoolChanged, openVoicePanel } from '../hooks/voiceApi';
 
 export const MEDIA_DND_TYPE = 'application/x-buzzedit-media';
 
@@ -425,6 +427,8 @@ export default function MediaPool() {
   // Eye-contact jobs by media id, while they run on the GPU.
   const [eyeJobs, setEyeJobs] = useState<Record<string, EyeContactJob>>({});
   const [eyeDialog, setEyeDialog] = useState<MediaEntry | null>(null);
+  // Right-click on an audio/video tile: "Convert voice…" (the Voice panel's Convert tab).
+  const [menu, setMenu] = useState<{ x: number; y: number; items: MenuEntry[] } | null>(null);
 
   const projectId = project?.id;
   const fps = (project?.timeline as any)?.fps_num
@@ -443,6 +447,8 @@ export default function MediaPool() {
   }, [projectId]);
 
   useEffect(() => { refresh(); }, [refresh]);
+  // A voice conversion or a microphone upload added an item.
+  useEffect(() => mediaPoolChanged.subscribe((id) => { if (id === projectId) refresh(); }), [projectId, refresh]);
 
   // Audio tiles need their peaks before they can draw anything but an icon.
   const waveReq = useRef<Set<string>>(new Set());
@@ -599,9 +605,9 @@ export default function MediaPool() {
             });
             if (next.status === 'completed') {
               await reloadSources();
-              const r = next.result;
+              const r: (NonNullable<typeof next.result> & { eyes_raised_deg?: number; head_pitch_deg?: number }) | null = next.result;
               setNote(r
-                ? `Eye contact fixed: eyes re-aimed ${r.prompter_offset_deg}° toward the lens (${r.median_shift_px}px), reading sweep ${r.reading_sweep_deg}° calmed, ${Math.round(r.seconds)}s`
+                ? `Eye contact fixed: eyes re-aimed ${r.prompter_offset_deg}° toward the lens (${r.median_shift_px}px)${r.eyes_raised_deg ? `, raised ${r.eyes_raised_deg}° for a head bowed ${r.head_pitch_deg}°` : ''}, reading sweep ${r.reading_sweep_deg}° calmed, ${Math.round(r.seconds)}s`
                 : 'Eye contact fixed');
             } else if (next.status === 'failed') {
               setError(`Eye contact correction failed: ${next.error}`);
@@ -732,6 +738,13 @@ export default function MediaPool() {
               draggable={!entry.missing}
               onDragStart={(e) => onDragStart(e, entry)}
               onDoubleClick={() => handleAddToTimeline(entry)}
+              onContextMenu={(e) => {
+                if (entry.missing || (entry.kind !== 'audio' && entry.kind !== 'video')) return;
+                e.preventDefault();
+                setMenu({ x: e.clientX, y: e.clientY, items: [
+                  { label: 'Convert voice…', onClick: () => openVoicePanel({ tab: 'convert', mediaId: entry.id }) },
+                ] });
+              }}
               className={`media-tile ${entry.missing ? 'missing' : ''}`}
               title={entry.missing
                 ? `Missing: ${entry.path}`
@@ -824,6 +837,7 @@ export default function MediaPool() {
       )}
 
       {dropActive && <div className="media-dropzone">Drop media to add it to the library</div>}
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} />}
       {eyeDialog && projectId && (
         <EyeContactDialog entry={eyeDialog} projectId={projectId}
           onRun={(setup) => handleEyeContact(eyeDialog, setup)}

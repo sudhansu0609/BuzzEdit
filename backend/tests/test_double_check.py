@@ -69,3 +69,7 @@ def test_the_final_read_can_remove_a_survivor_and_restore_a_link():
     assert report.final_read_removed == 1 and report.final_read_restored == 1
     assert sorted(out.removed_words) == [0, 1, 4, 5]              # U1 and U3; U5 back
     assert dc.FINAL_READ in client.seen
+
+
+def test_the_final_read_tells_a_trim_to_take_the_first_copy_of_a_doubled_phrase():
+    assert "FIRST copy" in dc.FINAL_READ_CHUNKED

@@ -70,6 +70,11 @@ def _ledger_held_by_another(port: int, answers_as_buzzedit) -> Optional[str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting BuzzEdit backend...")
+    # The default pool (40) is gone in the first second of opening a 275-entry
+    # library (a thumbnail and two filmstrips per entry, each on a thread), and
+    # every other to_thread call then waits behind it.
+    import anyio
+    anyio.to_thread.current_default_thread_limiter().total_tokens = 96
     # Start the nightly job scheduler here rather than via a router startup
     # event (deprecated in FastAPI, and only worked under the lifespan shim).
     # Imported locally: the routes package is imported further down this module.
@@ -132,6 +137,8 @@ from routes import (
     stock,
     music,
     eyecontact,
+    audio,
+    sfx,
 )
 
 app.include_router(health.router, prefix="/api", tags=["health"])
@@ -152,11 +159,30 @@ app.include_router(presets.router, prefix="/api/presets", tags=["presets"])
 app.include_router(style.router, prefix="/api/style", tags=["style"])
 app.include_router(presentation.router, prefix="/api/presentation", tags=["presentation"])
 app.include_router(music.router, prefix="/api/music", tags=["music"])
+app.include_router(sfx.router, prefix="/api/sfx", tags=["sfx"])
 app.include_router(script.router, prefix="/api/projects", tags=["script"])
 app.include_router(glossary.router, prefix="/api/glossary", tags=["glossary"])
 app.include_router(kept_words.router, prefix="/api/projects", tags=["projects"])
 app.include_router(stock.router, prefix="/api/settings", tags=["stock"])
 app.include_router(eyecontact.router, prefix="/api/eyecontact", tags=["eyecontact"])
+app.include_router(audio.router, prefix="/api/audio", tags=["audio"])
+# Analysis, noise print and the process lane (AUDIO_SUITE_PLAN.md brief A2).
+from routes import audio_process
+app.include_router(audio_process.router, prefix="/api/audio", tags=["audio"])
+# Voice conversion: voices, presets, speaker spans, voice map, the seed-vc worker
+# (VOICE_CHANGER_PLAN.md brief S1).
+from routes import audio_voice
+app.include_router(audio_voice.router, prefix="/api/audio", tags=["audio"])
+# BuzzEdit -> BuzzAnimate (BuzzAnimate docs/ECOSYSTEM_BRIDGE_PLAN.md step E4).
+from routes import buzzanimate
+app.include_router(buzzanimate.router, prefix="/api/buzzanimate", tags=["buzzanimate"])
+# The live audio socket (AUDIO_SUITE_PLAN.md brief L) shares the prefix; the
+# app still starts while that module is not there yet.
+try:
+    from routes import audio_live
+    app.include_router(audio_live.router, prefix="/api/audio", tags=["audio"])
+except ImportError as exc:
+    logger.info("Live audio routes not loaded: %s", exc)
 
 @app.get("/")
 async def root():

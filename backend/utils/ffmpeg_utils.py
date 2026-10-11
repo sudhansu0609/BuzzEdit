@@ -41,8 +41,12 @@ def run_ffprobe(path: str, stream: Optional[str] = None) -> dict:
         cmd.extend(["-select_streams", stream])
     cmd.append(path)
 
+    # ffprobe writes UTF-8 (tags, file names). Without an explicit encoding
+    # Windows decodes the pipe as cp1252 and a tag byte such as 0x8d kills the
+    # reader thread, so the JSON came back empty and the file's duration read
+    # as 0 (every such file was then invisible to the sound-effects library).
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
-                            creationflags=NO_WINDOW)
+                            encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
     if result.returncode != 0:
         raise FFmpegError(f"FFprobe failed: {result.stderr}")
     return json.loads(result.stdout)

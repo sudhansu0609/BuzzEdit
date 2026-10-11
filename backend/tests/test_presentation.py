@@ -179,11 +179,18 @@ async def test_a_long_topic_becomes_many_short_shots_near_the_target():
     """A long story must fill its coverage budget with many distinct short images,
     not one long still. The slices tile into image+gap cells so placement keeps
     them all, landing near the coverage target instead of ~40%."""
+    import re
     from presentation.shotplan import multiply_beats, budget_beats
     program = _program(count=200)                       # ~80s programme
     settings = PresentationSettings()
     beat = _beat(start_s=0.0, end_s=program.duration_s, topic="the whole story")
-    multiplied = await multiply_beats([beat], settings, ask=None)   # no LLM: deterministic
+
+    async def ask(system, user, schema=None):
+        # One different subject per slot, as VARIATION_SYSTEM asks for.
+        count = int(re.search(r"N: (\d+)", user).group(1))
+        return json.dumps({"prompts": [f"subject number {i} of the story" for i in range(count)]})
+
+    multiplied = await multiply_beats([beat], settings, ask)
     kept, _ = budget_beats(multiplied, program, settings)
     covered = sum(b.planned_duration_s or 0 for b in kept)
     assert len(kept) >= 8                               # many images, not one still
@@ -338,14 +345,14 @@ async def test_an_explicit_genre_setting_wins_without_asking_the_model():
 # --- Stage B: the video share ----------------------------------------------
 
 def _kept_beats(n=10, video=()):
-    """n budgeted 2.5s cutaways with descending priority, some already video."""
+    """n budgeted 5s cutaways (a clip's minimum) with descending priority, some already video."""
     beats = []
     for i in range(n):
         beats.append(_beat(
-            start_s=i * 4.0, end_s=i * 4.0 + 2.5,
+            start_s=i * 8.0, end_s=i * 8.0 + 5.0,
             topic=f"topic {i}", priority=1.0 - i * 0.05,
             kind="broll_video" if i in video else "broll_image",
-            planned_duration_s=2.5,
+            planned_duration_s=5.0,
             image_prompt=f"a photograph of topic {i}"))
     return beats
 
@@ -354,7 +361,7 @@ def test_the_most_important_beats_get_video_at_the_asked_share():
     from presentation.shotplan import balance_video_share
     out = balance_video_share(_kept_beats(10), PresentationSettings())
     videos = [b for b in out if b.kind == "broll_video"]
-    # 18% of 25s is 4.5s: exactly the two highest-priority beats at 2.5s each.
+    # 18% of 50s is 9s: exactly the two highest-priority beats at 5s each.
     assert [b.topic for b in videos] == ["topic 0", "topic 1"]
     assert all(b.video_prompt for b in videos), "a promoted beat needs a motion prompt"
 
@@ -616,6 +623,38 @@ def test_a_still_gets_a_ken_burns_move_and_a_clip_does_not(tmp_path):
                     key=lambda i: i.timeline_start_frame)
     assert placed[0].transform is not None and placed[0].transform.is_animated()
     assert placed[1].transform is None
+
+
+def test_a_clip_without_five_seconds_of_room_shows_its_still(tmp_path):
+    """A video beat never ends up showing nothing: when its slot cannot hold the
+    5 s a clip needs, the still the clip was made from takes it, with its move."""
+    timeline = _timeline(count=200)
+    program = build_program(timeline)
+    beat = _beat(start_s=10.0, end_s=14.0, kind="broll_video", planned_duration_s=3.0,
+                 video_prompt="mist drifting through a forest")
+    beat.id = "b00"
+    still = _asset("b00", tmp_path)
+    (tmp_path / "b00.mp4").write_bytes(b"not really an mp4")
+    clip = Asset(beat_id="b00", kind="video", path=str(tmp_path / "b00.mp4"), width=1920,
+                 height=1080, duration_s=5.06, still_path=still.path)
+    rejected = []
+    assert place_broll(timeline, [beat], [clip], program, PresentationSettings(),
+                       rejected=rejected) == 1
+    placed = [i for i in timeline.items if i.origin == BROLL_ORIGIN]
+    assert len(placed) == 1
+    source = timeline.sources[placed[0].source_id]
+    assert source.path == still.path and source.kind == "image"
+    assert placed[0].transform is not None and placed[0].transform.is_animated()
+    assert rejected == [{"beat": "b00", "topic": beat.topic,
+                         "reason": "clip needed 5 s; its still was placed"}]
+
+    # No still to fall back on: the beat stays unplaced, and says why.
+    timeline = _timeline(count=200)
+    rejected = []
+    bare = clip.model_copy(update={"still_path": None})
+    assert place_broll(timeline, [beat], [bare], program, PresentationSettings(),
+                       rejected=rejected) == 0
+    assert rejected[0]["reason"] == "a clip needs 5 s; no room"
 
 
 def test_a_second_run_replaces_the_first_rather_than_stacking(tmp_path):
@@ -1356,3 +1395,87 @@ async def test_only_stills_of_the_lead_get_the_face_and_a_missing_reactor_swaps_
                                        stats=stats, character=_lead())
     assert not any("bz_face_swap" in g for g in graphs)
     assert "not installed" in stats["character"]["skipped_reason"]
+
+
+def test_a_reworded_prompt_reuses_the_picture_already_made(tmp_path):
+    """A re-cut re-plans every shot and the planner rewords every prompt, so the exact-key
+    cache missed all 205 of them (2026-10-08) although most differed by a few words. The
+    closest earlier asset of the same kind, workflow and size stands in when the prompts
+    share 70% of their words; a clip only when it is long enough for the beat."""
+    import json
+    from presentation.assets import _near_cached, _sidecar_cache
+
+    d = tmp_path / "generated"
+    d.mkdir()
+    old = "Dark misty forest clearing at night, blurred distorted shapes of trees in heavy fog, unsettling stillness"
+    (d / "aaaa.png").write_bytes(b"png")
+    (d / "aaaa.json").write_text(json.dumps({"beat_id": "b213", "kind": "broll_image", "workflow": "zimage1.json",
+                                             "positive": old, "negative": "", "seed": 1, "width": 1584, "height": 896}))
+    (d / "bbbb.png").write_bytes(b"png")
+    (d / "bbbb.json").write_text(json.dumps({"beat_id": "b007", "kind": "broll_image", "workflow": "zimage1.json",
+                                             "positive": "A warm amber studio, a man speaking softly to the camera",
+                                             "negative": "", "seed": 1, "width": 1584, "height": 896}))
+    _sidecar_cache.clear()
+    reworded = "Dark misty forest clearing at night, blurred distorted tree shapes in thick fog, an unsettling stillness"
+    hit = _near_cached(d, False, "zimage1.json", reworded, 1584, 896, 0.7)
+    assert hit is not None and hit[0].name == "aaaa.png" and hit[2] == "b213" and hit[1] >= 0.7
+    assert _near_cached(d, False, "zimage1.json", reworded, 1024, 576, 0.7) is None       # another size
+    assert _near_cached(d, False, "other.json", reworded, 1584, 896, 0.7) is None         # another workflow
+    assert _near_cached(d, True, "zimage1.json", reworded, 1584, 896, 0.7) is None        # wants a clip
+    assert _near_cached(d, False, "zimage1.json", "a city street in the rain at dawn", 1584, 896, 0.7) is None
+    assert _near_cached(d, False, "zimage1.json", reworded, 1584, 896, 0.0) is None       # 0 turns it off
+
+
+@pytest.mark.asyncio
+async def test_one_asset_serves_one_beat_and_prompt_drift_is_reported(tmp_path, monkeypatch):
+    """Two beats whose prompts are nearly the same get a picture each: a near match
+    already on screen for another beat is passed over (ep2 reused assets across 205
+    beats). Words in most prompts are reported as drift."""
+    queue = _FakeComfyQueue(script=["ok"])
+    assets_stage = _wire_assets(monkeypatch, tmp_path, queue)
+    prompt = "a forest ranger kneels beside fresh tyre marks on a muddy jeep track at dawn"
+    beats = [_beat(id="b00", topic="tracks", image_prompt=prompt, start_s=5.0, end_s=11.0),
+             _beat(id="b01", topic="tracks again", image_prompt=prompt + ", rain", start_s=20.0, end_s=26.0)]
+    stats = {}
+
+    generated, failures = await assets_stage.generate_assets(
+        beats, tmp_path, PresentationSettings(), stats=stats)
+
+    assert failures == []
+    assert queue.submissions == 2, "the second beat is made, not handed the first one's picture"
+    assert len({a.path for a in generated}) == 2
+    assert stats["prompt_drift"]["ranger"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_a_still_promoted_by_the_live_share_is_planned_five_seconds_and_keeps_its_still(
+        tmp_path, monkeypatch):
+    """A still the creator's raised video share promotes mid-run becomes a clip
+    planned at 5 s or more, and the clip keeps the still it started from."""
+    from presentation import assets as assets_stage_mod
+    from presentation import live
+    queue = _video_queue(assets_stage_mod, tmp_path)
+    assets_stage = _wire_assets(monkeypatch, tmp_path, queue)
+    monkeypatch.setattr(assets_stage.workflows, "resolve",
+                        lambda role: {"broll_image": _fake_image_workflow(),
+                                      "broll_video": _i2v_workflow()}.get(role))
+    monkeypatch.setattr(assets_stage, "_probe", lambda path: (1920, 1080, 5.06))
+    seen = []
+    real_generate = assets_stage._generate_one
+
+    async def spy(beat, *args, **kwargs):
+        seen.append((beat.kind, beat.planned_duration_s))
+        return await real_generate(beat, *args, **kwargs)
+
+    monkeypatch.setattr(assets_stage, "_generate_one", spy)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    live.write(project_dir, {"video_broll_share": 1.0})
+    beats = [_beat(id="b00", topic="still", start_s=5.0, end_s=11.0, planned_duration_s=3.0)]
+
+    generated, failures = await assets_stage.generate_assets(beats, project_dir, PresentationSettings())
+
+    assert failures == []
+    assert ("broll_video", 5.0) in seen, "the promoted clip is planned 5 s"
+    assert [(a.beat_id, a.kind) for a in generated] == [("b00", "video")]
+    assert generated[0].still_path and generated[0].still_path.endswith(".png")

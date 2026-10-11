@@ -322,3 +322,47 @@ async def audio_preview(project_id: str, body: AudioPreviewRequest):
 
     return {"path": str(output_path), "preset": body.preset, "start_s": start_s,
             "seconds": seconds}
+
+
+# --------------------------------------------------------------- live settings
+#
+# The mid-production change: the creator moves the mix sliders while a pass
+# is generating, BuzzcafStudio PUTs the new numbers here, and the running
+# pass reads them back before each clip and before placement
+# (presentation/live.py). Nothing is restarted.
+
+class LiveSettingsRequest(BaseModel):
+    target_coverage: Optional[float] = None
+    video_broll_share: Optional[float] = None
+    image_broll_share: Optional[float] = None
+    broll_seconds_min: Optional[float] = None
+    broll_seconds_max: Optional[float] = None
+
+
+@router.get("/{project_id}/live_settings")
+async def get_live_settings(project_id: str):
+    from presentation import live
+    project_dir = PROJECTS_DIR / project_id
+    return {"project_id": project_id, "live_settings": live.read(project_dir)}
+
+
+@router.put("/{project_id}/live_settings")
+async def put_live_settings(project_id: str, body: LiveSettingsRequest):
+    """Store the settings the running pass should switch to. Validated like a
+    PresentationSettings (shares 0..1, cutaway seconds 1..8)."""
+    from presentation import live
+    overrides = {k: v for k, v in body.model_dump().items() if v is not None}
+    if overrides:
+        try:
+            PresentationSettings(**overrides)
+        except Exception as exc:  # noqa: BLE001 - pydantic's message is the useful part
+            raise HTTPException(status_code=400, detail=f"Invalid live settings: {exc}")
+    stored = live.write(PROJECTS_DIR / project_id, overrides)
+    return {"project_id": project_id, "live_settings": stored}
+
+
+@router.delete("/{project_id}/live_settings")
+async def delete_live_settings(project_id: str):
+    from presentation import live
+    live.clear(PROJECTS_DIR / project_id)
+    return {"project_id": project_id, "live_settings": {}}

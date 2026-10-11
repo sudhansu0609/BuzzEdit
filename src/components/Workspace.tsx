@@ -11,6 +11,8 @@ import MediaPool from './MediaPool';
 import InspectorPanel from './InspectorPanel';
 import EffectsPanel from './EffectsPanel';
 import TransitionsPanel from './TransitionsPanel';
+import AudioPanel from './AudioPanel';
+import VoicePanel from './VoicePanel';
 import LlmIndicator from './LlmIndicator';
 import RenderCompleteModal, { RenderResult } from './RenderCompleteModal';
 import DockLayout from './DockLayout';
@@ -246,6 +248,8 @@ export default function Workspace() {
         inspector: <div className="side-panel docked"><div className="panel-content"><InspectorPanel /></div></div>,
         effects: <div className="side-panel docked"><div className="panel-content"><EffectsPanel /></div></div>,
         transitions: <div className="side-panel docked"><div className="panel-content"><TransitionsPanel /></div></div>,
+        audio: <div className="side-panel docked"><div className="panel-content"><AudioPanel /></div></div>,
+        voice: <div className="side-panel docked"><div className="panel-content"><VoicePanel /></div></div>,
         agents: <div className="side-panel docked"><div className="panel-content"><AgentPanel /></div></div>,
         queue: <div className="side-panel docked"><div className="panel-content"><JobQueue /></div></div>,
         export: <div className="side-panel docked"><div className="panel-content"><ExportSettings /></div></div>,

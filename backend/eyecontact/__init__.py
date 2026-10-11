@@ -173,6 +173,10 @@ def correct_eye_contact(src: str, dst: Optional[str] = None, settings: Settings 
         "prompter_offset_deg": round(plan["offset_deg"], 1),
         "symmetry_offset_deg": round(plan["symmetry_offset_deg"], 1),
         "reading_sweep_deg": round(plan["sweep_deg"], 1),
+        # The head's bow while reading (+ = facing below the lens) and how far the gaze was
+        # raised (+) or lowered (-) to meet it; the warp caps the raise at MAX_PITCH_DEG.
+        "head_pitch_deg": round(float(plan.get("head_pitch_deg", 0.0)), 1),
+        "eyes_raised_deg": round(-float(plan.get("vertical_deg", 0.0)), 1),
         "median_shift_px": round(float(np.median(np.abs(plan["corr"][moved]))) * w, 2) if moved.any() else 0.0,
         # What each eye actually moved (per_eye_limits); median_shift_px is the shared push before it.
         "median_shift_px_per_eye": {k: round(float(np.median(np.abs(plan["corr_e"][k][moved]))) * w, 2)

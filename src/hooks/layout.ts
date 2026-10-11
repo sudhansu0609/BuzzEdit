@@ -21,7 +21,7 @@ import { create } from 'zustand';
 export type PanelId =
   | 'preview' | 'media' | 'transcript' | 'inspector'
   | 'effects' | 'transitions'
-  | 'timeline' | 'agents' | 'queue' | 'export';
+  | 'timeline' | 'agents' | 'queue' | 'export' | 'audio' | 'voice';
 export type DockZone = 'center' | 'left' | 'right' | 'bottom';
 export type PanelPlacement = DockZone | 'floating';
 
@@ -58,6 +58,8 @@ export const PANEL_TITLES: Record<PanelId, string> = {
   agents: 'AI Agents',
   queue: 'Nightly Queue',
   export: 'Export',
+  audio: 'Audio',
+  voice: 'Voice',
 };
 
 /** Short labels for the tab strip, where space is tight. */
@@ -72,6 +74,8 @@ export const PANEL_TABS: Record<PanelId, string> = {
   agents: 'Agents',
   queue: 'Queue',
   export: 'Export',
+  audio: 'Audio',
+  voice: 'Voice',
 };
 
 const MIN_ZONE = 180;
@@ -119,6 +123,12 @@ function makePanels(overrides: Partial<Record<PanelId, Partial<PanelConfig>>> = 
     agents: { placement: 'right', visible: true, rect: defaultRect(7) },
     queue: { placement: 'right', visible: false, rect: defaultRect(8) },
     export: { placement: 'right', visible: true, rect: defaultRect(9) },
+    // Opened from the Inspector's Audio section or the Layout menu. Floating and wide, so the
+    // timeline stays in view while the rack is played and tuned.
+    audio: { placement: 'floating', visible: false, rect: { x: 180, y: 90, width: 900, height: 600 } },
+    // The voice changer (VOICE_CHANGER_PLAN.md): opened from the timeline range's "Convert
+    // voice…", the media pool's "Convert voice…" or the Layout menu. Floating, like Audio.
+    voice: { placement: 'floating', visible: false, rect: { x: 220, y: 110, width: 860, height: 620 } },
   };
   (Object.keys(overrides) as PanelId[]).forEach((id) => {
     base[id] = { ...base[id], ...overrides[id] };

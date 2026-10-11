@@ -262,27 +262,37 @@ def test_converted_landmark_net_runs():
     assert out[1].shape == (1, 1)
 
 
-def test_each_eye_stops_at_its_own_lens_position():
+def test_each_eye_is_balanced_and_bounded_past_its_own_lens_position():
     """The lazy-eye bug (Raat3Baje, 2026-10-03): both irises got the same push, but the two eyes
     rest differently in their openings (here -0.07 and +0.09 eye widths when looking into the
-    lens), so an overshoot carried the off-centre eye into its corner. Each eye now stops where
-    it sits in the frames where the speaker really looked into the camera."""
-    from eyecontact.plan import LENS_MARGIN, per_eye_limits
+    lens). Each eye is pushed by the shared amount plus the extra travel its own lens asks for,
+    and no further than `past_lens_deg` beyond its camera-look position. A push within that
+    margin is honoured in full (2026-10-08: stopping AT the measured position threw the aim
+    away, since the measurement under-reads the lens)."""
+    from eyecontact.plan import EYE_WIDTHS_PER_DEGREE, per_eye_limits
     n = 400
     cam = np.zeros(n, bool)
     cam[:100] = True                                   # an intro looking into the lens
     s_e = {"R": np.where(cam, -0.07, -0.044), "L": np.where(cam, 0.086, 0.112)}
-    corr = np.where(cam, 0.0, -0.061)                  # the shared push: overshoots both eyes
+    corr = np.where(cam, 0.0, -0.061)                  # the shared push: 0.035 past both lenses
     weight = np.where(cam, 0.0, 1.0)
     gaze = (s_e["R"] + s_e["L"]) / 2
-    corr_e, lens_e = per_eye_limits(corr, s_e, np.ones(n, bool), weight, gaze, gaze.copy(), FPS,
-                                    Settings(tv_lambda=0.0))
+    settings = Settings(tv_lambda=0.0, past_lens_deg=12.0)
+    corr_e, lens_e = per_eye_limits(corr, s_e, np.ones(n, bool), weight, gaze, gaze.copy(), FPS, settings)
     assert lens_e == pytest.approx({"R": -0.07, "L": 0.086})
+    for k in "RL":                                      # both eyes rest 0.026 from their lens: no extra travel
+        assert np.allclose(corr_e[k][~cam], -0.061, atol=1e-6)
+    margin = 12.0 * EYE_WIDTHS_PER_DEGREE
+    big = np.where(cam, 0.0, -0.2)                      # far past both lenses
+    corr_e, _ = per_eye_limits(big, s_e, np.ones(n, bool), weight, gaze, gaze.copy(), FPS, settings)
     for k in "RL":
         landed = s_e[k][~cam] + corr_e[k][~cam]
-        assert np.all(landed >= lens_e[k] - LENS_MARGIN - 1e-9)        # never past its lens position
-        assert np.all(np.abs(corr_e[k]) <= np.abs(corr) + 1e-12)        # only ever a smaller push
-    assert np.median(corr_e["R"][~cam]) == pytest.approx(np.median(corr_e["L"][~cam]), abs=0.005)
+        assert np.allclose(landed, lens_e[k] - margin, atol=1e-6)    # bounded, equally, past its lens
+        assert np.all(np.abs(corr_e[k]) <= np.abs(big) + 1e-12)
+    # One eye whose lens sits further along than its reading place asks for: it travels more.
+    s_e2 = {"R": np.where(cam, -0.10, -0.044), "L": np.where(cam, 0.086, 0.112)}
+    corr_e, _ = per_eye_limits(corr, s_e2, np.ones(n, bool), weight, gaze, gaze.copy(), FPS, settings)
+    assert np.median(corr_e["R"][~cam]) < np.median(corr_e["L"][~cam]) - 0.01
 
 
 def test_without_camera_looks_the_shared_push_stands():
@@ -299,16 +309,16 @@ def test_a_short_clip_uses_the_whole_recordings_lens_positions():
     """A 30 s preview rarely holds 2 s of camera looks, so on its own it fell back to the shared
     push and showed the old over-pushed eyes; given the whole recording's lens positions, the
     same clip stops each eye at its own."""
-    from eyecontact.plan import LENS_MARGIN, per_eye_limits
+    from eyecontact.plan import EYE_WIDTHS_PER_DEGREE, per_eye_limits
     n = 200
-    corr = np.full(n, -0.061)
+    corr = np.full(n, -0.2)
     s_e = {"R": np.full(n, -0.044), "L": np.full(n, 0.112)}
     known = {"R": -0.07, "L": 0.086}
     corr_e, lens_e = per_eye_limits(corr, s_e, np.ones(n, bool), np.ones(n), np.zeros(n), np.zeros(n),
-                                    FPS, Settings(tv_lambda=0.0), known)
+                                    FPS, Settings(tv_lambda=0.0, past_lens_deg=12.0), known)
     assert lens_e == known
     for k in "RL":
-        assert np.all(s_e[k] + corr_e[k] >= known[k] - LENS_MARGIN - 1e-9)
+        assert np.allclose(s_e[k] + corr_e[k], known[k] - 12.0 * EYE_WIDTHS_PER_DEGREE, atol=1e-6)
         assert np.all(np.abs(corr_e[k]) < np.abs(corr))
 
 
@@ -340,15 +350,57 @@ def test_vertical_shift_never_folds_and_is_clamped():
             assert np.all(np.diff(ys + dy) > 0)
 
 
+def _bow(pts, dz, frames=None):
+    """The same faces with the chin `dz` further from the camera than the forehead: a head
+    pitched down by about atan(dz / 300) (300 is the synthetic forehead-to-chin height)."""
+    out = np.array(pts, copy=True)
+    rows = slice(None) if frames is None else frames
+    out[rows, COL[152], 2] = dz
+    return out
+
+
+def test_a_bowed_head_raises_the_reading_gaze_toward_the_lens():
+    """Reading a prompter below the lens: the head bows and the eyes stay neutral in it, so
+    the gaze sits below the lens by the bow however far the irises go sideways. The plan
+    raises it by that angle (2026-10-08). Off, and the eyes only move sideways."""
+    pts, gaze, blinks = _reading()
+    bowed = _bow(pts, 50.0)                        # ~9.5 degrees down
+    plan = make_plan(bowed, np.ones(len(pts)), FPS, Settings(prompter_side="left"))
+    reading = plan["weight"] > 0.5
+    assert 8.5 <= plan["head_pitch_deg"] <= 10.5
+    raised = -np.median(plan["corr_t"][reading]) / EYE_WIDTHS_PER_DEGREE
+    assert 8.0 <= raised <= 10.5                   # up, by the bow (capped at 10)
+    assert plan["vertical_deg"] <= -8.0
+    flat = make_plan(bowed, np.ones(len(pts)), FPS, Settings(prompter_side="left", auto_pitch=False))
+    assert np.abs(flat["corr_t"]).max() < 1e-9
+    nudged = make_plan(bowed, np.ones(len(pts)), FPS, Settings(prompter_side="left", pitch_deg=3.0))
+    assert np.median(nudged["corr_t"][reading]) > np.median(plan["corr_t"][reading])   # the nudge lowers it
+
+
+def test_a_head_dropped_far_below_its_reading_pitch_is_left_alone():
+    """Looking down at notes between takes is neither reading nor a camera look: no push,
+    no vertical lift, and never a frame the per-eye lens positions are measured from."""
+    pts, gaze, blinks = _reading(seconds=30)
+    drop = slice(int(10 * FPS), int(14 * FPS))
+    pts = _bow(pts, 50.0)
+    pts = _bow(pts, 220.0, drop)                   # ~36 degrees down for 4 s
+    plan = make_plan(pts, np.ones(len(pts)), FPS, Settings(prompter_side="left"))
+    inner = slice(int(11 * FPS), int(13 * FPS))
+    assert plan["weight"][inner].max() < 0.05
+    assert np.abs(plan["corr"][inner]).max() < 1e-3 and np.abs(plan["corr_t"][inner]).max() < 1e-3
+    before = slice(int(4 * FPS), int(8 * FPS))
+    assert np.median(plan["weight"][before]) > 0.9
+
+
 def test_pitch_moves_only_the_reaimed_frames():
     from eyecontact.plan import EYE_WIDTHS_PER_DEGREE, vertical_shift
     weight = np.array([0.0, 0.5, 1.0, 1.0])
     valid = np.array([True, True, True, False])
-    assert not vertical_shift(Settings(), weight, valid).any()
-    v = vertical_shift(Settings(pitch_deg=2.0), weight, valid)
+    assert not vertical_shift(Settings(), weight, valid)[0].any()
+    v, _deg = vertical_shift(Settings(pitch_deg=2.0), weight, valid)
     assert v[0] == 0 and v[3] == 0                            # a camera look and a lost face stay
     assert v[2] == pytest.approx(2.0 * EYE_WIDTHS_PER_DEGREE, rel=1e-3) and v[1] == pytest.approx(v[2] / 2)
-    assert vertical_shift(Settings(pitch_deg=-2.0), weight, valid)[2] < 0
+    assert vertical_shift(Settings(pitch_deg=-2.0), weight, valid)[0][2] < 0
 
 
 def test_plan_carries_the_vertical_shift():

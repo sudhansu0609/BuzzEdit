@@ -1,14 +1,16 @@
 import asyncio
+import subprocess
 import uuid
 import shutil
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from models import Project
-from config import PROJECTS_DIR
-from utils.ffmpeg_utils import get_video_info
+from config import FFMPEG_BIN, PROJECTS_DIR
+from utils.ffmpeg_utils import FFmpegError, get_video_info
+from utils.proc import NO_WINDOW
 from store import media_pool
 from store.project_store import ProjectStore
 from store.app_settings import app_settings
@@ -37,6 +39,16 @@ class MediaRelinkRequest(BaseModel):
 
 def _load(project_id: str) -> Dict[str, Any]:
     p_data = project_store.get_project(project_id)
+    if not p_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return p_data
+
+
+async def _load_readonly(project_id: str) -> Dict[str, Any]:
+    """`_load` for routes that only read: parsed once per saved version, and
+    off the event loop, so a burst of library requests cannot stall the
+    responses everything else is waiting on (the preview's video stream)."""
+    p_data = await asyncio.to_thread(project_store.get_project_readonly, project_id)
     if not p_data:
         raise HTTPException(status_code=404, detail="Project not found")
     return p_data
@@ -192,10 +204,115 @@ async def import_media(project_id: str, body: MediaImportRequest):
     }
 
 
+MAX_UPLOAD_BYTES = 2 * 1024 ** 3  # 2 GiB
+
+_UPLOAD_CONTENT_TYPE_EXT = {
+    "audio/webm": ".webm", "video/webm": ".webm",
+    "audio/ogg": ".ogg", "video/ogg": ".ogv",
+    "audio/wav": ".wav", "audio/x-wav": ".wav",
+    "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "video/mp4": ".mp4",
+}
+
+
+def _upload_suffix(filename: Optional[str], content_type: Optional[str]) -> str:
+    """A MediaRecorder blob names itself (`recording.webm`); fall back to the
+    multipart content type only when the browser sent no filename at all."""
+    suffix = Path(filename or "").suffix.lower()
+    if suffix:
+        return suffix
+    return _UPLOAD_CONTENT_TYPE_EXT.get((content_type or "").split(";")[0].strip().lower(), ".bin")
+
+
+@router.post("/{project_id}/media/upload")
+async def upload_media(project_id: str, file: UploadFile = File(...),
+                       name: Optional[str] = Form(None)):
+    """Add a browser microphone recording (or any audio/video file) to the library.
+
+    A MediaRecorder blob arrives as `audio/webm` or `audio/ogg`. Anything audio
+    that is not already WAV is transcoded to 48 kHz 16-bit WAV so it mixes
+    cleanly with the rest of the project; video is stored untouched.
+    """
+    p_data = _load(project_id)
+    pool: List[dict] = p_data.get("media_pool", [])
+
+    display_name = (name or file.filename or "recording").strip() or "recording"
+    media_id = f"media_{uuid.uuid4().hex[:8]}"
+    staged = PROJECTS_DIR / f"{project_id}_{media_id}{_upload_suffix(file.filename, file.content_type)}"
+
+    size = 0
+    try:
+        with open(staged, "wb") as out:
+            while True:
+                chunk = await file.read(1 << 20)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="File exceeds the 2 GB upload limit")
+                out.write(chunk)
+    except HTTPException:
+        staged.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+
+    if size == 0:
+        staged.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="Uploaded file is empty")
+
+    try:
+        info = await asyncio.to_thread(get_video_info, str(staged))
+    except FFmpegError as exc:
+        staged.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Unreadable media file: {exc}")
+
+    has_video = info.get("video_codec", "none") != "none"
+    if not has_video and info.get("audio_codec", "none") == "none":
+        staged.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="File has no audio or video stream ffmpeg can read")
+
+    final_path = staged
+    if not has_video and staged.suffix.lower() != ".wav":
+        wav_path = PROJECTS_DIR / f"{project_id}_{media_id}.wav"
+        cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", str(staged),
+               "-vn", "-ar", "48000", "-c:a", "pcm_s16le", str(wav_path)]
+        result = await asyncio.to_thread(
+            subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=120, creationflags=NO_WINDOW)
+        if result.returncode != 0 or not wav_path.exists() or wav_path.stat().st_size == 0:
+            staged.unlink(missing_ok=True)
+            wav_path.unlink(missing_ok=True)
+            err = (result.stderr or b"").decode("utf-8", "replace")[-500:]
+            raise HTTPException(status_code=400, detail=f"Could not transcode audio: {err}")
+        staged.unlink(missing_ok=True)
+        final_path = wav_path
+
+    added, skipped = await asyncio.to_thread(media_pool.import_paths, project_id, pool, [str(final_path)])
+    if not added:
+        final_path.unlink(missing_ok=True)
+        detail = "; ".join(skipped) if skipped else "Could not add the uploaded file to the library"
+        raise HTTPException(status_code=400, detail=detail)
+
+    entry = added[0]
+    entry["name"] = display_name
+    entry["linked"] = False  # the project owns this copy
+
+    p_data["media_pool"] = pool
+    project_store.save_project(project_id, p_data)
+
+    return {
+        "media_id": entry["id"],
+        "path": entry["path"],
+        "name": entry["name"],
+        "kind": entry["kind"],
+        "seconds": entry["duration"],
+    }
+
+
 @router.get("/{project_id}/media/{media_id}/thumb")
 async def media_thumbnail(project_id: str, media_id: str):
     """Poster image for a library tile, generated on first request."""
-    p_data = _load(project_id)
+    p_data = await _load_readonly(project_id)
     entry = _pool_entry(p_data, media_id)
     thumb = await asyncio.to_thread(media_pool.ensure_thumbnail, project_id, entry)
     if thumb:
@@ -207,7 +324,7 @@ async def media_thumbnail(project_id: str, media_id: str):
 async def media_waveform(project_id: str, media_id: str):
     """Audio peaks so music and voiceover tiles show a waveform instead of an icon."""
     from utils.waveform import compute_waveform
-    p_data = _load(project_id)
+    p_data = await _load_readonly(project_id)
     entry = _pool_entry(p_data, media_id)
     data = await asyncio.to_thread(compute_waveform, entry.get("path", ""))
     if not data:

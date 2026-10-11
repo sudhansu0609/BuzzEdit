@@ -1,4 +1,6 @@
+import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -40,6 +42,50 @@ def _is_image(path: str) -> bool:
 def _track_num(track: str) -> int:
     digits = "".join(ch for ch in track if ch.isdigit())
     return int(digits) if digits else 0
+
+
+logger = logging.getLogger("render.compiler")
+
+
+@dataclass
+class _FallbackRack:
+    filters: List[str]
+    chain: str
+
+
+def _compile_rack_fallback(effects: List[Any], *, scope: str = "") -> _FallbackRack:
+    """Stand-in for `audio.compile.compile_rack` while that module is absent:
+    handles only "amplify" (`gain_db`); disabled effects are skipped, and so is
+    every other effect, with a warning."""
+    filters: List[str] = []
+    for effect in effects:
+        if not effect.enabled:
+            continue
+        if effect.effect != "amplify":
+            logger.warning("Audio rack %s: effect %r (%s) skipped, audio.compile is not available",
+                           scope, effect.effect, effect.id)
+            continue
+        gain_db = float(effect.params.get("gain_db", 0.0))
+        filters.append(f"volume@{effect.id}_0=volume={gain_db:g}dB")
+    return _FallbackRack(filters=filters, chain=",".join(filters))
+
+
+def rack_filters(effects: Optional[List[Any]], *, scope: str) -> List[str]:
+    """The ffmpeg filters of one audio rack (AUDIO_SUITE_PLAN.md §2.6), in order.
+
+    An empty rack is no filters at all, so a project without racks compiles to
+    exactly the graph it did before racks existed. `audio.compile` is imported
+    here, not at module load, so the compiler works before that module lands.
+    """
+    if not effects:
+        return []
+    try:
+        from audio.compile import compile_rack
+    except ImportError:
+        compiled = _compile_rack_fallback(list(effects), scope=scope)
+    else:
+        compiled = compile_rack(list(effects), scope=scope)
+    return list(compiled.filters)
 
 
 def flatten_items(items: List[TimelineItem]) -> List[TimelineItem]:
@@ -201,6 +247,17 @@ class FilterGraphCompiler:
             source_index_map[src_id] = index_of[src_id]
             input_args.extend([*hw_for[src_id], *thread_args(src, hw_for[src_id]), "-i", src.path])
             input_count += 1
+
+        # Processed audio (AUDIO_SUITE_PLAN.md §2.1): a source with an
+        # `audio_override` is heard from that WAV instead of its own audio, so
+        # the WAV gets an input of its own and every audio trim of the source
+        # reads from it. A project without one adds nothing here.
+        audio_index_map: Dict[str, int] = {}
+        for src_id, src in self.timeline.sources.items():
+            if src.audio_override:
+                audio_index_map[src_id] = input_count
+                input_args.extend(["-threads", "1", "-i", src.audio_override])
+                input_count += 1
 
         # Segment inputs. With the whole cut trimmed out of ONE decoded stream,
         # every decoded frame fans out to every segment's trim branch, and the
@@ -395,13 +452,14 @@ class FilterGraphCompiler:
         for idx, item in enumerate(a1_items):
             if item.mute:
                 continue
-            src_idx = source_index_map[item.source_id]
+            src_idx = audio_index_map.get(item.source_id, source_index_map[item.source_id])
             start_sec = self._sec(item.source_start_frame)
             end_sec = self._sec(item.source_end_frame)
             out_label = f"[a1_{idx}]"
             # Same fan-out as V1; an A1 item usually spans exactly its V1
-            # partner's range, so it shares that segment's seeked input.
-            seg_idx = segment_input(item)
+            # partner's range, so it shares that segment's seeked input. A
+            # source with processed audio is trimmed from its override input.
+            seg_idx = segment_input(item) if item.source_id not in audio_index_map else None
             if seg_idx is not None:
                 src_idx = seg_idx
                 chain = [f"atrim=duration={end_sec - start_sec:.3f}", "asetpts=PTS-STARTPTS"]
@@ -495,6 +553,10 @@ class FilterGraphCompiler:
         #     with the speech, and a de-esser has no business touching a cymbal.
         master_a = self.timeline.audio_master
         voice_chain = build_voice_chain(master_a)
+        # The A1 rack runs after the voice chain; both apply (§2.6).
+        a1_rack = rack_filters(self.timeline.audio_racks.get("A1"), scope="A1")
+        racked = bool(a1_rack)                  # any rack in the graph: see 6c
+        voice_chain = voice_chain + a1_rack
         if voice_chain and base_a_label != "[anull]":
             out_label = "[voice_a]"
             filters.append(f"{base_a_label}" + ",".join(voice_chain) + out_label)
@@ -519,7 +581,7 @@ class FilterGraphCompiler:
             mix_inputs = [base_a_label]
             sidechain_index = 0
             for idx, item in enumerate(extra_audio_items):
-                src_idx = source_index_map[item.source_id]
+                src_idx = audio_index_map.get(item.source_id, source_index_map[item.source_id])
                 src = self.timeline.sources[item.source_id]
                 src_start_sec = self._sec(item.source_start_frame)
                 src_end_sec = self._sec(item.source_end_frame)
@@ -540,6 +602,10 @@ class FilterGraphCompiler:
                 else:
                     chain.append(f"atrim=start={src_start_sec:.3f}:end={src_end_sec:.3f}")
                 chain.append("asetpts=PTS-STARTPTS")
+                # The clip rack, in clip time, before the item's volume and fades.
+                clip_rack = rack_filters(item.audio_effects, scope=f"item:{item.id}")
+                racked = racked or bool(clip_rack)
+                chain.extend(clip_rack)
                 if item.volume != 1.0:
                     chain.append(f"volume={item.volume:.3f}")
                 if item.audio_fade_in > 0:
@@ -566,12 +632,33 @@ class FilterGraphCompiler:
             )
             final_a_label = mixed_label
 
+        # 6a. The MASTER rack on the finished mix, before the loudness stage.
+        master_rack = rack_filters(self.timeline.audio_racks.get("MASTER"), scope="MASTER")
+        racked = racked or bool(master_rack)
+        if master_rack and final_a_label != "[anull]":
+            out_label = "[rack_master_a]"
+            filters.append(f"{final_a_label}" + ",".join(master_rack) + out_label)
+            final_a_label = out_label
+
         # 6b. Loudness target on the finished mix — what the platform measures.
         loudness_chain = build_loudness_chain(master_a, measured=loudness_measured)
         if loudness_chain and final_a_label != "[anull]":
             out_label = "[master_a]"
             filters.append(f"{final_a_label}" + ",".join(loudness_chain) + out_label)
             final_a_label = out_label
+
+        # 6c. A rack can lengthen the sound (the FFT Filter's firequalizer
+        #     flushes 2 x its delay, 100 ms, of tail at the end) and nothing
+        #     else bounds it: no -shortest, and amix runs to its longest input.
+        #     With any rack in the graph the finished audio is padded and cut to
+        #     the picture's length, at the end of the statement that makes it,
+        #     so every label stays; without racks the graph is unchanged.
+        if racked and final_a_label != "[anull]" and program_seconds > 0:
+            bound = f"apad=whole_dur={program_seconds:.6f},atrim=end={program_seconds:.6f}"
+            for n in range(len(filters) - 1, -1, -1):
+                if filters[n].endswith(final_a_label):
+                    filters[n] = f"{filters[n][:-len(final_a_label)]},{bound}{final_a_label}"
+                    break
 
         # 7. Program-wide colour, after the overlays so B-roll grades with the
         #    program, but before text so captions stay the colour they were set.
@@ -951,6 +1038,14 @@ class FilterGraphCompiler:
             item.transform, self.canvas_w, self.canvas_h, duration_frames,
             self.fps, tl_start_sec, tl_end_sec,
         )
+        if any(f.startswith("zoompan=") for f in chain_geo):
+            # zoompan emits one output frame per input frame (d=1) and stamps
+            # them at the timeline rate, so a clip at another rate changes
+            # speed: a 16 fps Wan clip under a push-in played at 1.5x and ran
+            # out two thirds of the way through its slot, and overlay held its
+            # last frame for the rest (4 s moving, 1.5 s frozen, on every
+            # pushed-in clip of a 2026-10-08 render). Resample first.
+            chain.append(f"fps={self.fps:.5f}")
         chain.extend(chain_geo)
         chain.extend(build_chroma_key_chain(item.chroma))
         chain.extend(build_color_chain(item.color, src_end_sec - src_start_sec))

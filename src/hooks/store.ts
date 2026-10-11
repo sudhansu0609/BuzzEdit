@@ -57,6 +57,12 @@ export interface PipelineState {
   zoom: number;
   showTranscript: boolean;
   showSegments: boolean;
+  /** The Audio panel's range: its transport loops it and its analysis, process effects and
+   *  "windowed to selection" use it. Programme seconds, exactly what the timeline shows (the
+   *  backend maps programme ranges onto the sources across cuts); the Clip scope reads it
+   *  clip-relative. Null = none. The timeline sets it: Shift+drag on an audio lane or the
+   *  ruler, I / O at the playhead, or a plain drag with its Range toggle on; Esc clears it. */
+  audioSelection: { start_s: number; end_s: number } | null;
 
   setProject: (project: Project | null) => void;
   updateProject: (updates: Partial<Project>) => void;
@@ -73,6 +79,7 @@ export interface PipelineState {
   setZoom: (z: number) => void;
   setShowTranscript: (v: boolean) => void;
   setShowSegments: (v: boolean) => void;
+  setAudioSelection: (sel: { start_s: number; end_s: number } | null) => void;
   reset: () => void;
 }
 
@@ -90,6 +97,7 @@ export const useProjectStore = create<PipelineState>((set) => ({
   zoom: 1,
   showTranscript: true,
   showSegments: false,
+  audioSelection: null,
 
   setProject: (project) => set({ project, error: null }),
   updateProject: (updates) =>
@@ -119,6 +127,7 @@ export const useProjectStore = create<PipelineState>((set) => ({
   setZoom: (z) => set({ zoom: z }),
   setShowTranscript: (v) => set({ showTranscript: v }),
   setShowSegments: (v) => set({ showSegments: v }),
+  setAudioSelection: (sel) => set({ audioSelection: sel }),
   reset: () => set({
     project: null,
     isProcessing: false,
@@ -130,5 +139,6 @@ export const useProjectStore = create<PipelineState>((set) => ({
     currentTime: 0,
     isPlaying: false,
     zoom: 1,
+    audioSelection: null,
   }),
 }));

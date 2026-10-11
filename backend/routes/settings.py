@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from store.app_settings import (
     app_settings, OVERRIDE_MODES, get_presentation_overrides_state,
-    set_presentation_overrides,
+    set_presentation_overrides, get_seedvc_settings, set_seedvc_settings,
 )
 from store.project_store import ProjectStore
 from config import PROJECTS_DIR
@@ -24,6 +24,15 @@ class PresentationOverridesRequest(BaseModel):
 class AutoSaveRequest(BaseModel):
     project_id: str
     project_data: Dict[str, Any]
+
+
+class ClipGenerationRequest(BaseModel):
+    mode: str
+
+
+class SeedVCRequest(BaseModel):
+    seedvc_dir: Optional[str] = None       # "" = auto-detect
+    seedvc_python: Optional[str] = None    # "" = auto-detect
 
 
 def _masked_all() -> Dict[str, Any]:
@@ -55,24 +64,37 @@ class AutoCutEditorRequest(BaseModel):
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     planner: Optional[str] = None      # "editor" | "classic": the default for every project
+    model: Optional[str] = None        # the editor's model: claude* | opus* | sonnet* | fable*
+    effort: Optional[str] = None       # "low" | "medium" | "high" | "xhigh" | "max"
 
 
 @router.get("/auto_cut_editor")
 async def get_auto_cut_editor():
     """Which planner cuts by default, and whether the AI editor has a proxy to call."""
     from asr.auto_edit import choose_planner
-    from asr.editor import DEFAULT_BASE_URL, DEFAULT_EFFORT, DEFAULT_MODEL, proxy_config
+    from asr.editor import DEFAULT_BASE_URL, proxy_config
     proxy = proxy_config()
     own = app_settings.get("auto_cut_editor") or {}
-    return {"planner": choose_planner(None), "model": DEFAULT_MODEL, "effort": DEFAULT_EFFORT,
+    return {"planner": choose_planner(None), "model": proxy["model"], "effort": proxy["effort"],
             "base_url": proxy["base_url"] or DEFAULT_BASE_URL, "key_configured": bool(proxy["api_key"]),
             "key_source": "app_settings" if own.get("api_key") else ("env" if proxy["api_key"] else None)}
 
 
 @router.put("/auto_cut_editor")
 async def put_auto_cut_editor(body: AutoCutEditorRequest):
-    """Store the proxy the AI editor calls (key never echoed back) and the default planner."""
+    """Store the proxy the AI editor calls (key never echoed back), its model and effort, and
+    the default planner."""
     own = dict(app_settings.get("auto_cut_editor") or {})
+    if body.model is not None:
+        if not body.model.startswith(("claude", "opus", "sonnet", "fable")):
+            raise HTTPException(status_code=400,
+                                detail="model must start with 'claude', 'opus', 'sonnet' or 'fable'")
+        own["model"] = body.model
+    if body.effort is not None:
+        if body.effort not in ("low", "medium", "high", "xhigh", "max"):
+            raise HTTPException(status_code=400,
+                                detail="effort must be 'low', 'medium', 'high', 'xhigh' or 'max'")
+        own["effort"] = body.effort
     if body.base_url is not None:
         own["base_url"] = body.base_url
     if body.api_key is not None:
@@ -151,6 +173,39 @@ async def put_presentation_overrides(body: PresentationOverridesRequest):
             status_code=422,
             detail=f"override_mode must be one of {OVERRIDE_MODES}")
     return set_presentation_overrides(body.presentation_overrides, body.override_mode)
+
+
+@router.get("/clip_generation")
+async def get_clip_generation():
+    """How B-roll clips are generated: "classic" (832x480) or "hq" (1024x576 delivered
+    at 1920x1080, classic as its fallback), both at 16 fps -- presentation.workflows."""
+    from presentation.workflows import clip_generation_mode, clip_generation_modes
+    return {"mode": clip_generation_mode(), "modes": clip_generation_modes()}
+
+
+@router.put("/clip_generation")
+async def put_clip_generation(body: ClipGenerationRequest):
+    from presentation.workflows import CLIP_GENERATION_MODES, CLIP_GENERATION_SETTING
+    mode = (body.mode or "").strip().lower()
+    if mode not in CLIP_GENERATION_MODES:
+        raise HTTPException(status_code=422,
+                            detail=f"mode must be one of {sorted(CLIP_GENERATION_MODES)}")
+    app_settings.set(CLIP_GENERATION_SETTING, mode)
+    return await get_clip_generation()
+
+
+@router.get("/seedvc")
+async def get_seedvc():
+    """Where the seed-vc voice engine lives: the two settings ("" = auto-detect) and
+    what they resolve to -- audio.seedvc_env.resolve."""
+    from audio import seedvc_env
+    return {**get_seedvc_settings(), "resolved": seedvc_env.resolve()}
+
+
+@router.put("/seedvc")
+async def put_seedvc(body: SeedVCRequest):
+    set_seedvc_settings(body.seedvc_dir, body.seedvc_python)
+    return await get_seedvc()
 
 
 @router.get("/recovery_state")

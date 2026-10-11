@@ -348,7 +348,7 @@ const GENRE_OPTIONS = [
 ];
 const DENSITY_OPTIONS = ['calm', 'balanced', 'busy', 'max'] as const;
 const VOICE_PRESET_OPTIONS = [
-  'studio_mic', 'broadcast', 'warm_radio', 'rap_vocal', 'horror_intimate',
+  'studio_mic', 'broadcast', 'warm_radio', 'rap_vocal', 'crisp_bass', 'horror_intimate',
   'clean', 'podcast', 'light',
 ];
 const SOURCE_OPTIONS = ['auto', 'library', 'generated', 'synth', 'off'];

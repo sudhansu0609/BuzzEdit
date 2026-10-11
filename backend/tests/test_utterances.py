@@ -73,6 +73,13 @@ def test_a_finished_statement_gets_no_alarm():
                                                 "ends on a rising pitch"))
 
 
+def test_a_line_that_stops_on_a_postposition_is_noted_unfinished():
+    words = _words("मैं उसके घर के", 0.0) + _words("वो बहुत पुराना है", 3.0)
+    first, second = ut.build(words)
+    assert "ends on a connective (unfinished)" in first.notes
+    assert "ends on a connective (unfinished)" not in second.notes
+
+
 def test_the_table_carries_notes_and_pointers():
     words = _words("dosto kya aap", 0.0) + _words("dosto kya aapko pata hai", 3.0)
     text = ut.table(ut.build(words))

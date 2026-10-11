@@ -325,6 +325,17 @@ def public_report(report: Dict[str, Any]) -> Dict[str, Any]:
     if review:
         warnings.append(f"{len(review)} calls were decided under doubt and kept; "
                         "they are listed in the Cuts view")
+    # What the creator measures a cut by (AUTO_CUT_V3_PLAN.md §2.10): nothing said twice and no
+    # restarted line may play.
+    editor_report = (report or {}).get("editor") or {}
+    repeats_left = editor_report.get("repeats_remaining") or 0
+    if repeats_left:
+        first = ((editor_report.get("repeats_examples") or [{}])[0] or {}).get("start")
+        warnings.append(f"{repeats_left} exact repeats remain in the cut"
+                        + (f" (first at {float(first):.0f}s)" if first is not None else ""))
+    false_starts_left = editor_report.get("false_starts_remaining") or 0
+    if false_starts_left:
+        warnings.append(f"{false_starts_left} false starts remain in the cut")
     if not out.get("used_fluency"):
         warnings.append("the language model never ran, so this is a structural "
                         "edit only — check that LM Studio is up and its model "

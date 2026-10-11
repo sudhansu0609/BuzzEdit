@@ -222,6 +222,91 @@ def _stream_seconds(path: str, stream: str) -> Optional[float]:
         return None
 
 
+# --- frozen frames inside generated clips ----------------------------------------------------
+# A clip shorter than its slot used to be held on its last frame: a still inside a clip. Each
+# generated clip on the render is sampled at 4 fps as a 64x36 grey thumbnail; consecutive
+# samples whose mean absolute difference is under 1.0 are one picture, and a run of them
+# lasting 0.5 s or more is reported.
+FROZEN_SAMPLE_FPS = 4.0
+FROZEN_SAMPLE_SIZE = (64, 36)
+FROZEN_DIFF_MAX = 1.0
+FROZEN_MIN_SECONDS = 0.5
+
+
+def _grey_samples(path: str, start_s: float, seconds: float) -> List[bytes]:
+    """`path` from start_s for `seconds` at FROZEN_SAMPLE_FPS, as raw 8-bit grey
+    thumbnails; empty when ffmpeg fails."""
+    width, height = FROZEN_SAMPLE_SIZE
+    try:
+        result = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-nostats", "-v", "error",
+             "-ss", f"{max(0.0, start_s):.3f}", "-t", f"{max(0.0, seconds):.3f}", "-i", path,
+             "-an", "-vf", f"fps={FROZEN_SAMPLE_FPS:g},scale={width}:{height},format=gray",
+             "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+            creationflags=NO_WINDOW)
+    except Exception as e:
+        logger.warning("Frame sampling of %s at %.1fs failed: %s", path, start_s, e)
+        return []
+    size = width * height
+    data = result.stdout or b""
+    return [data[i:i + size] for i in range(0, len(data) - size + 1, size)]
+
+
+def _mean_abs_diff(a: bytes, b: bytes) -> float:
+    return sum(abs(x - y) for x, y in zip(a, b)) / max(1, min(len(a), len(b)))
+
+
+def frozen_clip_frames(render_path: str, items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Runs of identical frames inside the generated clips of a rendered file.
+
+    `items` are the clips' windows on the render: {"start_s", "end_s", "beat_id"}.
+    Returns [{"start_s", "seconds", "beat_id"}], one per run of FROZEN_MIN_SECONDS or more.
+    """
+    found: List[Dict[str, Any]] = []
+    if not render_path or not Path(render_path).exists():
+        return found
+    step = 1.0 / FROZEN_SAMPLE_FPS
+    for item in items:
+        start = float(item.get("start_s") or 0.0)
+        seconds = float(item.get("end_s") or 0.0) - start
+        if seconds < FROZEN_MIN_SECONDS:
+            continue
+        samples = _grey_samples(render_path, start, seconds)
+        run_from: Optional[int] = None
+        for index in range(1, len(samples) + 1):
+            if (index < len(samples)
+                    and _mean_abs_diff(samples[index - 1], samples[index]) < FROZEN_DIFF_MAX):
+                if run_from is None:
+                    run_from = index - 1
+                continue
+            if run_from is not None:
+                length = (index - 1 - run_from) * step
+                if length >= FROZEN_MIN_SECONDS - 1e-6:
+                    found.append({"start_s": round(start + run_from * step, 2),
+                                  "seconds": round(length, 2),
+                                  "beat_id": str(item.get("beat_id") or "")})
+                run_from = None
+    return found
+
+
+def _generated_clips(timeline: Timeline) -> List[Dict[str, Any]]:
+    """The generated video cutaways on the timeline, as frozen_clip_frames takes them."""
+    clips: List[Dict[str, Any]] = []
+    for item in timeline.items:
+        if item.kind != "media" or not item.enabled or item.origin != "broll" or not item.source_id:
+            continue
+        source = timeline.sources.get(item.source_id)
+        if source is None or source.kind != "video":
+            continue
+        start, end = _span(item, timeline)
+        # Placement names the source src_broll_<beat id>_<4 hex>.
+        beat_id = (item.source_id[len("src_broll_"):].rsplit("_", 1)[0]
+                   if item.source_id.startswith("src_broll_") else "")
+        clips.append({"start_s": start, "end_s": end, "beat_id": beat_id})
+    return clips
+
+
 def verify_render(output_path: str, settings: PresentationSettings,
                   timeline: Optional[Timeline] = None) -> List[Check]:
     checks: List[Check] = []
@@ -255,6 +340,20 @@ def verify_render(output_path: str, settings: PresentationSettings,
             checks.append(Check(name="length_matches_timeline", ok=abs(video - expected) < 0.5,
                                 detail=f"rendered {video:.2f}s, timeline {expected:.2f}s",
                                 value=round(video - expected, 3)))
+
+    if timeline is not None:
+        # No still inside a clip: identical frames for 0.5 s within a generated clip.
+        try:
+            clips = _generated_clips(timeline)
+            frozen = frozen_clip_frames(output_path, clips)
+            checks.append(Check(
+                name="frozen_clip_frames", ok=not frozen,
+                detail=("; ".join(f"{f['beat_id'] or '?'} @ {f['start_s']:.1f}s for {f['seconds']:.2f}s"
+                                  for f in frozen[:6])
+                        if frozen else f"{len(clips)} generated clips checked"),
+                value=float(len(frozen))))
+        except Exception as e:
+            logger.warning("Frozen-frame check failed: %s", e)
     return checks
 
 

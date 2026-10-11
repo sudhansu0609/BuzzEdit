@@ -1,0 +1,478 @@
+{
+ "source": "B:/youtubeProjects/life3Baje/ep1/MKLV3853.MOV",
+ "edited": "B:/youtubeProjects/life3Baje/ep1/eptemp2.mp4",
+ "src_duration": 697.127,
+ "cut_duration": 473.163,
+ "kept": [
+  {
+   "cut_start": 0.0,
+   "cut_end": 59.79,
+   "speech_s": 30.9,
+   "unmatched": true
+  },
+  {
+   "cut_start": 59.79,
+   "cut_end": 75.29,
+   "speech_s": 12.33,
+   "src_start": 1.293,
+   "src_end": 16.793,
+   "offset_samples": -935954,
+   "match": 0.77,
+   "margin": 0.757
+  },
+  {
+   "cut_start": 75.29,
+   "cut_end": 84.09,
+   "speech_s": 7.04,
+   "src_start": 29.593,
+   "src_end": 38.393,
+   "offset_samples": -731154,
+   "match": 0.828,
+   "margin": 0.819
+  },
+  {
+   "cut_start": 84.09,
+   "cut_end": 86.81,
+   "speech_s": 2.25,
+   "src_start": 40.953,
+   "src_end": 43.673,
+   "offset_samples": -690194,
+   "match": 0.83,
+   "margin": 0.815
+  },
+  {
+   "cut_start": 86.81,
+   "cut_end": 89.56,
+   "speech_s": 1.96,
+   "src_start": 47.593,
+   "src_end": 50.343,
+   "offset_samples": -627474,
+   "match": 0.797,
+   "margin": 0.749
+  },
+  {
+   "cut_start": 89.56,
+   "cut_end": 98.39,
+   "speech_s": 7.71,
+   "src_start": 68.863,
+   "src_end": 77.693,
+   "offset_samples": -331154,
+   "match": 0.794,
+   "margin": 0.784
+  },
+  {
+   "cut_start": 98.39,
+   "cut_end": 104.87,
+   "speech_s": 4.54,
+   "src_start": 83.533,
+   "src_end": 90.013,
+   "offset_samples": -237714,
+   "match": 0.823,
+   "margin": 0.81
+  },
+  {
+   "cut_start": 104.87,
+   "cut_end": 115.02,
+   "speech_s": 7.86,
+   "src_start": 96.093,
+   "src_end": 106.243,
+   "offset_samples": -140434,
+   "match": 0.818,
+   "margin": 0.811
+  },
+  {
+   "cut_start": 115.02,
+   "cut_end": 116.54,
+   "speech_s": 1.22,
+   "src_start": 124.123,
+   "src_end": 125.643,
+   "offset_samples": 145646,
+   "match": 0.709,
+   "margin": 0.693
+  },
+  {
+   "cut_start": 116.54,
+   "cut_end": 121.46,
+   "speech_s": 3.45,
+   "src_start": 133.203,
+   "src_end": 138.123,
+   "offset_samples": 266606,
+   "match": 0.793,
+   "margin": 0.771
+  },
+  {
+   "cut_start": 121.46,
+   "cut_end": 126.03,
+   "speech_s": 3.43,
+   "src_start": 140.483,
+   "src_end": 145.053,
+   "offset_samples": 304366,
+   "match": 0.823,
+   "margin": 0.806
+  },
+  {
+   "cut_start": 126.03,
+   "cut_end": 131.51,
+   "speech_s": 3.92,
+   "src_start": 159.533,
+   "src_end": 165.013,
+   "offset_samples": 536046,
+   "match": 0.783,
+   "margin": 0.77
+  },
+  {
+   "cut_start": 131.51,
+   "cut_end": 143.6,
+   "speech_s": 8.66,
+   "src_start": 221.853,
+   "src_end": 233.943,
+   "offset_samples": 1445486,
+   "match": 0.836,
+   "margin": 0.825
+  },
+  {
+   "cut_start": 143.6,
+   "cut_end": 156.95,
+   "speech_s": 10.37,
+   "src_start": 236.863,
+   "src_end": 250.213,
+   "offset_samples": 1492206,
+   "match": 0.816,
+   "margin": 0.809
+  },
+  {
+   "cut_start": 156.95,
+   "cut_end": 186.6,
+   "speech_s": 23.13,
+   "src_start": 258.373,
+   "src_end": 288.023,
+   "offset_samples": 1622766,
+   "match": 0.809,
+   "margin": 0.802
+  },
+  {
+   "cut_start": 186.6,
+   "cut_end": 188.59,
+   "speech_s": 1.2,
+   "src_start": 289.503,
+   "src_end": 291.493,
+   "offset_samples": 1646446,
+   "match": 0.773,
+   "margin": 0.749
+  },
+  {
+   "cut_start": 188.59,
+   "cut_end": 266.39,
+   "speech_s": 60.39,
+   "src_start": 337.813,
+   "src_end": 415.613,
+   "offset_samples": 2387566,
+   "match": 0.775,
+   "margin": 0.771
+  },
+  {
+   "cut_start": 266.39,
+   "cut_end": 285.77,
+   "speech_s": 14.55,
+   "src_start": 420.453,
+   "src_end": 439.833,
+   "offset_samples": 2465006,
+   "match": 0.77,
+   "margin": 0.761
+  },
+  {
+   "cut_start": 285.77,
+   "cut_end": 290.31,
+   "speech_s": 3.42,
+   "src_start": 451.033,
+   "src_end": 455.573,
+   "offset_samples": 2644206,
+   "match": 0.747,
+   "margin": 0.731
+  },
+  {
+   "cut_start": 290.31,
+   "cut_end": 333.02,
+   "speech_s": 35.23,
+   "src_start": 457.533,
+   "src_end": 500.243,
+   "offset_samples": 2675567,
+   "match": 0.629,
+   "margin": 0.619
+  },
+  {
+   "cut_start": 333.02,
+   "cut_end": 333.16,
+   "speech_s": 0.13,
+   "unmatched": true
+  },
+  {
+   "cut_start": 333.16,
+   "cut_end": 341.19,
+   "speech_s": 6.16,
+   "src_start": 500.383,
+   "src_end": 508.413,
+   "offset_samples": 2675567,
+   "match": 0.655,
+   "margin": 0.642
+  },
+  {
+   "cut_start": 341.19,
+   "cut_end": 341.69,
+   "speech_s": 0.3,
+   "unmatched": true
+  },
+  {
+   "cut_start": 341.69,
+   "cut_end": 344.05,
+   "speech_s": 1.79,
+   "src_start": 514.193,
+   "src_end": 516.553,
+   "offset_samples": 2760046,
+   "match": 0.797,
+   "margin": 0.718
+  },
+  {
+   "cut_start": 344.05,
+   "cut_end": 357.31,
+   "speech_s": 9.92,
+   "src_start": 520.553,
+   "src_end": 533.813,
+   "offset_samples": 2824047,
+   "match": 0.655,
+   "margin": 0.64
+  },
+  {
+   "cut_start": 357.31,
+   "cut_end": 366.91,
+   "speech_s": 7.47,
+   "src_start": 538.333,
+   "src_end": 547.933,
+   "offset_samples": 2896366,
+   "match": 0.798,
+   "margin": 0.785
+  },
+  {
+   "cut_start": 366.91,
+   "cut_end": 375.22,
+   "speech_s": 7.35,
+   "src_start": 550.653,
+   "src_end": 558.963,
+   "offset_samples": 2939886,
+   "match": 0.765,
+   "margin": 0.753
+  },
+  {
+   "cut_start": 375.22,
+   "cut_end": 434.55,
+   "speech_s": 48.01,
+   "src_start": 560.483,
+   "src_end": 619.813,
+   "offset_samples": 2964206,
+   "match": 0.802,
+   "margin": 0.797
+  },
+  {
+   "cut_start": 434.55,
+   "cut_end": 454.71,
+   "speech_s": 14.62,
+   "src_start": 643.333,
+   "src_end": 663.493,
+   "offset_samples": 3340526,
+   "match": 0.814,
+   "margin": 0.805
+  },
+  {
+   "cut_start": 454.71,
+   "cut_end": 473.17,
+   "speech_s": 12.07,
+   "src_start": 666.173,
+   "src_end": 684.633,
+   "offset_samples": 3383406,
+   "match": 0.781,
+   "margin": 0.767
+  }
+ ],
+ "spans": [
+  {
+   "start": 0.0,
+   "end": 1.293,
+   "kind": "silence",
+   "speech_s": 0.14
+  },
+  {
+   "start": 16.793,
+   "end": 29.593,
+   "kind": "speech",
+   "speech_s": 10.37
+  },
+  {
+   "start": 38.393,
+   "end": 40.953,
+   "kind": "speech",
+   "speech_s": 2.22
+  },
+  {
+   "start": 43.673,
+   "end": 47.593,
+   "kind": "speech",
+   "speech_s": 2.88
+  },
+  {
+   "start": 50.343,
+   "end": 68.863,
+   "kind": "speech",
+   "speech_s": 15.64
+  },
+  {
+   "start": 77.693,
+   "end": 83.533,
+   "kind": "speech",
+   "speech_s": 4.52
+  },
+  {
+   "start": 90.013,
+   "end": 96.093,
+   "kind": "speech",
+   "speech_s": 4.12
+  },
+  {
+   "start": 106.243,
+   "end": 124.123,
+   "kind": "speech",
+   "speech_s": 5.76
+  },
+  {
+   "start": 125.643,
+   "end": 133.203,
+   "kind": "speech",
+   "speech_s": 6.74
+  },
+  {
+   "start": 138.123,
+   "end": 140.483,
+   "kind": "speech",
+   "speech_s": 0.58
+  },
+  {
+   "start": 145.053,
+   "end": 159.533,
+   "kind": "speech",
+   "speech_s": 11.14
+  },
+  {
+   "start": 165.013,
+   "end": 221.853,
+   "kind": "speech",
+   "speech_s": 23.76
+  },
+  {
+   "start": 233.943,
+   "end": 236.863,
+   "kind": "speech",
+   "speech_s": 2.5
+  },
+  {
+   "start": 250.213,
+   "end": 258.373,
+   "kind": "speech",
+   "speech_s": 7.97
+  },
+  {
+   "start": 288.023,
+   "end": 289.503,
+   "kind": "speech",
+   "speech_s": 0.84
+  },
+  {
+   "start": 291.493,
+   "end": 337.813,
+   "kind": "speech",
+   "speech_s": 16.09
+  },
+  {
+   "start": 415.613,
+   "end": 420.453,
+   "kind": "speech",
+   "speech_s": 4.46
+  },
+  {
+   "start": 439.833,
+   "end": 451.033,
+   "kind": "speech",
+   "speech_s": 8.85
+  },
+  {
+   "start": 455.573,
+   "end": 457.533,
+   "kind": "speech",
+   "speech_s": 1.77
+  },
+  {
+   "start": 500.243,
+   "end": 500.383,
+   "kind": "silence",
+   "speech_s": 0.14
+  },
+  {
+   "start": 508.413,
+   "end": 514.193,
+   "kind": "speech",
+   "speech_s": 4.09
+  },
+  {
+   "start": 516.553,
+   "end": 520.553,
+   "kind": "speech",
+   "speech_s": 3.16
+  },
+  {
+   "start": 533.813,
+   "end": 538.333,
+   "kind": "speech",
+   "speech_s": 4.02
+  },
+  {
+   "start": 547.933,
+   "end": 550.653,
+   "kind": "speech",
+   "speech_s": 1.89
+  },
+  {
+   "start": 558.963,
+   "end": 560.483,
+   "kind": "speech",
+   "speech_s": 1.28
+  },
+  {
+   "start": 619.813,
+   "end": 643.333,
+   "kind": "speech",
+   "speech_s": 10.35
+  },
+  {
+   "start": 663.493,
+   "end": 666.173,
+   "kind": "speech",
+   "speech_s": 1.46
+  },
+  {
+   "start": 684.633,
+   "end": 697.127,
+   "kind": "speech",
+   "speech_s": 2.66
+  }
+ ],
+ "stats": {
+  "kept_segments": 27,
+  "kept_s": 412.74,
+  "unmatched_s": 60.43,
+  "removed_speech_s": 282.95,
+  "removed_silence_s": 1.43,
+  "reordered_segments": 0,
+  "weak_segments": 0
+ },
+ "language": "hi",
+ "genre": "vlog",
+ "note": "Creator's own cut (MKLV3853.MOV -> ep1/eptemp2.mp4), matched 2026-10-09: 27 kept segments, 283 s of speech removed; 60 s of the export is unmatched (inserts from other clips, or retakes the matcher could not place), so 'caught' may read low while 'wrongly removed' stays trustworthy."
+}

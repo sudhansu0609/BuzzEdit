@@ -7,11 +7,20 @@ requests>=2.31.0
 python-multipart>=0.0.6
 aiofiles>=23.2.1
 websockets>=12.0
+# Live audio preview (audio/live.py): parameter changes reach the running
+# ffmpeg graph through its azmq filter.
+pyzmq>=25.0
 
 # Video, Audio & Image Processing
 numpy>=1.24.0
 soundfile>=0.12.1
 pydub>=0.25.1
+# Audio suite (audio/analysis.py, audio/noise.py): spectra and resampling,
+# and Noise Reduction (process) with a captured noise print.
+scipy>=1.11
+noisereduce>=3.0
+# Voice Changer (audio/voice_changer.py): WORLD vocoder, formant shift independent of pitch.
+pyworld>=0.3.4
 pillow>=10.0.0
 opencv-python>=4.8.0
 scenedetect[opencv]>=0.6.2

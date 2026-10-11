@@ -189,3 +189,32 @@ def apply_presentation_overrides(settings: Dict[str, Any]) -> Tuple[Dict[str, An
     merged = dict(settings)
     merged.update(overrides)
     return merged, dict(overrides)
+
+
+# --- seed-vc voice engine (VOICE_CHANGER_PLAN.md, brief S0) ------------------
+#
+# Where the seed-vc engine and the Python that runs it live. Both default to
+# "" = auto-detect (audio.seedvc_env.resolve: BuzzEdit's engines/seedvc/, else
+# SkinWalker's vendor/seed-vc + .venv); a value that is set wins.
+SEEDVC_DIR_KEY = "seedvc_dir"
+SEEDVC_PYTHON_KEY = "seedvc_python"
+_SEEDVC_KEYS = (SEEDVC_DIR_KEY, SEEDVC_PYTHON_KEY)
+
+
+def get_seedvc_settings() -> Dict[str, str]:
+    """{"seedvc_dir": str, "seedvc_python": str}, "" when unset."""
+    return {key: str(app_settings.get(key, "") or "").strip() for key in _SEEDVC_KEYS}
+
+
+def set_seedvc_settings(seedvc_dir: Optional[str] = None,
+                        seedvc_python: Optional[str] = None) -> Dict[str, str]:
+    """Persist whichever of the two were passed (None = leave unchanged; "" =
+    back to auto-detect). Returns the stored state."""
+    updates: Dict[str, Any] = {}
+    if seedvc_dir is not None:
+        updates[SEEDVC_DIR_KEY] = seedvc_dir.strip()
+    if seedvc_python is not None:
+        updates[SEEDVC_PYTHON_KEY] = seedvc_python.strip()
+    if updates:
+        app_settings.update(updates)
+    return get_seedvc_settings()

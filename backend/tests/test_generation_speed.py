@@ -10,7 +10,7 @@ def test_clip_length_follows_the_beat_and_stays_4n_plus_1():
         frames = assets._video_length_for(seconds, 16)
         assert (frames - 1) % 4 == 0
         assert assets.MIN_VIDEO_FRAMES <= frames <= assets.MAX_VIDEO_FRAMES
-    assert assets._video_length_for(3.0, 16) < assets.DEFAULT_VIDEO_LENGTH  # no 5s clip for a 3s beat
+    assert assets._video_length_for(3.0, 16) >= assets.DEFAULT_VIDEO_LENGTH  # a clip is at least 5 s
     assert assets._video_length_for(3.0, 16) >= 3.0 * 16                   # still covers the beat
 
 

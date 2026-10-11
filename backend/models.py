@@ -159,6 +159,11 @@ class TranscribeJob(BaseModel):
     # "classic" (fumble_engine). None = the project's or app's choice, else the
     # editor (asr.auto_edit.choose_planner). Stored on project settings.
     planner: Optional[Literal["editor", "classic"]] = None
+    # About the speaker, for the AI editor's brief (the Studio sends it from the
+    # creator's writing style: fixed opening line, voice, habitual phrases).
+    # None = keep what the project has. Stored on project settings, so a re-cut
+    # reuses it.
+    speaker_style: Optional[str] = None
 
 
 class AnalyzeJob(BaseModel):

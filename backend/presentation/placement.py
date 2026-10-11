@@ -22,7 +22,7 @@ from timeline import clip_ops
 from timeline.authoring import clear_generated
 from timeline.schema import SourceFile, Timeline, time_to_frame
 
-from .models import BROLL_SECONDS_FLOOR, Asset, Beat, PresentationSettings, Program
+from .models import BROLL_SECONDS_FLOOR, VIDEO_SECONDS_MIN, Asset, Beat, PresentationSettings, Program
 
 logger = logging.getLogger("presentation.placement")
 
@@ -36,6 +36,9 @@ GRAPHIC_ORIGIN = "graphic"
 GRAPHIC_SCALE = 0.42
 POPUP_TRACK = "TP"
 POPUP_ORIGIN = "popup"
+# `_window_for`'s reason when a clip's slot cannot hold the 5 s a clip needs;
+# place_broll then shows the still the clip was made from (Asset.still_path).
+CLIP_NEEDS_5S_REASON = "a clip needs 5 s; no room"
 
 # Enough movement to feel alive, not enough to notice as an effect.
 # A shot timed by the script may start this far inside, or after, the one
@@ -147,6 +150,17 @@ def place_broll(timeline: Timeline, beats: List[Beat], assets: List[Asset],
 
         start_s, duration_s, reason = _window_for(beat, asset, program, placed, settings,
                                                   cuts)
+        if (duration_s <= 0 and reason == CLIP_NEEDS_5S_REASON and asset.still_path
+                and Path(asset.still_path).exists()):
+            # No 5 s for the clip here: the still it was made from takes the slot
+            # under the still rules (its planned length, a Ken Burns move).
+            still = _still_of(asset)
+            still_start, still_seconds, _ = _window_for(beat, still, program, placed, settings, cuts)
+            if still_seconds > 0:
+                asset, start_s, duration_s = still, still_start, still_seconds
+                if rejected is not None:
+                    rejected.append({"beat": beat.id, "topic": beat.topic,
+                                     "reason": "clip needed 5 s; its still was placed"})
         if partner is not None and duration_s > 0:
             from .composite import split_transform
             frames = max(1, time_to_frame(duration_s, timeline.fps_num, timeline.fps_den))
@@ -238,6 +252,19 @@ def place_broll(timeline: Timeline, beats: List[Beat], assets: List[Asset],
     return count
 
 
+def _still_of(asset: Asset) -> Asset:
+    """A clip's phase-1 still (Asset.still_path) as an image asset of its own."""
+    width = height = 0
+    try:
+        from PIL import Image
+        with Image.open(asset.still_path) as image:
+            width, height = image.size
+    except Exception:
+        pass
+    return asset.model_copy(update={"kind": "image", "path": asset.still_path, "duration_s": 0.0,
+                                    "width": width, "height": height, "still_path": None})
+
+
 def _window_for(beat: Beat, asset: Asset, program: Program,
                 placed: List[Tuple[float, float]],
                 settings: PresentationSettings,
@@ -266,6 +293,11 @@ def _window_for(beat: Beat, asset: Asset, program: Program,
         if available < floor * 0.8:
             return start_s, 0.0, "no room inside the beat's span"
         duration_s = min(floor, available)
+    # A clip of 5 s or more is never cut under 5 s (the creator's rule): a slot
+    # that cannot hold it is reported, not filled with a flash of motion.
+    if (asset.kind == "video" and asset.duration_s >= VIDEO_SECONDS_MIN
+            and duration_s + 1e-3 < VIDEO_SECONDS_MIN):
+        return start_s, 0.0, CLIP_NEEDS_5S_REASON
 
     # Slide the window onto the nearest jump cut. The word-boundary snap above
     # is a preference; hiding a join is the point of the shot being here at all,

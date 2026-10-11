@@ -213,6 +213,31 @@ def _to_canvas(cx: float, cy: float) -> Tuple[float, float]:
     return clamp(x), clamp(y)
 
 
+BASE_ZOOM_MAX = 1.5
+
+
+def apply_base_zoom(timeline: Timeline, settings: PresentationSettings) -> float:
+    """The resting frame of the recording (`settings.base_zoom`), as the
+    timeline's master transform. Returns the scale applied (1.0 = none).
+
+    The compiler puts the master transform on the V1 programme before the
+    overlays, so the recording is cropped and B-roll is not; segment moves
+    on V1 clips and the punch-in adjustment layers then compose on top, so a
+    1.15 base with an 8% push plays 1.15 -> 1.24. A base of 1.0 leaves any
+    master transform set by hand alone."""
+    from timeline.schema import Transform
+    scale = max(1.0, min(BASE_ZOOM_MAX, float(settings.base_zoom or 1.0)))
+    if scale <= 1.001:
+        return 1.0
+    current = timeline.master_transform
+    timeline.master_transform = Transform(
+        scale=round(scale, 3),
+        pos_x=current.pos_x if current else 0.0,
+        pos_y=current.pos_y if current else 0.0)
+    logger.info("Base zoom %.2f set as the master transform", scale)
+    return scale
+
+
 def plan_zooms(program: Program, settings: PresentationSettings,
                busy_windows: Optional[List[Tuple[float, float]]] = None,
                seed: int = 0,

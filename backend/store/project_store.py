@@ -11,6 +11,7 @@ class ProjectStore:
             base_dir = str(Path(__file__).parent.parent / "data" / "projects")
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._readonly_cache: Dict[str, Any] = {}
 
     def _get_project_file(self, project_id: str) -> Path:
         return self.base_dir / f"{project_id}.json"
@@ -24,6 +25,7 @@ class ProjectStore:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             # Replace target file atomically
             os.replace(temp_path, target_path)
+            self._readonly_cache.pop(project_id, None)
         except Exception:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -36,6 +38,30 @@ class ProjectStore:
             return None
         with open(target_path, "r", encoding="utf-8") as f:
             return json.load(f)
+
+    def get_project_readonly(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """The project as `get_project` returns it, parsed once per saved version.
+
+        For readers that only look (thumbnails, waveforms, filmstrips): the dict
+        is shared, so a caller must not mutate it. Opening a presented project
+        asks for a thumbnail and two filmstrips per library entry -- 275 entries
+        on a Raat3Baje cut -- and parsing the 10 MB file for each kept the server
+        busy for 20 s while the preview showed "Loading video stream" (2026-10-08).
+        Keyed on the file's mtime and size, so a save is seen at once.
+        """
+        target_path = self._get_project_file(project_id)
+        try:
+            st = target_path.stat()
+        except OSError:
+            return None
+        key = (st.st_mtime_ns, st.st_size)
+        cached = self._readonly_cache.get(project_id)
+        if cached and cached[0] == key:
+            return cached[1]
+        data = self.get_project(project_id)
+        if data is not None:
+            self._readonly_cache[project_id] = (key, data)
+        return data
 
     def list_projects(self) -> List[Dict[str, Any]]:
         """List all projects in base directory."""

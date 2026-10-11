@@ -21,6 +21,26 @@ router = APIRouter()
 project_store = ProjectStore(base_dir=str(PROJECTS_DIR))
 jobs: dict = {}
 
+
+def _stage(job_id: str, text: str) -> None:
+    """Record where a running transcription is. The Studio follows this record
+    (`GET /status/{job_id}`) once its own wait on the POST runs out, and reads a
+    stage that keeps changing as proof the job is alive."""
+    import time
+    job = jobs.get(job_id)
+    if job is not None:
+        job["stage"] = text
+        job["updated_at"] = time.time()
+
+
+@router.get("/jobs")
+async def transcription_jobs():
+    """Every transcription this process knows about, running ones first. The
+    Studio asks before unloading LM Studio: a running transcription is using it."""
+    items = sorted(jobs.values(), key=lambda j: (j.get("status") != "running", -(j.get("updated_at") or 0)))
+    return {"jobs": items, "running": sum(1 for j in items if j.get("status") == "running")}
+
+
 @router.post("/transcribe")
 async def transcribe_video(job: TranscribeJob):
     p_data = project_store.get_project(job.project_id)
@@ -43,6 +63,7 @@ async def transcribe_video(job: TranscribeJob):
     try:
         # 1. Extract WAV audio. ffmpeg is blocking; off the event loop so the
         #    server stays responsive during a long extraction.
+        _stage(job_id, "extracting audio")
         audio_path = await asyncio.to_thread(extract_audio, source_video)
 
         # 2. Get Video info
@@ -79,9 +100,12 @@ async def transcribe_video(job: TranscribeJob):
             settings["glossary"] = job.glossary
         if job.planner:
             settings["planner"] = job.planner
+        if job.speaker_style is not None:
+            settings["speaker_style"] = job.speaker_style
         vocabulary = settings.get("vocabulary")
         glossary_key = settings.get("glossary")
         glossary_map = glossary_store.load_merged(glossary_key)
+        _stage(job_id, f"transcribing with Whisper ({language or 'auto-detect'})")
         full = await whisper_engine.transcribe_full_async(
             audio_path, language=language, vocabulary=vocabulary, glossary=glossary_map)
         words = full["words"]
@@ -111,8 +135,17 @@ async def transcribe_video(job: TranscribeJob):
             aggressiveness = float(settings.get("fumble_aggressiveness", 0.5))
             # `settings` lets the planner give a project its genre's pacing when
             # nobody chose one: horror lives in its silences.
-            plan = await plan_auto_edit(words, audio_path, aggressiveness=aggressiveness,
-                                        settings=settings)
+            _stage(job_id, "planning the cut")
+            # The written script tags each utterance with the paragraph it follows
+            # (a hint for grouping attempts, never a filter). It rides on the same
+            # settings dict the planner writes its genre pacing onto, and is
+            # popped afterwards so it is never saved with the project.
+            _with_script_text(settings, p_data)
+            try:
+                plan = await plan_auto_edit(words, audio_path, aggressiveness=aggressiveness,
+                                            settings=settings)
+            finally:
+                settings.pop("script_text", None)
             ann_words = plan.words
             edit_report = plan.report
 
@@ -148,6 +181,7 @@ async def transcribe_video(job: TranscribeJob):
         if settings.get("auto_verify_cut", True) and not precut:
             try:
                 from asr.cut_verify import verify_cut
+                _stage(job_id, "verifying the cut")
                 vr = await verify_cut(tl, source_video, language=detected_language)
                 edit_report.setdefault("quality", {})["cut_verify"] = {
                     "verdict": vr["verdict"],
@@ -185,6 +219,7 @@ async def transcribe_video(job: TranscribeJob):
 
         p_data["transcript"] = res.model_dump()
         p_data["timeline"] = tl.model_dump()
+        _stage(job_id, "saving the transcript")
         p_data["status"] = "transcribed"
         project_store.save_project(job.project_id, p_data)
 
@@ -203,6 +238,114 @@ async def transcribe_video(job: TranscribeJob):
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
         raise HTTPException(status_code=500, detail=str(e))
+
+_ANNOTATION_KEYS = ("enabled", "disfluency", "candidate", "reason", "take", "note", "_edit_report")
+
+
+def _with_script_text(settings: dict, p_data: dict) -> None:
+    """Put the project's written script on `settings["script_text"]` for the
+    planner (asr.editor_planner tags utterances with the paragraph they
+    follow). Only when the project has one; callers pop the key afterwards."""
+    script = p_data.get("script")
+    text = script.get("text") if isinstance(script, dict) else None
+    if isinstance(text, str) and text.strip():
+        settings["script_text"] = text
+
+
+@router.post("/{project_id}/recut")
+async def recut_project(project_id: str):
+    """Plan the cut again from the words Whisper already produced, without
+    transcribing again: the same audio analysis, planner and timeline rebuild
+    as `/transcribe` from step 4 on. The Studio asks for it when the cut rules
+    changed after a production (2026-10-08: the editor's majority rule), since
+    a restart otherwise reuses the transcription -- and with it the old cut.
+    Every presentation item on the timeline goes with the rebuild; the Studio
+    re-presents afterwards. Runs under the transcription job id, so a caller
+    that follows `trans_<id>` sees it exactly like a transcription."""
+    p_data = project_store.get_project(project_id)
+    if not p_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    source_video = p_data.get("source_video")
+    if not source_video or not Path(source_video).exists():
+        raise HTTPException(status_code=400, detail="Source video missing")
+    # Saved as a TranscriptionResult by /transcribe, but a project that went
+    # through the Project model (the presentation pass) holds the segment list.
+    transcript = p_data.get("transcript") or {}
+    if isinstance(transcript, list):
+        transcript = {"segments": transcript, "language": (p_data.get("settings") or {}).get("language")}
+    segments = transcript.get("segments") if isinstance(transcript, dict) else None
+    words = [dict(w) for seg in (segments or []) for w in (seg.get("words") or [])
+             if not w.get("detected")]
+    for w in words:
+        for key in _ANNOTATION_KEYS:
+            w.pop(key, None)
+    if not words:
+        raise HTTPException(status_code=400, detail="This project has no transcription to re-cut from")
+    settings = p_data.get("settings") or {}
+    if settings.get("precut"):
+        raise HTTPException(status_code=400, detail="A precut recording has no cut to plan")
+
+    job_id = f"trans_{project_id}"
+    running = jobs.get(job_id)
+    if running and running.get("status") == "running":
+        raise HTTPException(status_code=409, detail="A transcription is already running for this project")
+    jobs[job_id] = {"id": job_id, "project_id": project_id, "job_type": "recut",
+                    "status": "running", "progress": 0.0}
+    try:
+        _stage(job_id, "extracting audio")
+        audio_path = await asyncio.to_thread(extract_audio, source_video)
+        v_info = await asyncio.to_thread(get_video_info, source_video)
+        _stage(job_id, "planning the cut")
+        _with_script_text(settings, p_data)
+        try:
+            plan = await plan_auto_edit(words, audio_path,
+                                        aggressiveness=float(settings.get("fumble_aggressiveness", 0.5)),
+                                        settings=settings)
+        finally:
+            settings.pop("script_text", None)
+        ann_words, edit_report = plan.words, plan.report
+        tl = build_timeline_from_transcript(
+            source_path=source_video,
+            duration_seconds=v_info.get("duration", 0.0),
+            transcript_words=ann_words,
+            fps_num=v_info.get("fps_num", 30),
+            fps_den=v_info.get("fps_den", 1),
+            width=v_info.get("width", 1920),
+            height=v_info.get("height", 1080),
+            has_audio=v_info.get("audio_codec") not in (None, "none"),
+            speech_regions=edit_report.get("speech"),
+            max_pause_seconds=settings.get("max_pause_seconds"),
+            pause_padding_seconds=settings.get("pause_padding_seconds"),
+            energy_envelope=edit_report.get("energy"),
+            default_transition=(None if settings.get("hard_cuts")
+                                else Transition(type="fade", duration=float(settings.get("transition_seconds", 0.25)))),
+            keep_full_source=False,
+        )
+        record_cut_coverage(tl, edit_report)
+        first = segments[0] if segments else {}
+        seg = TranscriptSegment(
+            id=0, start=ann_words[0]["start"], end=ann_words[-1]["end"],
+            text=first.get("text") or " ".join(w.get("word", "") for w in ann_words),
+            text_native=first.get("text_native"), text_english=first.get("text_english"),
+            words=ann_words, confidence=1.0)
+        res = TranscriptionResult(segments=[seg], language=transcript.get("language") or settings.get("language"),
+                                  duration=ann_words[-1]["end"])
+        p_data["transcript"] = res.model_dump()
+        p_data["timeline"] = tl.model_dump()
+        p_data["status"] = "transcribed"
+        p_data.pop("presented_at", None)
+        _stage(job_id, "saving the cut")
+        project_store.save_project(project_id, p_data)
+        jobs[job_id].update(status="completed", progress=1.0, result={"segments_count": 1})
+        return {"status": "completed", "job_id": job_id, "segments": 1,
+                "report": public_report(edit_report)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"] = str(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/status/{job_id}")
 async def transcription_status(job_id: str):

@@ -143,6 +143,19 @@ def test_a_plain_doubled_word_is_still_a_stutter():
     assert not out[1].get("disfluency")
 
 
+def test_a_third_copy_of_a_reduplicated_word_is_a_stutter():
+    """"bahut bahut" is grammar; "bahut" said ten times in a row (Raat3Baje ep2) is not.
+    One doubling is protected on its own; a run beyond it is cut down to the last copy
+    (the restart sweep then folds the surviving pair as well)."""
+    from asr.disfluency import analyze_disfluencies
+    words = [{"word": "bahut", "word_native": "बहुत", "start": 0.3 * n, "end": 0.3 * n + 0.25,
+              "probability": 0.99} for n in range(5)]
+    words.append({"word": "dard", "word_native": "दर्द", "start": 1.6, "end": 1.9, "probability": 0.99})
+    out = analyze_disfluencies(words)
+    assert [bool(w.get("disfluency")) for w in out] == [True, True, True, True, False, False]
+    assert all(w["reason"] == "stutter" for w in out[:4])
+
+
 def test_the_sweep_leaves_reduplication_alone_too():
     from asr.fumble_engine import _sweep_stutters
     words = [

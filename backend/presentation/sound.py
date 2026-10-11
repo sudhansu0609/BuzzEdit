@@ -64,7 +64,7 @@ SYNTH_DIR = Path(DATA_DIR) / "audio_synth"
 # (and each music mood/genre) is made once and then reused like a library file.
 AUDIO_GEN_DIR = Path(DATA_DIR) / "audio_gen"
 
-AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus"}
+AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus", ".aif", ".aiff"}
 
 # The effect vocabulary the planner may ask for. Anything else is ignored
 # rather than guessed at.
@@ -102,6 +102,7 @@ VOICE_PRESETS: Dict[str, Tuple[float, float, float]] = {
     "broadcast": (0.35, 0.3, 0.7),
     "warm_radio": (0.35, 0.2, 0.5),
     "rap_vocal": (0.3, 0.35, 0.75),
+    "crisp_bass": (0.35, 0.45, 0.65),
     "horror_intimate": (0.5, 0.25, 0.7),
     "clean": (0.35, 0.3, 0.45),
     "podcast": (0.3, 0.35, 0.65),
@@ -765,7 +766,8 @@ def plan_sound(timeline: Timeline, program: Program, settings: PresentationSetti
                extra_sfx: Optional[Sequence[Tuple[float, str]]] = None,
                loops: Optional[Sequence[Tuple[float, float, str, float]]] = None,
                sections: Optional[Sequence[Tuple[float, float, str]]] = None,
-               music_cues: Optional[Sequence[Tuple[float, str]]] = None) -> SoundPlan:
+               music_cues: Optional[Sequence[Tuple[float, str]]] = None,
+               diegetic: Optional[Sequence[Any]] = None) -> SoundPlan:
     """Decide the music, effects and ambience for the programme.
 
     `extra_sfx` are (time, tag) pairs from other planners (the mood recipes
@@ -773,6 +775,8 @@ def plan_sound(timeline: Timeline, program: Program, settings: PresentationSetti
     `loops` are (start, end, tag, gain) stretches of a looped effect (a
     heartbeat through a climax). `sections` are (start, end, act) from the
     story structure: the bed changes cue at act boundaries with a crossfade.
+    `diegetic` are scene sounds (sound_design.DiegeticCue): accents and beds
+    under the voice, placed whenever `sfx_diegetic` is on, whatever `sfx` says.
     """
     rng = random.Random(seed)
     plan = SoundPlan()
@@ -829,6 +833,9 @@ def plan_sound(timeline: Timeline, program: Program, settings: PresentationSetti
                 plan.loops.append(LoopCue(tag=tag, start_s=max(0.0, start),
                                           end_s=min(duration, end),
                                           gain=gain * settings.sfx_volume))
+
+    if settings.sfx_diegetic and diegetic:
+        _plan_diegetic(plan, diegetic, settings, duration)
 
     return plan
 
@@ -1093,6 +1100,66 @@ def _space_sfx(events: List[Tuple[float, str, float]], duration: float,
     return kept
 
 
+# Scene sounds (presentation/sound_design.py): accents on a word and beds under
+# a stretch, always under the voice -- ducked like the music, never above
+# `sfx_diegetic_volume` nor `sfx_volume`, no two accents within MIN_SFX_GAP_S
+# of each other or of a tagged one-shot, at most DIEGETIC_ACCENTS_PER_MINUTE
+# in any minute.
+DIEGETIC_ACCENTS_PER_MINUTE = 8
+DIEGETIC_ACCENT_MAX_S = 6.0
+DIEGETIC_ACCENT_DUCK = 0.35
+DIEGETIC_SUBTLE_ACCENT = 0.5
+DIEGETIC_BED_S = 20.0
+DIEGETIC_BED_SHARE = 0.35
+DIEGETIC_SUBTLE_BED = 0.6
+DIEGETIC_BED_DUCK = 0.6
+
+
+def _diegetic_gain(settings: PresentationSettings, gain: float) -> float:
+    return round(max(0.0, min(gain, settings.sfx_volume, settings.sfx_diegetic_volume)), 4)
+
+
+def _plan_diegetic(plan: SoundPlan, cues: Sequence[Any], settings: PresentationSettings,
+                   duration: float) -> None:
+    """Scene-sound accents into `plan.sfx`, beds into `plan.loops`. A later
+    accent too close to a kept one (or to any tagged one-shot) is dropped; a
+    bed runs `seconds` (default DIEGETIC_BED_S) up to the next bed or the end."""
+    ceiling = settings.sfx_diegetic_volume
+    ordered = sorted((c for c in cues if (c.effect or "").strip()
+                      and 0.0 <= float(c.at_s) < duration), key=lambda c: float(c.at_s))
+    tagged = [c.at_s for c in plan.sfx]
+    accents: List[SfxCue] = []
+    for cue in ordered:
+        if cue.kind == "bed":
+            continue
+        at = float(cue.at_s)
+        if any(abs(at - t) < MIN_SFX_GAP_S for t in tagged):
+            continue
+        if accents and at - accents[-1].at_s < MIN_SFX_GAP_S:
+            continue
+        if sum(1 for a in accents if at - a.at_s < 60.0) >= DIEGETIC_ACCENTS_PER_MINUTE:
+            continue
+        gain = ceiling * (DIEGETIC_SUBTLE_ACCENT if cue.level == "subtle" else 1.0)
+        accents.append(SfxCue(
+            tag="accent", kind="accent", text=" ".join(cue.effect.split()), at_s=round(at, 3),
+            duration_s=min(float(cue.seconds), DIEGETIC_ACCENT_MAX_S) if cue.seconds else 0.0,
+            gain=_diegetic_gain(settings, gain), duck=DIEGETIC_ACCENT_DUCK))
+    beds = [c for c in ordered if c.kind == "bed"]
+    for i, cue in enumerate(beds):
+        start = float(cue.at_s)
+        end = start + (float(cue.seconds) if cue.seconds else DIEGETIC_BED_S)
+        if i + 1 < len(beds):
+            end = min(end, float(beds[i + 1].at_s))
+        end = min(end, duration)
+        if end - start < 2.0:   # the tagged loops' floor too
+            continue
+        gain = DIEGETIC_BED_SHARE * ceiling * (DIEGETIC_SUBTLE_BED if cue.level == "subtle" else 1.0)
+        plan.loops.append(LoopCue(
+            tag="bed", text=" ".join(cue.effect.split()), start_s=round(start, 3),
+            end_s=round(end, 3), gain=_diegetic_gain(settings, gain), duck=DIEGETIC_BED_DUCK))
+    plan.sfx = sorted(plan.sfx + accents, key=lambda c: c.at_s)
+
+
 # --- placement -----------------------------------------------------------------
 
 def _resolve_sfx(tag: str, rng: random.Random, source: str) -> Tuple[Optional[Path], str]:
@@ -1156,6 +1223,67 @@ def file_duration(path: str) -> float:
     return _probe_duration(path)
 
 
+def _place_scene_sound(timeline: Timeline, cue: Any, kind: str,
+                       settings: PresentationSettings, rng: random.Random,
+                       scene: Dict[str, Any]) -> None:
+    """One scene sound (an accent SfxCue or a bed LoopCue with `text` or
+    `path`) onto the effects lane: its own file, else the library's match for
+    its words or a cached generation (sfx_library.resolve_effect), normalised
+    once (prepare_effect), ducked under the voice and never above the diegetic
+    ceiling. A cue that cannot be placed is counted unresolved, never raised."""
+    from . import sfx_library
+    scene["any"] = True
+    label = " ".join((cue.text or Path(cue.path).stem).split())
+    fps_num, fps_den = timeline.fps_num, timeline.fps_den
+    programme_frames = timeline.duration_frames
+    try:
+        if cue.path:
+            path, src = Path(cue.path), "library"
+        else:
+            if scene.get("roots") is None:
+                scene["roots"] = sfx_library.library_roots(settings.sfx_library_dirs)
+            path, _score, src = sfx_library.resolve_effect(cue.text, rng, kind=kind,
+                                                           roots=scene["roots"])
+        if path is None:
+            raise LookupError("nothing in the library or the generation cache")
+        path = sfx_library.prepare_effect(path, kind)
+        duration = file_duration(str(path))
+        if duration <= 0.0:
+            raise LookupError(f"no readable duration in {path}")
+        if kind == "bed":
+            start_frame = time_to_frame(cue.start_s, fps_num, fps_den)
+            end_frame = min(time_to_frame(cue.end_s, fps_num, fps_den), programme_frames)
+        else:
+            length = min(duration, cue.duration_s if cue.duration_s > 0 else duration,
+                         DIEGETIC_ACCENT_MAX_S)
+            start_frame = time_to_frame(cue.at_s, fps_num, fps_den)
+            end_frame = min(start_frame + time_to_frame(length, fps_num, fps_den),
+                            programme_frames)
+        if end_frame - start_frame <= 0:
+            raise LookupError("outside the programme")
+        source_id = _register(timeline, str(path), duration)
+        item = clip_ops.add_media_item(timeline, source_id, SFX_TRACK, start_frame, 0,
+                                       end_frame - start_frame, origin=SFX_ORIGIN)
+    except Exception as e:
+        logger.warning("Scene sound %r not placed (%s)", label, e)
+        scene["sources"]["none"] = scene["sources"].get("none", 0) + 1
+        scene["unresolved"].append(label)
+        return
+    item.volume = _diegetic_gain(settings, cue.gain)
+    item.duck = cue.duck
+    if kind == "bed":
+        item.loop = True
+        item.audio_fade_in = 1.5
+        item.audio_fade_out = 1.5
+        item.label = f"SFX bed: {label}"
+    else:
+        item.audio_fade_in = cue.fade_in_s
+        item.audio_fade_out = cue.fade_out_s
+        item.label = f"SFX: {label}"
+    scene["placed"] += 1
+    scene["sources"][src] = scene["sources"].get(src, 0) + 1
+
+
 def apply_sound(timeline: Timeline, plan: SoundPlan, settings: PresentationSettings,
                 seed: int = 0, source_counts: Optional[Dict[str, int]] = None
                 ) -> Dict[str, int]:
@@ -1165,6 +1293,10 @@ def apply_sound(timeline: Timeline, plan: SoundPlan, settings: PresentationSetti
     SFX came from each source ("library"/"generated"/"synth"/"off") — an
     opt-in the report reads from; every existing caller that omits it keeps
     today's return value unchanged.
+
+    When the plan holds scene sounds (cues with `text` or `path`), the counts
+    also carry "diegetic" (placed), "diegetic_sources" ({"library"/
+    "generated"/"none": n}) and "diegetic_unresolved" (their effect texts).
     """
     for origin in (MUSIC_ORIGIN, SFX_ORIGIN, AMBIENCE_ORIGIN):
         clear_generated(timeline, origin)
@@ -1172,6 +1304,8 @@ def apply_sound(timeline: Timeline, plan: SoundPlan, settings: PresentationSetti
     counts = {"music": 0, "sfx": 0, "ambience": 0}
     rng = random.Random(seed)
     programme_frames = timeline.duration_frames
+    scene: Dict[str, Any] = {"any": False, "placed": 0, "sources": {}, "unresolved": [],
+                             "roots": None}
 
     def note_source(label: str) -> None:
         if source_counts is not None:
@@ -1213,6 +1347,9 @@ def apply_sound(timeline: Timeline, plan: SoundPlan, settings: PresentationSetti
         counts["ambience"] += 1
 
     for cue in plan.sfx:
+        if cue.text or cue.path:
+            _place_scene_sound(timeline, cue, "accent", settings, rng, scene)
+            continue
         path, src = _resolve_sfx(cue.tag, rng, settings.sfx_source)
         if path is None:
             note_source(src)
@@ -1240,6 +1377,9 @@ def apply_sound(timeline: Timeline, plan: SoundPlan, settings: PresentationSetti
         note_source(src)
 
     for cue in plan.loops:
+        if cue.text or cue.path:
+            _place_scene_sound(timeline, cue, "bed", settings, rng, scene)
+            continue
         path, src = _resolve_sfx(cue.tag, rng, settings.sfx_source)
         if path is None:
             note_source(src)
@@ -1262,6 +1402,11 @@ def apply_sound(timeline: Timeline, plan: SoundPlan, settings: PresentationSetti
         item.label = f"SFX loop: {cue.tag}"
         counts["sfx"] += 1
         note_source(src)
+
+    if scene["any"]:
+        counts["diegetic"] = scene["placed"]
+        counts["diegetic_sources"] = scene["sources"]
+        counts["diegetic_unresolved"] = scene["unresolved"]
 
     _drop_orphan_audio_sources(timeline)
     timeline.recalculate_duration()

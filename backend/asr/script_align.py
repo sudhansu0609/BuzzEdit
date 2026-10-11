@@ -12,7 +12,11 @@ script, this module aligns it to the transcript words and:
   topic boundaries, which a model reading timestamps only ever estimated;
 * **carries stage directions** — `[map: Jaipur]`, `[sfx: thunder]`,
   `[broll: an old haveli at night]`, `[text: 40% of students]` written into
-  the script become beats at the moment the surrounding words are spoken.
+  the script become beats at the moment the surrounding words are spoken;
+* **knows who speaks** — a speaker label at the start of a line (`MAYA (V.O.)`,
+  `**V.O. (Narrator):**`, `HOST:`, `MAYA:`) gives the paragraph it opens a
+  `speaker`, and `speaker_spans()` turns that into time spans on the words
+  (the voice map of VOICE_CHANGER_PLAN.md converts the characters' spans).
 
 Alignment is `difflib` over normalised tokens with a fuzzy pairing inside the
 replaced runs. It does not need to be perfect: an unaligned word simply keeps
@@ -42,6 +46,30 @@ DIRECTIVES = ("map", "sfx", "broll", "video", "text", "title", "card", "chapter"
 _DIRECTIVE_RE = re.compile(
     r"\[\s*(" + "|".join(DIRECTIVES) + r")\s*:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 _HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.+?)\s*$")
+
+# Speaker labels (VOICE_CHANGER_PLAN.md brief S1; the label forms of the Studio's
+# integrations/script_reconcile.py `_LABEL_RE` / `_SPEAKER_LABEL_RE`). A label at the start of a
+# line names who speaks from there to the next label or the end of the block, and is not spoken:
+#   MAYA (V.O.)           a screenplay cue -- alone on its line (the speech follows), or with ": text"
+#   **V.O. (Narrator):**  a label and a colon -- any case when emphasised or when it names the narrator
+#   HOST: / MAYA:         an upper-case name and a colon
+# The narrator's labels (V.O., Narrator, Host, Me, Anchor, Presenter, Speaker, Voice-over) give no
+# speaker: the narrator is the creator, never converted. Production-note labels ("VISUAL:",
+# "TEXT OVERLAY:", "SFX:") are not speakers; such a line stays as it was. A block holding only a
+# label hands it to the next block; a paragraph without a label has no speaker (= the narrator).
+_VO_MARK = r"(?:V\.?\s*O\.?|O\.?\s*S\.?|O\.?\s*C\.?|CONT'?D\.?)"
+_CUE_LINE_RE = re.compile(
+    r"^\s*[*_]*\s*([A-Za-z][A-Za-z0-9 .'&-]{0,40}?)\s*\(\s*" + _VO_MARK + r"\s*\)\s*[*_]*\s*"
+    r"(?::\s*[*_]*\s*(.*))?$", re.IGNORECASE)
+_COLON_LABEL_RE = re.compile(
+    r"^\s*([*_]*)\s*([A-Za-z][A-Za-z0-9 .()/&'-]{0,40}?)\s*[*_]*\s*:\s*[*_]*\s*(.*)$")
+_VO_MARK_RE = re.compile(r"(?<![A-Za-z])" + _VO_MARK + r"(?![A-Za-z])", re.IGNORECASE)
+_NOTE_LABEL_RE = re.compile(
+    r"\b(visual|text|overlay|sfx|sound|music|b-?roll|graphic|camera|shot|note|on-?screen|cut|"
+    r"transition|lower third|caption|title|scene|thumbnail|edit|fx|bgm|cta|duration|tone|brand|language)\b",
+    re.IGNORECASE)
+NARRATOR_LABELS = frozenset({"", "narrator", "host", "me", "anchor", "presenter", "speaker", "voice",
+                             "voiceover", "voice-over", "voice over", "sutradhar"})
 _DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
 _TOKEN_RE = re.compile(r"\S+")
 
@@ -54,23 +82,58 @@ LOOSE_PAIR_RATIO = 0.34
 
 # --- parsing ---------------------------------------------------------------------
 
+def _speaker_name(raw: str) -> Optional[str]:
+    """A label's speaker: "MAYA (V.O.)" -> "MAYA", "V.O. (Narrator)" -> None (the narrator)."""
+    name = _VO_MARK_RE.sub(" ", re.sub(r"[*_`~]+", "", raw))
+    name = re.sub(r"\(\s*\)", " ", name)
+    outside = re.sub(r"\([^)]*\)", " ", name)
+    inside = " ".join(re.findall(r"\(([^)]*)\)", name))
+    name = outside if outside.strip(" .-/&'") else inside
+    name = re.sub(r"\s+", " ", name).strip(" .-/&'")
+    return None if name.casefold() in NARRATOR_LABELS else name
+
+
+def speaker_label(line: str) -> Optional[Tuple[Optional[str], str]]:
+    """(speaker, the rest of the line) when `line` opens with a speaker label, else None.
+    speaker None = the narrator."""
+    cue = _CUE_LINE_RE.match(line)
+    if cue:
+        return _speaker_name(cue.group(1)), (cue.group(2) or "").strip()
+    label = _COLON_LABEL_RE.match(line)
+    if not label:
+        return None
+    emphasis, raw, rest = label.group(1), label.group(2), label.group(3)
+    speaker = _speaker_name(raw)
+    if speaker is None or _VO_MARK_RE.search(raw):
+        return speaker, rest.strip()
+    if (emphasis or raw.isupper()) and not _NOTE_LABEL_RE.search(raw):
+        return speaker, rest.strip()
+    return None
+
+
 def parse_script(text: str) -> Dict[str, Any]:
     """Paragraphs of spoken tokens plus the directives found among them.
 
-    Returns {"paragraphs": [{"index", "text", "tokens", "heading"}],
+    Returns {"paragraphs": [{"index", "text", "tokens", "heading", "speaker"}],
              "directives": [{"kind", "arg", "paragraph", "token"}]}
     where `token` is the index (into the flat spoken-token list) of the word
-    the directive sits before — the moment it should happen.
+    the directive sits before — the moment it should happen. A speaker label
+    (`speaker_label`) starts a new paragraph and is not a spoken token;
+    `speaker` is None for the narrator and for a paragraph without a label.
     """
     paragraphs: List[Dict[str, Any]] = []
     directives: List[Dict[str, Any]] = []
     flat_index = 0
     pending_heading: Optional[str] = None
+    pending_speaker: Optional[str] = None      # a label alone in its block speaks the next one
 
     blocks = re.split(r"\n\s*\n", (text or "").replace("\r\n", "\n").strip())
     for block in blocks:
         lines = block.split("\n")
-        spoken_lines: List[str] = []
+        # (speaker, lines, labelled) runs of this block: a label line closes the run before it
+        runs: List[Tuple[Optional[str], List[str], bool]] = []
+        speaker, spoken_lines, labelled = pending_speaker, [], False
+        pending_speaker = None
         for line in lines:
             heading = _HEADING_RE.match(line)
             if heading:
@@ -78,35 +141,48 @@ def parse_script(text: str) -> Dict[str, Any]:
                 directives.append({"kind": "chapter", "arg": pending_heading,
                                    "paragraph": len(paragraphs), "token": flat_index})
                 continue
+            label = speaker_label(line)
+            if label is not None:
+                if "\n".join(spoken_lines).strip():
+                    runs.append((speaker, spoken_lines, labelled))
+                speaker, labelled = label[0], True
+                spoken_lines = [label[1]] if label[1] else []
+                continue
             spoken_lines.append(line)
-        body = "\n".join(spoken_lines).strip()
-        if not body:
-            continue
+        runs.append((speaker, spoken_lines, labelled))
+        if labelled and not "\n".join(spoken_lines).strip():
+            pending_speaker = speaker
 
-        tokens: List[str] = []
-        cursor = 0
-        for match in _DIRECTIVE_RE.finditer(body):
-            before = body[cursor:match.start()]
-            tokens.extend(_TOKEN_RE.findall(before))
-            directives.append({
-                "kind": match.group(1).lower(),
-                "arg": match.group(2).strip(),
-                "paragraph": len(paragraphs),
-                "token": flat_index + len(tokens),
+        for speaker, spoken_lines, _labelled in runs:
+            body = "\n".join(spoken_lines).strip()
+            if not body:
+                continue
+
+            tokens: List[str] = []
+            cursor = 0
+            for match in _DIRECTIVE_RE.finditer(body):
+                before = body[cursor:match.start()]
+                tokens.extend(_TOKEN_RE.findall(before))
+                directives.append({
+                    "kind": match.group(1).lower(),
+                    "arg": match.group(2).strip(),
+                    "paragraph": len(paragraphs),
+                    "token": flat_index + len(tokens),
+                })
+                cursor = match.end()
+            tokens.extend(_TOKEN_RE.findall(body[cursor:]))
+            if not tokens:
+                continue
+            paragraphs.append({
+                "index": len(paragraphs),
+                "text": " ".join(tokens),
+                "tokens": tokens,
+                "first_token": flat_index,
+                "heading": pending_heading,
+                "speaker": speaker,
             })
-            cursor = match.end()
-        tokens.extend(_TOKEN_RE.findall(body[cursor:]))
-        if not tokens:
-            continue
-        paragraphs.append({
-            "index": len(paragraphs),
-            "text": " ".join(tokens),
-            "tokens": tokens,
-            "first_token": flat_index,
-            "heading": pending_heading,
-        })
-        pending_heading = None
-        flat_index += len(tokens)
+            pending_heading = None
+            flat_index += len(tokens)
 
     return {"paragraphs": paragraphs, "directives": directives}
 
@@ -286,6 +362,39 @@ def paragraph_spans(parsed: Dict[str, Any], words: Sequence[Dict[str, Any]],
         entry["end"] = next_start if next_start is not None else entry["start"] + 1.0
         entry["estimated"] = True
     return [s for s in spans if "start" in s]
+
+
+def speaker_spans(parsed: Dict[str, Any], words: Sequence[Dict[str, Any]],
+                  pairs: Optional[Sequence[Tuple[int, int]]] = None,
+                  start_key: str = "start", end_key: str = "end") -> List[Dict[str, Any]]:
+    """Who speaks when: [{speaker, start_s, end_s, text}] in the WORDS' time base.
+
+    Built on `paragraph_spans`: each paragraph's span with its `speaker` (None = the narrator),
+    consecutive paragraphs of the same speaker merged into one span. A paragraph none of whose
+    words were heard has no time of its own (its span would only be the gap between its
+    neighbours) and is left out -- and nothing merges across it, so a character's span never
+    swallows a line someone else may have said there. `pairs` defaults to `align` over the
+    script and `words`.
+    """
+    if pairs is None:
+        pairs = align(flat_tokens(parsed), list(words))
+    speakers = {p["index"]: p.get("speaker") for p in parsed["paragraphs"]}
+    spans: List[Dict[str, Any]] = []
+    last_index: Optional[int] = None
+    for entry in paragraph_spans(parsed, words, pairs, start_key, end_key):
+        if entry.get("estimated") or not entry.get("aligned_words"):
+            continue
+        speaker = speakers.get(entry["index"])
+        start, end = float(entry["start"]), float(entry["end"])
+        if spans and spans[-1]["speaker"] == speaker and last_index == entry["index"] - 1:
+            last = spans[-1]
+            last["start_s"] = min(last["start_s"], start)
+            last["end_s"] = max(last["end_s"], end)
+            last["text"] = f"{last['text']} {entry['text']}"
+        else:
+            spans.append({"speaker": speaker, "start_s": start, "end_s": end, "text": entry["text"]})
+        last_index = entry["index"]
+    return spans
 
 
 def directive_times(parsed: Dict[str, Any], words: Sequence[Dict[str, Any]],

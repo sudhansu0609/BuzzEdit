@@ -22,6 +22,7 @@ never a filter: in Raat3Baje ep1's final cut, 37% of what was said was ad-lib.
 
 import math
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -42,6 +43,14 @@ CUT_OFF_FRAMES = 4             # sound gone within 40 ms of its last loud frame:
 FADE_DB = 10.0                 # dropping at least this over the last 400 ms
 DRAWN_OUT_S = 1.2              # a single word held this long
 FILLERS = {"[uh]", "uh", "um", "umm", "hmm", "aa", "aaa", "उम", "अ", "आ", "हम्म"}
+# Words a finished sentence cannot end on: Hindi postpositions, conjunctions and oblique
+# pronouns, their romanised spellings, and English connectives. A measurement for the editor.
+UNFINISHED_ENDINGS = frozenset((
+    "में से को के की का पर तक ने और कि लेकिन मगर या जो जब अगर क्योंकि ताकि मुझे उसे हमें उन्हें "
+    "तुम्हें इसे इन्हें लिए बाद साथ बारे वजह तरफ तरह पास "
+    "mein me se ko ke ki ka par tak ne aur lekin magar ya jo jab agar kyunki kyonki taaki mujhe use "
+    "humein hamein unhe unhein tumhe liye baad saath baare wajah taraf tarah paas "
+    "and but so because the a an to of in that with which for or if when").split())
 
 
 @dataclass
@@ -186,6 +195,15 @@ def _semitones(a: float, b: float) -> float:
     return 12.0 * math.log2(a / b) if a > 0 and b > 0 and not (math.isnan(a) or math.isnan(b)) else 0.0
 
 
+def _ends_on_connective(u: Utterance, words: Sequence[Dict[str, Any]]) -> bool:
+    """The line's last word is one a finished sentence cannot end on (UNFINISHED_ENDINGS)."""
+    from .tokens import spoken
+    if not u.word_indices:
+        return False
+    last = unicodedata.normalize("NFC", spoken(words[u.word_indices[-1]])).lower()
+    return re.sub(r"[^\w\u0900-\u097F]", "", last) in UNFINISHED_ENDINGS
+
+
 def _word_notes(u: Utterance, words: Sequence[Dict[str, Any]]) -> List[str]:
     notes = []
     fillers = sum(1 for i in u.word_indices if _key(words[i]) in FILLERS
@@ -197,6 +215,8 @@ def _word_notes(u: Utterance, words: Sequence[Dict[str, Any]]) -> List[str]:
         notes.append(f"a word held {longest:.1f} s")
     if u.untranscribed_s:
         notes.append(f"{u.untranscribed_s:.1f} s of speech the transcript missed")
+    if _ends_on_connective(u, words):
+        notes.append("ends on a connective (unfinished)")
     return notes
 
 
@@ -265,6 +285,8 @@ def _acoustics(utterances: List[Utterance], words: Sequence[Dict[str, Any]], aud
                 notes.append("rushed")
             elif rate < 0.7 * median_rate:
                 notes.append("slow")
+        if _ends_on_connective(u, words):
+            unfinished = True                    # its note comes with the word notes below
         u.notes = notes + _word_notes(u, words)
         if not math.isnan(f0_tail):
             previous_tail_f0 = f0_tail

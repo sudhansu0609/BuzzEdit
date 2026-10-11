@@ -68,6 +68,23 @@ def test_the_anchor_can_never_run_off_the_canvas():
 
 # --- planning the moves ----------------------------------------------------
 
+def test_the_base_zoom_becomes_the_master_transform_and_one_leaves_it_alone():
+    """A resting frame for the whole recording (2026-10-08: the creator wanted
+    a tighter default crop that every zoom then moves from). It is the master
+    transform, which the compiler applies to V1 before the overlays, so B-roll
+    keeps its full frame."""
+    from presentation.facezoom import apply_base_zoom
+    from timeline.schema import Timeline, SourceFile
+    tl = Timeline(fps_num=24, fps_den=1,
+                  sources={"s": SourceFile(id="s", path="C:/m.mp4", duration_seconds=10,
+                                           width=1920, height=1080)}, items=[])
+    assert apply_base_zoom(tl, PresentationSettings(base_zoom=1.0)) == 1.0
+    assert tl.master_transform is None
+    assert apply_base_zoom(tl, PresentationSettings(base_zoom=1.15)) == 1.15
+    assert tl.master_transform is not None and tl.master_transform.scale == 1.15
+    assert apply_base_zoom(tl, PresentationSettings(base_zoom=9.0)) == 1.5   # capped
+
+
 def test_every_segment_move_pushes_in_so_each_join_resets_wide():
     """Every clip starts wide and drifts tighter, so every V1 join steps back to
     wide by the whole depth of the move — a punch-out, the standard disguise for

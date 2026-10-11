@@ -13,6 +13,8 @@ import {
 import {
   ColorField, PresetChips, Row, Section, Slider, toHex,
 } from './controls';
+import { useLayoutStore } from '../hooks/layout';
+import { getEffects } from '../hooks/audioApi';
 
 const DEFAULT_TRANSFORM: ClipTransform = {
   crop_left: 0, crop_top: 0, crop_right: 0, crop_bottom: 0,
@@ -55,6 +57,7 @@ const MASTER_PRESETS: Record<string, Record<string, any>> = {
   clean: { voice_enhance: 'auto', voice_denoise: 0.4, voice_eq_preset: 'clean' },
   podcast: { voice_eq_preset: 'podcast', voice_compress: 0.5, loudness_lufs: -16 },
   rap_vocal: { voice_eq_preset: 'rap_vocal', voice_compress: 0.8, voice_saturation: 0.3, loudness_lufs: -14 },
+  crisp_bass: { voice_eq_preset: 'crisp_bass', voice_deess: 0.45, voice_compress: 0.65, voice_saturation: 0.2, loudness_lufs: -14 },
   broadcast: { voice_eq_preset: 'broadcast', voice_compress: 0.6, loudness_lufs: -14 },
   reset: {
     voice_gain_db: 0, voice_enhance: 'auto', voice_denoise: 0, voice_deess: 0, voice_compress: 0,
@@ -155,6 +158,7 @@ function StyleSummary({ profile }: { profile: StyleProfile }) {
 
 export default function InspectorPanel() {
   const { project, updateProject, selectedClipId, setError, currentTime } = useProjectStore();
+  const showPanel = useLayoutStore((s) => s.toggleVisible);
   const [fonts, setFonts] = useState<FontFamily[]>([]);
   const [presets, setPresets] = useState<PresetCatalogue | null>(null);
   const [busy, setBusy] = useState(false);
@@ -260,6 +264,16 @@ export default function InspectorPanel() {
     if (audioSectionOpen) loadAudioMaster();
   }, [audioSectionOpen, loadAudioMaster]);
 
+  // Effect names for the Audio section's one-line rack summary: the catalogue, fetched once the
+  // section opens (until then, or on a backend without it, an effect id reads as words).
+  const [effectNames, setEffectNames] = useState<Record<string, string> | null>(null);
+  useEffect(() => {
+    if (!audioSectionOpen || effectNames) return;
+    getEffects()
+      .then((c) => setEffectNames(Object.fromEntries((c.effects || []).map((d) => [d.id, d.name]))))
+      .catch(() => setEffectNames({}));
+  }, [audioSectionOpen, effectNames]);
+
   const storedTransform: ClipTransform = {
     ...DEFAULT_TRANSFORM,
     ...((item ? item.transform : timeline?.master_transform) || {}),
@@ -322,6 +336,16 @@ export default function InspectorPanel() {
   // V1's sound IS the A1 voice, so a V1 clip gets the same programme-level controls.
   const isA1Clip = (isATrack && itemTrack.toUpperCase() === 'A1') || isV1Clip;
   const showAudioSection = isATrack || isV1Clip;
+  // The rack the Audio panel opens on for this clip: A1's for an A1/V1 clip, its own on A2+.
+  const scopeRack: any[] = !showAudioSection ? []
+    : isA1Clip ? (Array.isArray(timeline?.audio_racks?.A1) ? timeline.audio_racks.A1 : [])
+      : (Array.isArray(item?.audio_effects) ? item.audio_effects : []);
+  const rackSummary = scopeRack.length === 0 ? 'No effects'
+    : `${scopeRack.length} effect${scopeRack.length === 1 ? '' : 's'}: ${scopeRack.map((fx: any) => {
+      const id = String(fx?.effect ?? '');
+      const name = effectNames?.[id] || id.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+      return fx?.enabled === false ? `${name} (off)` : name;
+    }).join(', ')}`;
 
   const storedClipAudio = {
     volume: item?.volume ?? 1, mute: !!item?.mute, loop: !!item?.loop,
@@ -807,6 +831,17 @@ export default function InspectorPanel() {
       {showAudioSection && (
         <Section title="Audio (this clip)" defaultOpen={false}
           onToggle={(open) => setAudioSectionOpen(open)}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+            <button className="btn btn-sm" onClick={() => showPanel('audio', true)}
+              title="Effects racks heard live, noise reduction, presets and loudness">
+              Open Audio panel
+            </button>
+            <span className="text-xs text-muted"
+              title={`${isA1Clip ? 'Programme (A1) rack' : "This clip's rack"}: ${rackSummary}`}
+              style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {rackSummary}
+            </span>
+          </div>
           <Slider label="Gain"
             value={isA1Clip ? master.voice_gain_db : dbFromVolume(clipAudio.volume)}
             min={-24} max={isA1Clip ? 24 : 12} step={0.5}
@@ -846,6 +881,7 @@ export default function InspectorPanel() {
               { id: 'clean', label: 'Clean' },
               { id: 'podcast', label: 'Podcast' },
               { id: 'rap_vocal', label: 'Rap vocals' },
+              { id: 'crisp_bass', label: 'Crisp & bassy' },
               { id: 'broadcast', label: 'Broadcast' },
               { id: 'reset', label: 'Reset' },
             ]}

@@ -40,3 +40,7 @@ data/cache/
 data/music/
 text_*.txt
 backend/text_*.txt
+
+# Audio suite: generated impulse responses and the creator's voice references (large WAVs)
+data/ir/synthetic/
+data/voices/

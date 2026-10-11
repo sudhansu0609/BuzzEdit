@@ -213,14 +213,25 @@ async def bench_product(name: str, args) -> List[Dict[str, Any]]:
                       tokens_in=ed["tokens_in"], tokens_out=ed["tokens_out"],
                       usd=round((ed["tokens_in"] * OPUS_PRICE[0] + ed["tokens_out"] * OPUS_PRICE[1]) / 1e6, 3),
                       reads=ed["reads"], removed_takes=ed["removed_takes"], trims=ed["trims"],
-                      kept_under_doubt=ed["kept_under_doubt"], style_examples=ed["style_examples"],
-                      untranscribed_cut_s=ed["untranscribed_cut_s"], refused=ed["refused"])
+                      kept_by_minority=ed.get("kept_by_minority", 0), style_examples=ed.get("style_examples", 0),
+                      untranscribed_cut_s=ed["untranscribed_cut_s"], refused=ed["refused"],
+                      repeats_remaining=ed.get("repeats_remaining", 0),
+                      false_starts_remaining=ed.get("false_starts_remaining", 0),
+                      candidates=ed.get("candidates", 0), verified_removed=ed.get("verified_removed", 0),
+                      sweep_groups=ed.get("sweep_groups", 0), final_read_removed=ed.get("final_read_removed", 0),
+                      final_read_restored=ed.get("final_read_restored", 0),
+                      steps_failed=ed.get("steps_failed", []))
         results.append(result)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         path = _eval_dir() / "results" / f"product_{name}_{time.strftime('%Y%m%dT%H%M%S')}_{run}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"result": result, "review": report.get("review")}, ensure_ascii=False,
-                                   indent=1), encoding="utf-8")
+        detail = {
+            "refused_notes": ed.get("refused_notes") or [],
+            "words": [{"start": w.get("start"), "end": w.get("end"), "word": w.get("word"),
+                       "enabled": bool(w.get("enabled", True)), "reason": w.get("reason")} for w in out],
+        }
+        path.write_text(json.dumps({"result": result, "review": report.get("review"), "detail": detail},
+                                   ensure_ascii=False, indent=1), encoding="utf-8")
     return results
 
 

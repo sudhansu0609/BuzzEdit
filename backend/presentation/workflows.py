@@ -55,6 +55,19 @@ DEFAULT_FILE = {
     "thumbnail": "thumbnail.json",
 }
 
+# The clip-generation toggle (app setting `clip_generation_mode`), consulted for
+# `broll_video` when `workflow_broll_video` names no file. Both run at Wan's
+# native 16 fps. "classic" is the 832x480 graph (fitted to full HD by ffmpeg);
+# "hq" is the 2026-10 HQ graph without its RIFE stage -- hi-res first frame,
+# 1024x576, RealESRGAN to 1920x1080 -- with the classic graph as its fallback.
+CLIP_GENERATION_SETTING = "clip_generation_mode"
+DEFAULT_CLIP_GENERATION_MODE = "classic"
+CLIP_GENERATION_MODES: Dict[str, Dict[str, Any]] = {
+    "classic": {"file": "zimage_wan22_i2v.json", "size": [832, 480], "fps": 16, "fallback": None},
+    "hq": {"file": "zimage_wan22_i2v_hq16.json", "size": [1024, 576], "fps": 16,
+           "fallback": "zimage_wan22_i2v.json"},
+}
+
 # Node classes that carry a prompt.
 _TEXT_CLASSES = ("CLIPTextEncode", "CLIPTextEncodeSDXL", "T5TextEncode",
                  "CLIPTextEncodeFlux", "TextEncodeQwenImageEdit")
@@ -354,17 +367,33 @@ def _settings_value(key: str) -> Optional[str]:
         return None
 
 
+def clip_generation_modes() -> Dict[str, Dict[str, Any]]:
+    """Each clip-generation mode: its graph file, generation size and fps."""
+    return copy.deepcopy(CLIP_GENERATION_MODES)
+
+
+def clip_generation_mode() -> str:
+    """The selected clip-generation mode; anything unknown reads as the default."""
+    value = (_settings_value(CLIP_GENERATION_SETTING) or "").strip().lower()
+    return value if value in CLIP_GENERATION_MODES else DEFAULT_CLIP_GENERATION_MODE
+
+
 def resolve(role: str) -> Optional[ResolvedWorkflow]:
     """The workflow to use for a role, fully bound, or None if unconfigured."""
     if role not in ROLES:
         return None
     manifest = load_manifest().get("roles", {}).get(role, {})
-    file_name = _settings_value(SETTINGS_KEY[role]) or manifest.get("file") \
-        or DEFAULT_FILE.get(role)
+    explicit = _settings_value(SETTINGS_KEY[role])
+    if role == "broll_video" and not explicit:
+        # No file named in the settings: the clip-generation mode decides.
+        mode = CLIP_GENERATION_MODES[clip_generation_mode()]
+        file_name, fallback_name = mode["file"], mode["fallback"]
+    else:
+        file_name = explicit or manifest.get("file") or DEFAULT_FILE.get(role)
+        fallback_name = manifest.get("fallback_file")
     if not file_name:
         return None
 
-    fallback_name = manifest.get("fallback_file")
     fallback = (_bind(role, fallback_name, manifest)
                 if fallback_name and fallback_name != file_name else None)
     resolved = _bind(role, file_name, manifest)
@@ -435,7 +464,12 @@ def current_selection() -> Dict[str, Optional[str]]:
     selection: Dict[str, Optional[str]] = {}
     manifest_roles = load_manifest().get("roles", {})
     for role in ROLES:
-        selection[role] = (_settings_value(SETTINGS_KEY[role])
+        explicit = _settings_value(SETTINGS_KEY[role])
+        if role == "broll_video" and not explicit:
+            # As in resolve(): with no file named, the clip-generation mode decides.
+            selection[role] = CLIP_GENERATION_MODES[clip_generation_mode()]["file"]
+            continue
+        selection[role] = (explicit
                            or manifest_roles.get(role, {}).get("file")
                            or DEFAULT_FILE.get(role))
     return selection

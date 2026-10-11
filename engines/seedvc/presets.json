@@ -1,0 +1,51 @@
+{
+  "_source": "SkinWalker app/config.py (ENGINE_DEFAULTS, PRESETS) and app/effects.py (FX_PRESETS), copied 2026-10-09 for VOICE_CHANGER_PLAN.md brief S0",
+  "_notes": [
+    "engine_defaults: the seed-vc parameters every conversion starts from (cli.py reads them); a preset's engine block overrides them.",
+    "voice: the stem of the preset's reference clip, <voices_dir>/<voice>.wav.",
+    "fx: the creature-FX intent after the conversion, as plain values. cli.py does not apply FX; BuzzEdit turns them into live rack effects (S1/S2).",
+    "SkinWalker's own UI applied only formant/drive/reverb/sub_octave of these: its fx pitch_semitones never reached the audio (the engine's pitch_shift did), and its formant was a shelf tilt, not a real formant shift."
+  ],
+  "engine_defaults": {
+    "diffusion_steps": 25,
+    "length_adjust": 1.0,
+    "inference_cfg_rate": 0.7,
+    "f0_condition": false,
+    "auto_f0_adjust": true,
+    "pitch_shift": 0
+  },
+  "fx_units": {
+    "pitch_semitones": "semitones, pitch shift after the conversion",
+    "formant": "formant shift amount, negative = darker/bigger (SkinWalker: shelf tilt of formant*2 dB, +low shelf 300 Hz / -high shelf 3 kHz)",
+    "drive": "0..1, distortion drive_db = drive*30",
+    "reverb": "0..1, room size = reverb, wet level = reverb*0.5",
+    "sub_octave": "0..1, gain of a copy pitched -12 semitones mixed in"
+  },
+  "presets": {
+    "Woman": {
+      "voice": "woman",
+      "engine": {"f0_condition": true, "auto_f0_adjust": true, "pitch_shift": 0, "diffusion_steps": 25},
+      "fx": {"pitch_semitones": 0, "formant": 0, "drive": 0, "reverb": 0.1, "sub_octave": 0}
+    },
+    "Child": {
+      "voice": "child",
+      "engine": {"f0_condition": true, "auto_f0_adjust": true, "pitch_shift": 4, "diffusion_steps": 25},
+      "fx": {"pitch_semitones": 3, "formant": 0, "drive": 0, "reverb": 0.1, "sub_octave": 0}
+    },
+    "Demon": {
+      "voice": "demon",
+      "engine": {"f0_condition": true, "auto_f0_adjust": true, "pitch_shift": -5, "diffusion_steps": 30},
+      "fx": {"pitch_semitones": -4, "formant": 0, "drive": 0.35, "reverb": 0.4, "sub_octave": 0.5}
+    },
+    "Monster": {
+      "voice": "demon",
+      "engine": {"f0_condition": true, "auto_f0_adjust": true, "pitch_shift": -7, "diffusion_steps": 30},
+      "fx": {"pitch_semitones": -7, "formant": -3, "drive": 0.5, "reverb": 0.5, "sub_octave": 0.7}
+    },
+    "Ghost": {
+      "voice": "woman",
+      "engine": {"f0_condition": false, "pitch_shift": 0, "diffusion_steps": 25},
+      "fx": {"pitch_semitones": -1, "formant": 0, "drive": 0, "reverb": 0.8, "sub_octave": 0}
+    }
+  }
+}

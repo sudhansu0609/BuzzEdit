@@ -288,6 +288,8 @@ def test_a_neutral_master_compiles_to_nothing():
     ("warm_radio", ["highpass=f=100", "equalizer=f=200", "lowpass=f=9000"]),
     ("rap_vocal", ["highpass=f=100", "equalizer=f=350", "equalizer=f=5000",
                   "treble=g=3.0:f=12000", "aexciter=", "mix=0.35"]),
+    ("crisp_bass", ["highpass=f=70", "bass=g=4.0:f=160", "equalizer=f=350", "equalizer=f=3500",
+                    "treble=g=3.0:f=10000", "aexciter=", "mix=0.35", "alimiter="]),
     ("horror_intimate", ["highpass=f=60", "aecho="]),
     ("clean", ["highpass=f=70", "equalizer=f=300", "equalizer=f=4000"]),
     ("podcast", ["highpass=f=70", "acompressor="]),
@@ -301,6 +303,23 @@ def test_voice_chain_per_preset_carries_its_named_eq(preset, expected_filters):
     joined = ",".join(chain)
     for expected in expected_filters:
         assert expected in joined, f"{preset}: missing {expected!r} in {joined!r}"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_every_voice_preset_chain_runs_through_ffmpeg(tmp_path):
+    """Every preset's full chain (its EQ, exciter, de-esser, compressor, limiter)
+    is accepted by the real ffmpeg. Caught once: the exciter's `ceil` below 9999
+    made every render with saturation > 0 fail, and no string test can see that."""
+    for preset, (denoise, deess, compress) in sound.VOICE_PRESETS.items():
+        master = AudioMaster(voice_denoise=denoise, voice_deess=deess, voice_compress=compress,
+                             voice_eq_preset=preset, voice_saturation=0.5, voice_enhance="ffmpeg")
+        chain = ",".join(render_audio.build_voice_chain(master))
+        out = tmp_path / f"{preset}.wav"
+        result = subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=220:duration=0.5",
+             "-af", chain, str(out)], capture_output=True, text=True)
+        assert result.returncode == 0, f"{preset}: {result.stderr.strip()} in {chain!r}"
+        assert out.stat().st_size > 1000
 
 
 def test_no_preset_afftdn_ever_exceeds_6db_by_default():
@@ -683,3 +702,79 @@ def test_picked_tracks_that_cannot_be_used_leave_silence_not_a_guess(monkeypatch
                                     music_tracks=[{"file": "uploads/ripped.mp3", "volume_db": -20}])
     plan = sound.plan_sound(timeline, build_program(timeline), settings, "horror", 1)
     assert plan.music == [] and "music_missing" in plan.notes
+
+
+# --- scene sounds ---------------------------------------------------------------
+
+def test_scene_sounds_are_levelled_ducked_and_placed_with_the_one_shots_off():
+    from backend.presentation.sound_design import DiegeticCue
+    timeline = _timeline(60.0)
+    settings = PresentationSettings(sfx=False, music=False, ambience=False, sfx_volume=0.3)
+    cues = [DiegeticCue(5.0, "footsteps on gravel", level="subtle", seconds=3),
+            DiegeticCue(5.8, "door creak"),          # within 1.2 s of the first: dropped
+            DiegeticCue(10.0, "rain", kind="bed", seconds=90),
+            DiegeticCue(30.0, "jeep engine idling", kind="bed")]
+    plan = sound.plan_sound(timeline, build_program(timeline), settings, "horror", 1,
+                            diegetic=cues)
+    assert [(c.text, c.at_s) for c in plan.sfx] == [("footsteps on gravel", 5.0)]
+    accent = plan.sfx[0]
+    caps = min(settings.sfx_volume, settings.sfx_diegetic_volume)
+    assert accent.kind == "accent" and accent.duck > 0 and accent.duration_s == 3.0
+    assert accent.gain == pytest.approx(0.5 * settings.sfx_diegetic_volume) and accent.gain <= caps
+    # A bed runs its seconds up to the next bed; the default is 20 s.
+    assert [(l.text, l.start_s, l.end_s) for l in plan.loops] == [
+        ("rain", 10.0, 30.0), ("jeep engine idling", 30.0, 50.0)]
+    assert all(l.duck > 0 and 0 < l.gain <= caps for l in plan.loops)
+    off = sound.plan_sound(timeline, build_program(timeline),
+                           settings.model_copy(update={"sfx_diegetic": False}), "horror", 1,
+                           diegetic=cues)
+    assert not off.sfx and not off.loops
+
+
+def test_scene_accents_give_way_to_tagged_one_shots_and_cap_at_eight_a_minute():
+    from backend.presentation.sound_design import DiegeticCue
+    timeline = _timeline(60.0)
+    settings = PresentationSettings(music=False, ambience=False)
+    cues = [DiegeticCue(3.5, "door knock")] + [DiegeticCue(10.0 + i * 2.0, "footsteps")
+                                               for i in range(12)]
+    plan = sound.plan_sound(timeline, build_program(timeline), settings, "horror", 1,
+                            broll_windows=[(3.0, 6.0)], diegetic=cues)
+    assert [c.tag for c in plan.sfx if not c.text] == ["whoosh"]
+    accents = [c for c in plan.sfx if c.text]
+    assert all(abs(c.at_s - 3.0) >= sound.MIN_SFX_GAP_S for c in accents)
+    assert len(accents) == sound.DIEGETIC_ACCENTS_PER_MINUTE
+    assert accents[0].at_s == 10.0
+
+
+def test_scene_sounds_go_on_the_effects_lane_and_are_counted(monkeypatch, tmp_path):
+    from backend.presentation import sfx_library
+    from backend.presentation.sound_design import DiegeticCue
+    files = {"footsteps on gravel": tmp_path / "steps.wav", "rain": tmp_path / "rain.wav"}
+    for path in files.values():
+        path.write_bytes(b"RIFF" + b"\0" * 2000)
+
+    def resolve(text, rng, kind="accent", min_s=0.3, max_s=None, roots=None):
+        path = files.get(text)
+        return (path, 3, "library") if path else (None, 0, "none")
+
+    monkeypatch.setattr(sfx_library, "resolve_effect", resolve)
+    monkeypatch.setattr(sfx_library, "prepare_effect", lambda path, kind="accent": path)
+    monkeypatch.setattr(sfx_library, "library_roots", lambda extra=None: [tmp_path])
+    monkeypatch.setattr(sound, "_probe_duration", lambda path: 10.0)
+    timeline = _timeline(40.0)
+    settings = PresentationSettings(sfx=False, music=False, ambience=False)
+    cues = [DiegeticCue(4.0, "footsteps on gravel", seconds=3), DiegeticCue(8.0, "a temple conch"),
+            DiegeticCue(12.0, "rain", kind="bed", seconds=10)]
+    plan = sound.plan_sound(timeline, build_program(timeline), settings, "horror", 1,
+                            diegetic=cues)
+    counts = sound.apply_sound(timeline, plan, settings)
+    assert counts["diegetic"] == 2
+    assert counts["diegetic_sources"] == {"library": 2, "none": 1}
+    assert counts["diegetic_unresolved"] == ["a temple conch"]
+    items = {i.label: i for i in timeline.items if i.origin == sound.SFX_ORIGIN}
+    steps, rain = items["SFX: footsteps on gravel"], items["SFX bed: rain"]
+    assert steps.track == rain.track == "A3"
+    assert steps.duck > 0 and rain.duck > 0 and rain.loop and not steps.loop
+    assert max(steps.volume, rain.volume) <= min(settings.sfx_volume, settings.sfx_diegetic_volume)
+    assert steps.timeline_end_frame - steps.timeline_start_frame == 90     # 3 s at 30 fps
+    assert rain.timeline_end_frame - rain.timeline_start_frame == 300

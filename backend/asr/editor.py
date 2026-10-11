@@ -67,6 +67,17 @@ Keep everything else, including deliberate repetition for effect, rhetorical que
 dramatic pauses. Never remove content that is said nowhere else unless it is clearly a mistake or
 chatter. When unsure whether to remove something, keep it.
 
+The speaker, dialect and style:
+- Regional and dialect Hindi forms are style, never errors: Bihari, Awadhi, Bhojpuri, Haryanvi or
+  Punjabi-influenced verb forms, "हम" for "मैं", regional vocabulary. So are Hinglish
+  code-switching and the speaker's habitual phrases.
+- Never remove or "correct" grammar: unusual grammar is how this speaker talks, not a mistake.
+- The fixed greeting line is said once: only an extra copy of it goes.
+- Deliberate repetition for effect in storytelling stays.
+- A retake is removed only when a kept line carries its content.
+- A false start is a line that breaks off (cut off, ends on a connective, restarts) and whose
+  content the next attempt picks up. Such a line goes.
+
 You may only remove. Never reword, reorder or add.
 
 Answer with one JSON object and nothing else:
@@ -86,10 +97,13 @@ class Decisions:
     groups: int = 0
     drops: int = 0
     trims: int = 0
+    trim_ranges: List[Tuple[str, int, int]] = field(default_factory=list)  # (uid, first, last word index)
 
 
-def request(table: str, style: str = "") -> str:
+def request(table: str, style: str = "", speaker_style: str = "") -> str:
     parts = []
+    if speaker_style and speaker_style.strip():
+        parts.append("About this speaker (from their own channel notes):\n" + speaker_style.strip())
     if style:
         parts.append("How this creator edits (from their own past cuts):\n" + style.strip())
     parts.append("The recording:\n\n" + table)
@@ -131,11 +145,45 @@ def _tokens(words: Sequence[Dict[str, Any]], indices: Sequence[int]) -> Tuple[Li
     return native, roman
 
 
-def _find(run: List[str], quote: List[str]) -> Optional[int]:
-    norm = lambda t: re.sub(r"[^\w]", "", t.lower())
+def _find(run: List[str], quote: List[str], fuzzy: bool = False) -> Optional[int]:
+    """Where `quote` starts in `run`. Tokens compare NFC-normalised and lowercased with
+    punctuation dropped; Devanagari vowel marks are kept ("के" is not "की"). `fuzzy` also
+    accepts a token of 4+ characters one edit away from its word, for at most a third of
+    the quote's tokens (rounded up)."""
+    import unicodedata
+
+    norm = lambda t: re.sub(r"[^\w\u0900-\u097F]", "", unicodedata.normalize("NFC", t).lower())
     run_n, quote_n = [norm(t) for t in run], [norm(t) for t in quote]
+
+    def near(a: str, b: str) -> bool:                  # both 4+ characters, Levenshtein <= 1
+        if len(a) < 4 or len(b) < 4 or abs(len(a) - len(b)) > 1:
+            return False
+        if len(a) == len(b):
+            return sum(x != y for x, y in zip(a, b)) <= 1
+        short, long_ = (a, b) if len(a) < len(b) else (b, a)
+        k = 0
+        while k < len(short) and short[k] == long_[k]:
+            k += 1
+        return short[k:] == long_[k + 1:]
+
+    allowed = (len(quote_n) + 2) // 3 if fuzzy else 0   # ceil(len / 3) slipped tokens
     for k in range(len(run_n) - len(quote_n) + 1):
-        if run_n[k:k + len(quote_n)] == quote_n:
+        pairs = list(zip(run_n[k:k + len(quote_n)], quote_n))
+        slips = sum(a != b for a, b in pairs)
+        if slips == 0 or (slips <= allowed and all(a == b or near(a, b) for a, b in pairs)):
+            return k
+    return None
+
+
+def _twin(run: List[str], at: int, n: int) -> Optional[int]:
+    """Where `run` says its n tokens at `at` again: the first n-token window not overlapping them
+    whose tokens match theirs at 60 % or more of the positions (equal, or one slip apart as
+    `_find` allows). None when the phrase is said only once."""
+    for k in range(len(run) - n + 1):
+        if at - n < k < at + n:
+            continue                                   # overlaps the quoted run
+        same = sum(_find([run[k + j]], [run[at + j]], fuzzy=True) is not None for j in range(n))
+        if same * 5 >= n * 3:                          # 60 % of the positions
             return k
     return None
 
@@ -193,7 +241,10 @@ def parse(answer: Any, utterances: Sequence[Any], words: Sequence[Dict[str, Any]
 
     for t in data.get("trims") or []:
         u = by_id.get(t.get("utterance"))
-        quote = str(t.get("remove") or "").split()
+        # The table writes speech no word covers as "[speech, no transcript, 1.2 s]"; a quote
+        # that copies it (or "[…]") means the words around it, so it is not matched as a word.
+        remove = re.sub(r"\[speech, no transcript, [\d.]+ s\]", " ", str(t.get("remove") or ""))
+        quote = remove.replace("[…]", " ").split()
         if u is None or not quote:
             out.refused.append(f"trim on {t.get('utterance')!r}: unknown utterance or empty quote")
             continue
@@ -201,43 +252,63 @@ def parse(answer: Any, utterances: Sequence[Any], words: Sequence[Dict[str, Any]
         at = _find(native, quote)
         if at is None:
             at = _find(roman, quote)
+        if at is None and len(quote) >= 3:                 # a slip of one letter, a third of the tokens
+            at = _find(native, quote, fuzzy=True)
+            if at is None:
+                at = _find(roman, quote, fuzzy=True)
         if at is None:
             out.refused.append(f"trim on {u.uid}: {' '.join(quote)!r} is not in that utterance")
             continue
-        if len(quote) >= len(u.word_indices):
+        if len(quote) >= len(u.word_indices) or (len(quote) >= 4 and len(u.word_indices) - len(quote) < 3):
             out.refused.append(f"trim on {u.uid} would remove the whole utterance; use a drop")
             continue
+        if len(quote) >= 4:                                # a long trim is one copy of a doubled phrase
+            twin = _twin(native, at, len(quote))
+            if twin is None:
+                twin = _twin(roman, at, len(quote))
+            if twin is None:
+                out.refused.append(f"trim on {u.uid}: {' '.join(quote)!r} ({len(quote)} words) is not a "
+                                   "repeated phrase; a trim removes only a stutter or a doubled phrase")
+                continue
+            at = min(at, twin)                             # the earlier copy goes, whichever was quoted
         for i in u.word_indices[at:at + len(quote)]:
             out.removed_words.setdefault(i, str(t.get("kind") or "stutter"))
+        out.trim_ranges.append((u.uid, u.word_indices[at], u.word_indices[at + len(quote) - 1]))
         out.trims += 1
     return out
 
 
 def proxy_config(settings: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
-    """{base_url, api_key} for the claude-local-api proxy; api_key "" when none is configured.
+    """{base_url, api_key, model, effort} for the claude-local-api proxy; api_key "" when none
+    is configured.
 
     1. the job's own `llm_*` settings, when the caller routed the job to an OpenAI-compatible
        endpoint (BuzzcafStudio does that for presentation jobs when production runs on Claude);
     2. BuzzEdit's app setting `auto_cut_editor` ({"base_url", "api_key"});
     3. the `CLAUDE_API_KEY` (and optional `CLAUDE_URL`) environment variables.
 
-    The model is never taken from any of these: the editor is Opus 5.5 (§10 item 4), whatever
-    model the caller uses for its own planning.
+    The model and effort are never taken from the job's settings, whatever model the caller uses
+    for its own planning: `auto_cut_editor` {"model", "effort"} when set, else the
+    `CLAUDE_EDITOR_MODEL` / `CLAUDE_EDITOR_EFFORT` environment variables, else Opus 5.5 at
+    medium (§10 item 4).
     """
     import os
     settings = settings or {}
-    if settings.get("llm_api_key") and str(settings.get("llm_provider") or "") == "openai_compat":
-        return {"base_url": str(settings.get("llm_base_url") or DEFAULT_BASE_URL),
-                "api_key": str(settings["llm_api_key"])}
     try:
         from store.app_settings import AppSettings
         own = AppSettings().get("auto_cut_editor") or {}
     except Exception:
         own = {}
+    pinned = {"model": str(own.get("model") or os.environ.get("CLAUDE_EDITOR_MODEL") or DEFAULT_MODEL),
+              "effort": str(own.get("effort") or os.environ.get("CLAUDE_EDITOR_EFFORT") or DEFAULT_EFFORT)}
+    if settings.get("llm_api_key") and str(settings.get("llm_provider") or "") == "openai_compat":
+        return {"base_url": str(settings.get("llm_base_url") or DEFAULT_BASE_URL),
+                "api_key": str(settings["llm_api_key"]), **pinned}
     if own.get("api_key"):
-        return {"base_url": str(own.get("base_url") or DEFAULT_BASE_URL), "api_key": str(own["api_key"])}
+        return {"base_url": str(own.get("base_url") or DEFAULT_BASE_URL), "api_key": str(own["api_key"]),
+                **pinned}
     return {"base_url": os.environ.get("CLAUDE_URL", DEFAULT_BASE_URL),
-            "api_key": os.environ.get("CLAUDE_API_KEY", "")}
+            "api_key": os.environ.get("CLAUDE_API_KEY", ""), **pinned}
 
 
 class EditorClient:
@@ -271,19 +342,27 @@ class EditorClient:
             served = str(out.get("model") or "")
             if not served.startswith(self.model):
                 # The proxy answers with another vendor's model when Claude cannot serve this
-                # one. That is not the editor anyone chose; never cut on it.
-                raise RuntimeError(f"proxy served {served!r} instead of {self.model!r}")
+                # one. That is not the editor anyone chose; never cut on it. The failover is
+                # often transient ("Couldn't confirm model ... Try again", 2026-10-09), so
+                # one more attempt is made before giving up.
+                last_error = RuntimeError(f"proxy served {served!r} instead of {self.model!r}")
+                logger.warning("Editor call (attempt %d): %s", attempt + 1, last_error)
+                if attempt < retries:
+                    time.sleep(3.0)
+                continue
             meta = {"model": served, "usage": out.get("usage") or {},
                     "seconds": round(time.time() - started, 1)}
             return out["choices"][0]["message"]["content"], meta
+        if isinstance(last_error, RuntimeError):
+            raise last_error
         raise RuntimeError(f"editor unavailable: {last_error}")
 
 
 def edit(utterances: Sequence[Any], words: Sequence[Dict[str, Any]], client: EditorClient,
-         style: str = "") -> Tuple[Decisions, Dict[str, Any]]:
+         style: str = "", speaker_style: str = "") -> Tuple[Decisions, Dict[str, Any]]:
     """One whole-recording editing pass: ask, validate. Returns (decisions, meta)."""
     from .utterances import table
-    text, meta = client.ask(SYSTEM, request(table(utterances), style))
+    text, meta = client.ask(SYSTEM, request(table(utterances), style, speaker_style))
     decisions = parse(text, utterances, words)
     meta["answer"] = text
     if decisions.refused:

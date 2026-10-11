@@ -290,18 +290,42 @@ def _timeline_data(field: str) -> Dict[str, Any]:
     return {"ticks": ticks[:9], "active": active if active is not None else max(0, len(ticks) - 1)}
 
 
+def _diegetic_cue(at: float, effect: str, options: Dict[str, str]) -> Optional[Any]:
+    """`[sfx: footsteps on gravel | kind=accent | level=subtle | seconds=3]`: a
+    scene sound in words (at most 8), not a tagged one-shot."""
+    from .sound_design import DiegeticCue
+    words = effect.split()[:8]
+    if not words:
+        return None
+    kind = options.get("kind", "accent")
+    level = options.get("level", "normal")
+    seconds: Optional[float] = None
+    if options.get("seconds"):
+        try:
+            seconds = float(options["seconds"].rstrip("s")) or None
+        except ValueError:
+            seconds = None
+    return DiegeticCue(at_s=at, effect=" ".join(words),
+                       kind=kind if kind in ("accent", "bed") else "accent",
+                       level=level if level in ("subtle", "normal") else "normal",
+                       seconds=seconds if seconds and seconds > 0 else None, source="script")
+
+
 def directive_beats(ctx: ScriptContext, program: Program,
                     settings: PresentationSettings) -> Dict[str, Any]:
     """Turn the script's stage directions into beats and side requests.
 
     Returns {"beats": [...], "sfx": [(at, tag)], "title": str|None,
              "moods": {paragraph_index: mood}, "music_mood": str|None,
-             "music_cues": [(at, cue text)] -- each `[music: ...]` in order}.
+             "music_cues": [(at, cue text)] -- each `[music: ...]` in order,
+             "diegetic": [DiegeticCue] -- each `[sfx: ...]` naming a scene sound
+             rather than a known tag (presentation/sound_design.py)}.
     Every beat carries priority 1.0 and origin "script": the user asked for
     it by name, so it wins any budget contest with the model's own ideas.
     """
     beats: List[Beat] = []
     sfx: List[Tuple[float, str]] = []
+    diegetic: List[Any] = []
     moods: Dict[int, str] = {}
     title: Optional[str] = None
     music_mood: Optional[str] = None
@@ -439,7 +463,17 @@ def directive_beats(ctx: ScriptContext, program: Program,
                                   data={"left": left, "right": right,
                                         "labels": [left[:24], right[:24]]}, **common))
         elif d.kind == "sfx":
-            sfx.append((at, arg.lower().replace(" ", "_")))
+            # A known tag (whoosh, stinger...) is a one-shot as before; any
+            # other effect is a scene sound.
+            from .sound import SFX_TAGS
+            fields, options = _parts(arg)
+            tag = (fields[0] if fields else "").lower().replace(" ", "_")
+            if tag in SFX_TAGS:
+                sfx.append((at, tag))
+            elif fields:
+                cue = _diegetic_cue(at, fields[0], options)
+                if cue is not None:
+                    diegetic.append(cue)
         elif d.kind == "title":
             title = arg
         elif d.kind == "mood":
@@ -455,7 +489,8 @@ def directive_beats(ctx: ScriptContext, program: Program,
 
     beats.sort(key=lambda b: b.start_s)
     return {"beats": beats, "sfx": sfx, "title": title, "moods": moods,
-            "music_mood": music_mood, "music_cues": music_cues, "fx": fx}
+            "music_mood": music_mood, "music_cues": music_cues, "fx": fx,
+            "diegetic": diegetic}
 
 
 def _split_attribution(arg: str, separators=("|", " — ", " - ", ",")) -> Tuple[str, Optional[str]]:

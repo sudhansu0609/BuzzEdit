@@ -26,7 +26,8 @@ export default defineConfig({
     // With these in place the renderer's API base can stay relative in dev —
     // same origin, proxied — instead of carrying a port of its own.
     proxy: {
-      '/api': { target: backend, changeOrigin: true },
+      // ws: the live audio preview socket (WS /api/audio/{project}/live) goes through too.
+      '/api': { target: backend, changeOrigin: true, ws: true },
       '/output': { target: backend, changeOrigin: true },
     },
   },

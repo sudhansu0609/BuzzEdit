@@ -142,3 +142,43 @@ def test_adjustment_copy_is_padded_so_the_base_never_waits_on_it():
 
     assert "[adjfx_0]setpts=PTS-STARTPTS,tpad=start_mode=add:start_duration=108.920:color=black[adjpad_0]" in fc
     assert "[adjbase_0][adjpad_0]overlay=x=0:y=0:eof_action=pass:enable='between(t,108.920,109.840)'[adj_0]" in fc
+
+
+def test_pushed_in_video_overlay_is_resampled_to_the_timeline_rate():
+    """A B-roll clip with a push-in goes through zoompan, which emits one frame
+    per input frame at the timeline rate. A 16 fps generated clip therefore
+    played at 1.5x and overlay froze its last frame for the final third of the
+    slot. The clip is resampled to the timeline rate before the zoom; a clip
+    without a zoom is left alone."""
+    from backend.timeline.schema import Timeline, SourceFile, TimelineItem, Transform
+    from backend.render.compiler import FilterGraphCompiler
+
+    main = SourceFile(id="s", path="C:/m.mp4", duration_seconds=120, width=1920, height=1080)
+    clip = SourceFile(id="c", path="C:/clip.mp4", duration_seconds=4.5625, width=1920, height=1080,
+                      fps_num=16, fps_den=1)
+    items = [
+        TimelineItem(id="v1", track="V1", source_id="s",
+                     source_start_frame=0, source_end_frame=2400,
+                     timeline_start_frame=0, timeline_end_frame=2400),
+        TimelineItem(id="a1", track="A1", source_id="s",
+                     source_start_frame=0, source_end_frame=2400,
+                     timeline_start_frame=0, timeline_end_frame=2400),
+        TimelineItem(id="push", track="V2", source_id="c",
+                     source_start_frame=0, source_end_frame=101,
+                     timeline_start_frame=240, timeline_end_frame=341,
+                     transform=Transform(scale=1.0, scale_end=1.09)),
+        TimelineItem(id="plain", track="V2", source_id="c",
+                     source_start_frame=0, source_end_frame=101,
+                     timeline_start_frame=960, timeline_end_frame=1061),
+    ]
+    tl = Timeline(fps_num=24, fps_den=1, sources={"s": main, "c": clip}, items=items)
+    tl.recalculate_duration()
+
+    _, fc, _, _ = FilterGraphCompiler(tl).compile()
+
+    pushed = [line for line in fc.split(";") if "zoompan=" in line]
+    assert len(pushed) == 1
+    assert "setpts=PTS-STARTPTS,fps=24.00000," in pushed[0]
+    assert pushed[0].index("fps=24.00000") < pushed[0].index("zoompan=")
+    plain = [line for line in fc.split(";") if "[vclip_" in line and "zoompan=" not in line]
+    assert plain and all("fps=24.00000" not in line for line in plain)

@@ -15,6 +15,7 @@ every image instead of spending twenty minutes on the GPU again.
 import asyncio
 import hashlib
 import json
+import re
 import logging
 import shutil
 from pathlib import Path
@@ -22,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from runtime import gpu_handover
 
-from .models import BROLL_SECONDS_CAP, Asset, Beat, Character, PresentationSettings
+from .models import BROLL_SECONDS_CAP, VIDEO_SECONDS_MIN, Asset, Beat, Character, PresentationSettings
 from . import character as character_mod
 from . import workflows
 
@@ -43,12 +44,13 @@ IMAGE_TIMEOUT = 300
 VIDEO_TIMEOUT = 900
 
 # Measured on the RTX 5060 Ti 16GB (ComfyUI log, 2026-09-26): Wan 2.2 14B Q4
-# samples at ~37 s/step for 81 frames at 832x480, so frames are the cost. Clips
-# are cut to the beat (2-4s on screen), so generating a fixed 5s (81 frames)
-# threw ~40% of every clip's sampling away. Wan wants 4n+1 frames.
+# samples at ~37 s/step for 81 frames at 832x480, so frames are the cost. Clip
+# length follows the beat's time on screen. Wan wants 4n+1 frames. The floor is
+# 5 s (81 frames at 16 fps): a clip runs at least 5 s (the creator's rule,
+# 2026-10-09), never a 2-3 s flash.
 # The ceiling follows BROLL_SECONDS_CAP (8 s -> 133 frames at 16 fps); a
 # clip that long costs ~1.6x an 81-frame one, so only a long max asks for it.
-MIN_VIDEO_FRAMES = 33
+MIN_VIDEO_FRAMES = 81
 MAX_VIDEO_FRAMES = ((int(round((BROLL_SECONDS_CAP + 0.3) * DEFAULT_VIDEO_FPS)) - 1) // 4) * 4 + 1
 
 # Z-Image Turbo cost scales with pixels: 1920x1080 (2.1MP) spent ~25s of each
@@ -145,9 +147,11 @@ def _canvas_default(canvas_size: Optional[Tuple[int, int]],
 # Video diffusion cost scales with pixels × frames. ~0.4MP (832x480-class) is
 # what the 14B Q4 model renders in ~2.5 min on a 16GB card; generating at a full
 # 1080p canvas instead takes ~5x longer and blows the per-clip timeout. The HQ
-# workflow (zimage_wan22_i2v_hq.json, not active) was built for 1024x576 and
-# measured ~7 min a clip here -- docs/GENERATION_UPGRADE_PLAN.md.
-MAX_VIDEO_GEN_PIXELS = 832 * 480
+# graph was built for 1024x576 and measured ~7 min a clip here --
+# docs/GENERATION_UPGRADE_PLAN.md -- so that size is only asked for in the "hq"
+# clip-generation mode (workflows.clip_generation_mode).
+def max_video_gen_pixels() -> int:
+    return 1024 * 576 if workflows.clip_generation_mode() == "hq" else 832 * 480
 
 
 # Every delivered clip is full HD (the creator's rule): generated at the size
@@ -203,8 +207,9 @@ def _video_canvas_default(canvas_size: Optional[Tuple[int, int]]) -> Tuple[int, 
     latents. An explicit gen_video_size setting bypasses this entirely."""
     width, height = _canvas_default(canvas_size, DEFAULT_VIDEO_SIZE)
     pixels = width * height
-    if pixels > MAX_VIDEO_GEN_PIXELS:
-        scale = (MAX_VIDEO_GEN_PIXELS / pixels) ** 0.5
+    limit = max_video_gen_pixels()
+    if pixels > limit:
+        scale = (limit / pixels) ** 0.5
         width, height = width * scale, height * scale
     return (_snap(int(width), 16), _snap(int(height), 16))
 
@@ -238,6 +243,133 @@ def _cached(directory: Path, key: str) -> Optional[Path]:
         if candidate.suffix.lower() in _IMAGE_SUFFIXES | _VIDEO_SUFFIXES:
             return candidate
     return None
+
+
+# --- near matches: the same picture for a prompt that was only reworded ------------------
+# A re-cut (or any change to the programme) re-plans the shots, and the planner writes a
+# fresh prompt for every beat even when the topic is the one it wrote for last time. The
+# exact-key cache then misses everything: a 2026-10-08 Raat3Baje re-cut set out to make all
+# 205 pictures and 90 clips again (four hours) although 171 of the new prompts shared 70%
+# or more of their words with an asset already on disk. A near match is the best such
+# asset of the same kind, workflow and size.
+NEAR_MATCH_MIN = 0.7
+NEAR_MATCH_MIN_WORDS = 6
+_WORD = re.compile(r"[a-z]{3,}")
+_sidecar_cache: Dict[str, Tuple[int, List[Dict[str, Any]]]] = {}
+
+
+def _tokens(text: str) -> set:
+    return set(_WORD.findall((text or "").lower()))
+
+
+# Words in at least half of a run's prompts are its boilerplate -- the world line, the
+# cast's looks, the genre look, appended to every prompt -- and say nothing about what one
+# beat shows: near matching (and shotplan.adjacent_similarity) leaves them out. With
+# fewer than four prompts nothing is boilerplate.
+BOILERPLATE_MIN_SHARE = 0.5
+BOILERPLATE_MIN_PROMPTS = 4
+
+
+def boilerplate_tokens(prompts: List[str], min_share: float = BOILERPLATE_MIN_SHARE) -> set:
+    """The words (as `_tokens` reads them) present in at least `min_share` of `prompts`."""
+    sets = [_tokens(p) for p in prompts if p]
+    if len(sets) < BOILERPLATE_MIN_PROMPTS:
+        return set()
+    counts: Dict[str, int] = {}
+    for words in sets:
+        for word in words:
+            counts[word] = counts.get(word, 0) + 1
+    return {word for word, n in counts.items() if n >= min_share * len(sets)}
+
+
+# --- prompt drift: one subject in every picture -----------------------------------------
+# Ep2's world line said "tiger reserve", and 106 of 118 clips drew a tiger although the
+# beats described mist, trails and a jeep. A content word in more than 60% of the prompts
+# is reported, naming the world/look line as the usual cause.
+DRIFT_MIN_SHARE = 0.6
+_DRIFT_WORD = re.compile(r"[a-z]{4,}")
+_DRIFT_STOPWORDS = {"the", "and", "with", "from", "into", "over", "under", "that", "this",
+                    "light", "dark", "slow", "shot", "scene", "misty", "mist", "night", "dusk",
+                    "cold", "tones", "deep", "wet"}
+
+
+def prompt_drift(prompts: List[str], min_share: float = DRIFT_MIN_SHARE) -> Dict[str, float]:
+    """{word: share of the prompts} for every content word in more than `min_share` of them."""
+    sets = [set(_DRIFT_WORD.findall(p.lower())) - _DRIFT_STOPWORDS for p in prompts if p]
+    if not sets:
+        return {}
+    counts: Dict[str, int] = {}
+    for words in sets:
+        for word in words:
+            counts[word] = counts.get(word, 0) + 1
+    shares = {word: n / len(sets) for word, n in counts.items() if n / len(sets) > min_share}
+    return {word: round(share, 2)
+            for word, share in sorted(shares.items(), key=lambda kv: (-kv[1], kv[0]))}
+
+
+def _sidecars(directory: Path) -> List[Dict[str, Any]]:
+    """Every sidecar in the cache directory, re-read when their number changes."""
+    files = sorted(directory.glob("*.json")) if directory.exists() else []
+    cached = _sidecar_cache.get(str(directory))
+    if cached and cached[0] == len(files):
+        return cached[1]
+    out = []
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data, dict) and data.get("positive"):
+            data["key"] = f.stem
+            data["tokens"] = _tokens(data["positive"])
+            out.append(data)
+    _sidecar_cache[str(directory)] = (len(files), out)
+    return out
+
+
+def _near_cached(directory: Path, is_video: bool, workflow_file: str, positive: str,
+                 width: int, height: int, min_ratio: float,
+                 min_duration_s: float = 0.0, boilerplate: Optional[set] = None,
+                 exclude: Optional[set] = None) -> Optional[Tuple[Path, float, str]]:
+    """(file, similarity, beat id it was made for) of the closest earlier asset whose prompt
+    shares at least `min_ratio` of its words with `positive`, of the same kind, workflow and
+    generation size; a clip must also be at least `min_duration_s` long. None when nothing
+    is close enough.
+
+    `boilerplate` (this run's shared words, see boilerplate_tokens) is left out of both
+    prompts, so only the beat's own words decide. `exclude` holds the files already serving
+    a beat in this run: they are passed over for the next best candidate."""
+    shared = boilerplate or set()
+    taken = exclude or set()
+    want = _tokens(positive) - shared
+    # Only a real prompt is worth matching: a stub of a few words would make every beat
+    # that shares it reuse one picture.
+    if len(want) < NEAR_MATCH_MIN_WORDS or min_ratio <= 0:
+        return None
+    best: Optional[Tuple[Path, float, str]] = None
+    for side in _sidecars(directory):
+        if side.get("workflow") != workflow_file:
+            continue
+        try:
+            if (int(side.get("width") or 0), int(side.get("height") or 0)) != (int(width), int(height)):
+                continue
+        except (TypeError, ValueError):
+            continue
+        have = side["tokens"] - shared
+        ratio = len(want & have) / len(want | have)
+        if ratio < min_ratio or (best is not None and ratio <= best[1]):
+            continue
+        path = _cached(directory, side["key"])
+        if path is None or (path.suffix.lower() in _VIDEO_SUFFIXES) != is_video:
+            continue
+        if str(path) in taken:
+            continue
+        if is_video and min_duration_s > 0:
+            _w, _h, duration = _probe(path)
+            if duration + 0.05 < min_duration_s:
+                continue
+        best = (path, ratio, str(side.get("beat_id") or ""))
+    return best
 
 
 def _probe(path: Path) -> Tuple[int, int, float]:
@@ -281,6 +413,13 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
               or (b.kind == "source_quote" and b.image_prompt)]
     if not wanted:
         return [], []
+
+    # One asset, one beat: every file `attempt` (below) hands a beat goes into `used_paths`,
+    # and neither a cache hit nor a near match may hand it to another. The run's boilerplate
+    # (world line, cast looks) is left out of near matching -- see _near_cached.
+    prompts = [b.prompt() or b.image_prompt or b.topic for b in wanted]
+    boilerplate = boilerplate_tokens(prompts)
+    used_paths: set = set()
 
     resolved: Dict[str, Optional[workflows.ResolvedWorkflow]] = {}
     for role in ("broll_image", "broll_video", "graphic"):
@@ -342,7 +481,8 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
         try:
             made = await _generate_one(b, resolved, directory, queue_manager,
                                        seed_base, canvas_size, start_image=start_image,
-                                       face=face if b.shows_character else None)
+                                       face=face if b.shows_character else None,
+                                       boilerplate=boilerplate, used_paths=used_paths)
             return made, "" if made else "no output produced"
         except Exception as e:
             logger.warning("Beat %s (%s) failed to generate: %s", b.id, b.topic, e)
@@ -419,8 +559,59 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
     video_beats = sorted(video_beats, key=lambda b: (-float(b.priority or 0.0), b.start_s))
     phase_started = asyncio.get_running_loop().time()
     video_failures = 0
-    for number, beat in enumerate(video_beats):
-        report((len(wanted) + number) / max(1, total), f"Generating video clip {number + 1}/{len(video_beats)}")
+    # The mid-production change (presentation/live.py): before every clip the
+    # live `video_broll_share` is read back and the clip quota recomputed. A
+    # lowered share stops the phase once enough B-roll seconds are moving; a
+    # raised one promotes the most important stills beyond the plan. Without
+    # a live share the plan's own video beats are made, as before.
+    from . import live as live_mod
+    planned_ids = {b.id for b in video_beats}
+    extra_stills = sorted((b for b in wanted if b.kind == "broll_image" and b.is_generated and b.image_prompt),
+                          key=lambda b: (-float(b.priority or 0.0), b.start_s))
+    candidates = list(video_beats) + extra_stills
+    cutaways_all = [b for b in wanted if b.is_cutaway]
+    video_secs_made = 0.0
+    live_applied: Optional[Dict[str, Any]] = None
+    number = -1
+    for beat in candidates:
+        number += 1
+        live_now = live_mod.read(project_dir)
+        live_share = live_now.get("video_broll_share")
+        if live_share is not None:
+            quota = live_mod.clip_quota_seconds(cutaways_all, live_share)
+            if live_applied != live_now:
+                live_applied = dict(live_now)
+                video_stats["live"] = {"video_broll_share": live_share, "quota_s": round(quota),
+                                       "made_s_when_applied": round(video_secs_made)}
+                logger.info("Live settings: video share %.0f%% -> %.0fs of clips (%.0fs made so far)",
+                            live_share * 100, quota, video_secs_made)
+            if video_secs_made >= quota - 0.001:
+                remaining = sum(1 for b in candidates[number:] if b.id in planned_ids)
+                video_stats["skipped_reason"] = (f"video share set to {live_share * 100:.0f}% during the run; "
+                                                 f"{remaining} planned clip(s) kept as stills")
+                logger.info("Live video share met (%.0fs of %.0fs); %d planned clips stay stills",
+                            video_secs_made, quota, remaining)
+                break
+            if beat.id not in planned_ids:
+                beat = beat.model_copy(update={
+                    "kind": "broll_video",
+                    # A clip runs at least 5 s, never past the cap.
+                    "planned_duration_s": min(BROLL_SECONDS_CAP,
+                                              max(VIDEO_SECONDS_MIN, live_mod.planned_length(beat))),
+                    "video_prompt": beat.video_prompt or (f"{beat.image_prompt}, gentle cinematic camera "
+                                                          f"movement, natural motion in the scene")})
+                video_stats["promoted"] = video_stats.get("promoted", 0) + 1
+            # The quota is seconds of moving footage, so the label counts
+            # seconds: a clip-count estimate (quota / this beat's length) moved
+            # with every beat and read "clip 81 of 77" in the Studio.
+            left_s = max(0.0, quota - video_secs_made)
+            label = (f"Generating video clip {number + 1}: {video_secs_made:.0f} s of {quota:.0f} s moving, "
+                     f"{left_s:.0f} s to go (live share {live_share * 100:.0f}%)")
+        elif beat.id not in planned_ids:
+            break  # no live share: only the plan's own clips
+        else:
+            label = f"Generating video clip {number + 1}/{len(video_beats)}"
+        report((len(wanted) + min(number, len(video_beats))) / max(1, total), label)
         if asyncio.get_running_loop().time() - phase_started > budget_s:
             video_stats["skipped_reason"] = (f"video budget of {budget_s / 60:.0f} min used; "
                                              f"{len(video_beats) - number} clip(s) kept as stills")
@@ -464,9 +655,13 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
             clip, reason = await attempt(beat, start_image=still.path if still else None)
         if clip is not None and clip.kind == "video":
             if still is not None:
+                # The still's file rides on the clip: placement shows it when the
+                # clip's slot cannot hold 5 s, so the beat never shows nothing.
                 assets.remove(still)
+                clip.still_path = still.path
             assets.append(clip)
             video_stats["made"] += 1
+            video_secs_made += live_mod.planned_length(beat)
             video_failures = 0
             continue
         video_failures += 1
@@ -483,6 +678,13 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
                            video_failures)
             break
     video_stats["kept_still"] = video_stats["planned"] - video_stats["made"]
+
+    # A content word in most prompts is drawn into most pictures (ep2's tigers).
+    drift = prompt_drift(prompts)
+    stats["prompt_drift"] = drift
+    for word, share in drift.items():
+        logger.warning("'%s' appears in %.0f %% of prompts; check the world/look line",
+                       word, share * 100)
 
     # Colour looks on stills, and canvas cards framed on their canvas
     # (presentation/graphics.py) -- both before anything is placed.
@@ -523,12 +725,16 @@ async def _generate_one(beat: Beat, resolved: Dict[str, Optional[workflows.Resol
                         canvas_size: Optional[Tuple[int, int]] = None,
                         start_image: Optional[str] = None,
                         cache_only: bool = False,
-                        face: Optional["_Face"] = None) -> Optional[Asset]:
+                        face: Optional["_Face"] = None,
+                        boilerplate: Optional[set] = None,
+                        used_paths: Optional[set] = None) -> Optional[Asset]:
     """One beat's asset: from the cache when this exact prompt was made
     before, otherwise generated. `cache_only` never generates (ComfyUI down).
     `face`, for a beat that shows the main character: a still gets that face
     swapped in (a clip only keys its cache on it -- it starts from the
-    swapped still)."""
+    swapped still). `boilerplate` is the run's shared prompt words, left out of
+    near matching; `used_paths` the files already serving a beat in this run --
+    none is handed out twice, and the file returned here is added to it."""
     role = "graphic" if beat.kind == "graphic" else (
         "broll_video" if beat.kind == "broll_video" else "broll_image")
     workflow = resolved.get(role)
@@ -581,17 +787,42 @@ async def _generate_one(beat: Beat, resolved: Dict[str, Optional[workflows.Resol
     seed = (seed_base + int(hashlib.sha1(beat.id.encode()).hexdigest()[:6], 16)) % 2_000_000_000
     key = cache_key(workflow.file, positive, negative, seed, width, height,
                     extra=f"{steps}|{cfg}|{model_override}|{upscale}"
-                          + (f"|out{out_width}x{out_height}" if is_video else "")
+                          + (f"|out{out_width}x{out_height}|len{length}" if is_video else "")
                           + (f"|face:{face.key}" if face is not None else ""))
 
     existing = _cached(directory, key)
+    if existing and used_paths is not None and str(existing) in used_paths:
+        # Already on screen for a beat in this run: look further.
+        logger.info("Beat %s: cached asset %s already serves a beat; not reusing it",
+                    beat.id, existing.name)
+        existing = None
     if existing:
         w, h, duration = _probe(existing)
         logger.info("Beat %s: reusing cached asset %s", beat.id, existing.name)
+        if used_paths is not None:
+            used_paths.add(str(existing))
         return Asset(beat_id=beat.id,
                      kind="video" if existing.suffix.lower() in _VIDEO_SUFFIXES else "image",
                      path=str(existing), width=w, height=h, duration_s=duration,
                      cache_hit=True, workflow_file=workflow.file, seed=seed, prompt_sha=key)
+    try:
+        near_min = float(_setting("gen_near_match_min", NEAR_MATCH_MIN) or 0.0)
+    except (TypeError, ValueError):
+        near_min = NEAR_MATCH_MIN
+    near = _near_cached(directory, is_video, workflow.file, positive, width, height, near_min,
+                        min_duration_s=float(beat.planned_duration_s or 0.0) if is_video else 0.0,
+                        boilerplate=boilerplate, exclude=used_paths)
+    if near is not None:
+        path, ratio, made_for = near
+        w, h, duration = _probe(path)
+        logger.info("Beat %s: reusing %s made for beat %s (prompt %.0f%% the same)",
+                    beat.id, path.name, made_for or "?", ratio * 100)
+        if used_paths is not None:
+            used_paths.add(str(path))
+        return Asset(beat_id=beat.id,
+                     kind="video" if path.suffix.lower() in _VIDEO_SUFFIXES else "image",
+                     path=str(path), width=w, height=h, duration_s=duration,
+                     cache_hit=True, workflow_file=workflow.file, seed=seed, prompt_sha=path.stem)
     if cache_only:
         return None
 
@@ -618,7 +849,8 @@ async def _generate_one(beat: Beat, resolved: Dict[str, Optional[workflows.Resol
     if not outputs and swapped:
         # A picture without the face beats no picture; cached under its own key.
         return await _generate_one(beat, resolved, directory, queue_manager, seed_base,
-                                   canvas_size, start_image=start_image)
+                                   canvas_size, start_image=start_image,
+                                   boilerplate=boilerplate, used_paths=used_paths)
     if not outputs:
         return None
 
@@ -648,6 +880,8 @@ async def _generate_one(beat: Beat, resolved: Dict[str, Optional[workflows.Resol
             w, h, duration = _probe(destination)
     _write_sidecar(directory, key, beat, workflow.file, positive, negative, seed,
                    width, height)
+    if used_paths is not None:
+        used_paths.add(str(destination))
     return Asset(beat_id=beat.id,
                  kind="video" if destination.suffix.lower() in _VIDEO_SUFFIXES else "image",
                  path=str(destination), width=w, height=h, duration_s=duration,

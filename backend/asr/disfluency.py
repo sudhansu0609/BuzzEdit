@@ -122,13 +122,18 @@ def analyze_disfluencies(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         #    the same stutter with an editing term dropped into the middle of it,
         #    and comparing against the raw previous token misses every one of them.
         else:
-            previous = next((p for p in reversed(out) if not p.get("disfluency")), None)
+            survivors = [p for p in reversed(out) if not p.get("disfluency")]
+            previous = survivors[0] if survivors else None
             said = spoken_norms[i]
-            if (said and previous is not None and _norm(spoken(previous)) == said
-                    and not is_reduplication(spoken(previous), spoken(w), said)):
-                # cut the EARLIER duplicate(s); keep the last clean utterance.
-                previous["disfluency"] = True
-                previous["reason"] = "stutter"
+            if said and previous is not None and _norm(spoken(previous)) == said:
+                # Reduplication is one doubling. "bahut bahut" is grammar; "bahut"
+                # ten times over (Raat3Baje ep2, 2026-10-08) is a stutter whatever
+                # the word, so a third copy in a row is always cut.
+                third = len(survivors) > 1 and _norm(spoken(survivors[1])) == said
+                if third or not is_reduplication(spoken(previous), spoken(w), said):
+                    # cut the EARLIER duplicate(s); keep the last clean utterance.
+                    previous["disfluency"] = True
+                    previous["reason"] = "stutter"
 
         # 3. Soft filler -> candidate for LLM.
         if not disfluency and clean in SOFT_FILLERS:

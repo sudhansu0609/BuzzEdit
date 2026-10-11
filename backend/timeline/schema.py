@@ -25,6 +25,12 @@ class SourceFile(BaseModel):
     fps_den: int = 1
     has_audio: bool = True
     kind: str = "video"  # "video" | "audio" | "image"
+    # Processed audio (AUDIO_SUITE_PLAN.md §2.1): a WAV written by a process
+    # effect that replaces this source's audio everywhere (render, preview,
+    # live); the original file is never touched. `audio_history` is the stack
+    # of versions, [{path, effect, params, created}] newest last; Undo pops it.
+    audio_override: Optional[str] = None
+    audio_history: List[Dict[str, Any]] = Field(default_factory=list)
 
 class WordItem(BaseModel):
     id: str
@@ -335,6 +341,23 @@ class AudioMaster(BaseModel):
                 and self.voice_gain_db == 0.0)
 
 
+class AudioEffect(BaseModel):
+    """One effect in an audio rack (AUDIO_SUITE_PLAN.md §2.6).
+
+    `effect` names a catalogue entry; `params` holds UI-unit values keyed by
+    the catalogue's param keys (missing = default). A window (`start_s`/
+    `end_s`) is programme time for the A1/MASTER racks and clip time for a
+    clip rack.
+    """
+    id: str                          # unique in the project, e.g. "fx_7f3a"; also the ffmpeg instance stem
+    effect: str                      # catalogue id, e.g. "parametric_eq"
+    params: Dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+    start_s: Optional[float] = None
+    end_s: Optional[float] = None
+    preset: Optional[str] = None
+
+
 class AtmosphereEffect(BaseModel):
     """A generated overlay: rain, snow, lightning, sunlight, light leak, fog, wind, grain."""
     type: str
@@ -425,6 +448,10 @@ class TimelineItem(BaseModel):
     # a V track and its sound on an A track. Move, trim, split and delete act on
     # the whole set so the two can never drift out of sync; unlinking clears it.
     link_id: Optional[str] = None
+    # Clip rack (AUDIO_SUITE_PLAN.md §2.6): effects on this item's own audio,
+    # before its volume and fades. Used on A2+ items; A1 items are rebuilt from
+    # the transcript, so the compiler ignores it there.
+    audio_effects: List[AudioEffect] = Field(default_factory=list)
 
     @property
     def duration_frames(self) -> int:
@@ -507,6 +534,10 @@ class Timeline(BaseModel):
     effects: List[AtmosphereEffect] = Field(default_factory=list)
     # Voice clean-up and the loudness target for the finished mix.
     audio_master: Optional[AudioMaster] = None
+    # Audio effect racks (AUDIO_SUITE_PLAN.md §2.6), keyed "A1", "A2", … (track
+    # racks) and "MASTER". The A1 rack runs after the voice chain, the MASTER
+    # rack after the mix and before the loudness stage.
+    audio_racks: Dict[str, List[AudioEffect]] = Field(default_factory=dict)
     # Letterbox the programme to this aspect ratio (2.39 = cinematic scope).
     # The output resolution is unchanged; black bars are matted on.
     aspect_bars: Optional[float] = None

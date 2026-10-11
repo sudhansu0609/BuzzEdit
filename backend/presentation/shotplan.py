@@ -24,7 +24,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from . import character as character_mod
 from . import genre as genre_mod
-from .models import BEAT_KINDS, Beat, Character, Program, PresentationSettings, ShotPlan, Topic
+from .models import (BEAT_KINDS, BROLL_SECONDS_CAP, VIDEO_SECONDS_MIN, Beat, Character, Program,
+                     PresentationSettings, ShotPlan, Topic)
 from .program import transcript_lines
 
 logger = logging.getLogger("presentation.shotplan")
@@ -43,8 +44,7 @@ TOPIC_DEDUP_JACCARD = 0.6
 MAX_PROMPT_CHARS = 400
 # Ceiling on how many shots one topic is split into. Generous so a long topic
 # fills its budget with many images; the coverage budget is the real limiter, so
-# this only bounds a single very long topic. Beyond the six named shot angles the
-# fallback reuses them with different generation seeds, so images stay distinct.
+# this only bounds a single very long topic.
 MAX_SHOT_SLICES = 30
 # The cutaway gap and screen-time budget are DERIVED from the settings
 # (`PresentationSettings.cutaway_gap_s` / `.broll_budget_seconds`), and
@@ -551,6 +551,41 @@ def dedup_beats(candidates: List[Beat]) -> Tuple[List[Beat], List[Dict[str, str]
     return unique, dropped
 
 
+# Two consecutive cutaways whose own words overlap this much show one subject twice.
+ADJACENT_TWIN_JACCARD = 0.6
+
+
+def adjacent_similarity(beats: List[Beat], boilerplate_min_share: float = 0.5,
+                        min_overlap: float = ADJACENT_TWIN_JACCARD
+                        ) -> Tuple[List[Beat], List[Dict[str, str]]]:
+    """Drop the later of two consecutive cutaways that would show the same thing.
+
+    Cutaways are taken in start order and each prompt is read without the run's
+    boilerplate -- the words at least `boilerplate_min_share` of the prompts share
+    (world line, cast looks, genre look; none below four prompts) -- so only what
+    the beat itself shows is compared. A Jaccard overlap of `min_overlap` or more
+    with the cutaway before it makes a beat a twin. Returns (kept, dropped) like
+    dedup_beats.
+    """
+    from .assets import _tokens as prompt_tokens, boilerplate_tokens
+    cutaways = sorted((b for b in beats if b.is_cutaway), key=lambda b: b.start_s)
+    prompts = [b.prompt() or b.image_prompt or "" for b in cutaways]
+    shared = boilerplate_tokens(prompts, boilerplate_min_share)
+    dropped: List[Dict[str, str]] = []
+    twins = set()
+    previous: Optional[Tuple[Beat, set]] = None
+    for beat, prompt in zip(cutaways, prompts):
+        own = prompt_tokens(prompt) - shared
+        if previous is not None and own and previous[1]:
+            overlap = len(own & previous[1]) / len(own | previous[1])
+            if overlap >= min_overlap:
+                twins.add(id(beat))
+                dropped.append({"topic": beat.topic, "reason": f"twin of {previous[0].id}"})
+                continue
+        previous = (beat, own)
+    return [b for b in beats if id(b) not in twins], dropped
+
+
 def _ensure_coverage_candidates(unique: List[Beat], program: Program,
                                 settings: PresentationSettings, genre: str,
                                 genre_secondary: Optional[str] = None) -> List[Beat]:
@@ -625,6 +660,13 @@ def budget_beats(unique: List[Beat], program: Program,
         held = requested and bool(beat.data.get("hold")) and bool(beat.planned_duration_s)
         if held:
             planned = beat.planned_duration_s
+        elif beat.kind == "broll_video":
+            # A clip runs 5-8 s on screen (the creator's rule); a span that
+            # cannot hold 5 s gets a still instead.
+            if beat.duration_s + 1e-6 < VIDEO_SECONDS_MIN:
+                beat = beat.model_copy(update={"kind": "broll_image"})
+            else:
+                planned = min(BROLL_SECONDS_CAP, max(planned, VIDEO_SECONDS_MIN))
         if not requested and spent + planned > budget + 0.001:
             dropped.append({"topic": beat.topic, "reason": "over the coverage budget"})
             continue
@@ -701,14 +743,20 @@ def balance_video_share(beats: List[Beat], settings: PresentationSettings) -> Li
         beat = out[i]
         if not beat.image_prompt:
             continue
+        # A clip runs 5-8 s on screen; a span that cannot hold 5 s stays a still.
+        if beat.duration_s + 1e-6 < VIDEO_SECONDS_MIN:
+            continue
+        planned = min(BROLL_SECONDS_CAP, max(_planned_length(beat), VIDEO_SECONDS_MIN))
         out[i] = beat.model_copy(update={
             "kind": "broll_video",
+            "planned_duration_s": round(planned, 3),
             # The scene prompt doubles as the motion prompt: the video stage
             # only needs to know what world it is moving through.
             "video_prompt": beat.video_prompt or _clean_prompt(
                 f"{beat.image_prompt}, gentle cinematic camera movement, "
                 f"natural motion in the scene"),
         })
+        total += _planned_length(out[i]) - _planned_length(beat)
         video_secs += _planned_length(out[i])
     return out
 
@@ -933,23 +981,17 @@ async def write_beats(topics: List[Topic], ask: AskJson,
 
 # --- beat multiplication ----------------------------------------------------
 
-# Deterministic shot-type variations, used when the model cannot be asked for
-# distinct shots. Appended to the base prompt so each sub-beat generates a
-# different image of the same subject.
-SHOT_VARIATIONS = [
-    "wide establishing shot",
-    "medium shot, subject in motion",
-    "close-up on a telling detail",
-    "over-the-shoulder perspective",
-    "low angle, dramatic composition",
-    "high angle overview of the scene",
-]
-
+# Each slice of a long topic shows something else from it: one subject from N
+# angles, cut back to back, reads as the same scene repeating (ep2, 2026-10-09).
+# There is no deterministic fallback -- a suffix such as "close-up on a telling
+# detail" on the same prompt makes exactly that twin -- so fewer usable prompts
+# mean fewer, longer slices.
 VARIATION_SYSTEM = (
     "You are the art director for a YouTube video. You are given ONE scene "
-    "description and a number N. Write N distinct text-to-image prompts showing the "
-    "same subject as N different shots — for example a wide establishing shot, a "
-    "medium shot of the action, a close-up on a telling detail. Keep the same world, "
+    "description and a number N. Write N text-to-image prompts that each show a "
+    "DIFFERENT subject or moment of the same topic — a different object, place, "
+    "action or detail from it — never the same subject again from another angle. "
+    "Two consecutive prompts must not share their main subject. Keep the same world, "
     "style and lighting across all of them so they cut together as one sequence.\n"
     "Each prompt: 20 to 40 words, English only, no readable text, no logos, no real "
     "identifiable people.\n"
@@ -1021,11 +1063,14 @@ async def multiply_beats(beats: List[Beat], settings: PresentationSettings,
                            for p in parsed.get("prompts", []) or []]
                 prompts = [p for p in prompts if p][:count]
             except Exception as e:
-                logger.warning("Shot variation call failed (%s); using suffixes", e)
-        if len(prompts) < count:
-            # Deterministic fallback: the base scene from different shot types.
-            prompts = [f"{beat.image_prompt}, {SHOT_VARIATIONS[i % len(SHOT_VARIATIONS)]}"
-                       for i in range(count)]
+                logger.warning("Shot variation call failed (%s); the topic stays one shot", e)
+        if not prompts:
+            # Nothing usable: the topic stays one shot rather than one subject
+            # repeated from several angles.
+            out.append(beat)
+            continue
+        # Fewer usable prompts than slots: fewer, longer slices -- never padding.
+        count = len(prompts)
 
         slice_s = span / count
         for index in range(count):
@@ -1282,7 +1327,9 @@ async def plan_shots(program: Program, settings: PresentationSettings,
         # budget below has enough candidates to actually spend on.
         unique = _ensure_coverage_candidates(unique, program, settings, genre, genre_secondary)
     kept, budget_dropped = budget_beats(unique, program, settings)
-    dropped = dropped + dup_dropped + budget_dropped
+    # Consecutive cutaways must differ: the later of two twins goes.
+    kept, twin_dropped = adjacent_similarity(kept)
+    dropped = dropped + dup_dropped + budget_dropped + twin_dropped
     kept = balance_video_share(kept, settings)
     kept = character_mod.apply_to_beats(kept, character)
     if character is not None:

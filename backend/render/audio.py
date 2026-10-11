@@ -214,6 +214,16 @@ EQ_PRESETS: Dict[str, Dict[str, Any]] = {
         "shelf": (12000, 3.0), "comp_ratio": 5.0, "comp_threshold_db": -24.0,
         "parallel_compress": True, "saturation": 0.35, "limiter_tp": -1.0,
     },
+    # "Crisp & bassy": a radio-style proximity voice. The low shelf brings the
+    # body up, the 350 Hz cut keeps that body from turning into mud, presence
+    # and air make the consonants crisp, and the exciter (saturation) adds the
+    # top-end sparkle. De-ess is set higher in presentation/sound.VOICE_PRESETS
+    # because the air shelf lifts sibilance with it.
+    "crisp_bass": {
+        "hpf": 70, "low_shelf": (160, 4.0), "bands": [(350, -2.5, 1.2), (3500, 3.0, 1.0)],
+        "shelf": (10000, 3.0), "comp_ratio": 4.0, "comp_threshold_db": -22.0,
+        "parallel_compress": True, "saturation": 0.2, "limiter_tp": -1.0,
+    },
     "horror_intimate": {
         "hpf": 60, "bands": [(250, 1.0, 1.0)], "shelf": None,
         "comp_ratio": 3.0, "comp_threshold_db": -20.0, "reverb": "dark_room",
@@ -254,6 +264,11 @@ def _eq_stage(preset: Dict[str, Any]) -> List[str]:
     hpf = preset.get("hpf")
     if hpf:
         chain.append(f"highpass=f={int(hpf)}")
+    low_shelf = preset.get("low_shelf")
+    if low_shelf:
+        # `bass` is ffmpeg's low shelf, the mirror of the `treble` shelf below.
+        freq, gain_db = low_shelf
+        chain.append(f"bass=g={gain_db:.1f}:f={int(freq)}:width_type=o:width=0.7")
     for freq, gain_db, q in preset.get("bands", []):
         if abs(gain_db) < 0.05:
             continue
@@ -301,9 +316,11 @@ def _saturation_stage(amount: float) -> List[str]:
     if amount <= 0.0:
         return []
     # aexciter adds harmonic content above a blend frequency; amount maps to
-    # how much of the excited signal is blended back in.
+    # how much of the excited signal is blended back in. `ceil` must be at
+    # least 9999 (ffmpeg rejects the filter otherwise, and the old 9500 made
+    # every render with saturation > 0 fail), so the ceiling sits at 12 kHz.
     return [f"aexciter=level_in=1:level_out=1:amount={1.0 + 3.0 * amount:.2f}:"
-            f"drive={2.0 + 6.0 * amount:.2f}:blend=0:freq=7500:ceil=9500"]
+            f"drive={2.0 + 6.0 * amount:.2f}:blend=0:freq=7500:ceil=12000"]
 
 
 def _limiter_stage(preset: Optional[Dict[str, Any]]) -> List[str]:

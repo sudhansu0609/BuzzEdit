@@ -1,0 +1,368 @@
+/* Voice panel (VOICE_CHANGER_PLAN.md §2.7). The Audio panel's vocabulary (audio.css: audio-btn,
+   audio-card, audio-note, audio-progress, insp-chip tabs) plus what the voice tabs add: preset
+   buttons, the recorder's meter, the regions table, the voices list. 11-12px type, tertiary cards
+   on the secondary background, the accent for what is active. */
+
+.voice-panel {
+  container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  outline: none;
+}
+
+.voice-tabs { padding-bottom: 2px; }
+.voice-tab-hint {
+  margin-top: -2px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.voice-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.voice-modes { padding-bottom: 2px; }
+
+.voice-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.voice-spacer { flex: 1; }
+
+.voice-source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+/* -- voice settings ------------------------------------------------------------------------- */
+.voice-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.voice-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.voice-field > .audio-select,
+.voice-field > .audio-text { flex: 1; }
+.voice-label {
+  flex: 0 0 92px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.voice-slider {
+  flex: 1;
+  min-width: 80px;
+  accent-color: var(--accent);
+}
+.voice-value {
+  min-width: 44px;
+  text-align: right;
+  color: var(--text-primary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.voice-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.voice-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex: 1;
+}
+.voice-preset {
+  position: relative;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.voice-preset:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--border-light); }
+.voice-preset:disabled { opacity: 0.45; cursor: not-allowed; }
+.voice-preset.active { border-color: var(--accent); color: var(--accent); }
+/* the preset's voice is not in the library yet */
+.voice-preset.warn::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  right: 3px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--warning);
+}
+
+/* -- FX summary ----------------------------------------------------------------------------- */
+.voice-fx {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+}
+.voice-fx-title {
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.voice-fx-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.voice-fx-list li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11px;
+}
+.voice-fx-name { color: var(--text-primary); font-weight: 600; }
+.voice-fx-params { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
+/* -- progress and results ------------------------------------------------------------------- */
+.voice-progress { flex: 0 0 auto; }
+.voice-result .audio-preview { margin-top: 2px; }
+
+/* -- recorder ------------------------------------------------------------------------------- */
+.voice-recorder {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.voice-rec-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--danger);
+  vertical-align: middle;
+}
+.voice-rec-time {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.voice-rec-time.live { color: var(--danger); font-weight: 600; }
+.voice-meter {
+  position: relative;
+  flex: 1;
+  min-width: 120px;
+  height: 10px;
+  border-radius: 2px;
+  overflow: hidden;
+  /* -60..-12 dBFS green, -12..-6 amber, -6..0 red (the Audio panel's meter scale); the mask
+     hides what is above the level */
+  background: linear-gradient(90deg, var(--success) 0 80%, var(--warning) 80% 90%, var(--danger) 90% 100%);
+}
+.voice-meter-mask {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--bg-active);
+  transition: left 0.06s linear;
+}
+.voice-meter-peak {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--text-primary);
+  opacity: 0.8;
+}
+.voice-clip {
+  padding: 0 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--danger) 18%, var(--bg-tertiary));
+  color: var(--danger);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* -- batch ---------------------------------------------------------------------------------- */
+.voice-batch-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.voice-batch-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+}
+.voice-batch-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 160px;
+  cursor: pointer;
+}
+.voice-ellipsis {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.voice-status {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-size: 10.5px;
+}
+.voice-status.running { color: var(--accent); }
+.voice-status.applied { color: var(--success); }
+.voice-status.failed { color: var(--danger); }
+
+/* -- regions -------------------------------------------------------------------------------- */
+.voice-table-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  overflow-x: auto;
+}
+.voice-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+.voice-table th {
+  padding: 3px 4px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.voice-table td {
+  padding: 3px 4px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.voice-table .audio-select { max-width: 130px; padding: 2px 4px; }
+.voice-region.applied td { background: color-mix(in srgb, var(--success) 6%, transparent); }
+.voice-region.failed td { background: color-mix(in srgb, var(--danger) 6%, transparent); }
+.voice-num { color: var(--text-muted); }
+.voice-time {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.voice-center { text-align: center; }
+.voice-badge {
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--bg-active);
+  color: var(--text-secondary);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.voice-badge.pending { color: var(--accent); }
+.voice-badge.applied { color: var(--success); }
+.voice-badge.failed { color: var(--danger); }
+.voice-failed { color: var(--danger); }
+
+/* -- voices --------------------------------------------------------------------------------- */
+.voice-worker { gap: 4px; }
+.voice-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+.voice-dot.on { background: var(--success); }
+.voice-consent {
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-tertiary));
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.voice-consent strong { color: var(--text-primary); }
+.voice-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.voice-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px 7px;
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+}
+.voice-item-name {
+  color: var(--text-primary);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.voice-item-sub {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@container (max-width: 420px) {
+  .voice-label { flex-basis: 74px; }
+  .voice-table .audio-select { max-width: 96px; }
+}

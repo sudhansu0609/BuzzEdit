@@ -233,6 +233,14 @@ async def _run_presentation_pass(
     settings = settings or PresentationSettings()
     report_progress = progress_cb or (lambda fraction, message="": None)
     store = ProjectStore(base_dir=str(PROJECTS_DIR))
+    # The mid-production change (presentation/live.py): numbers the creator
+    # set while an earlier pass of this project was running. A pass that
+    # starts (or restarts) now plans with them rather than its job's snapshot.
+    from . import live as live_mod
+    live_at_start = live_mod.read(PROJECTS_DIR / project_id)
+    if live_at_start:
+        settings = live_mod.apply(settings, live_at_start)
+        logger.info("Presentation: live settings applied at start (%s)", live_mod.describe(live_at_start))
 
     report = PresentationReport(
         project_id=project_id,
@@ -519,6 +527,15 @@ async def _run_presentation_pass(
         video_phase = generation_stats.get("video_phase") or {}
         if video_phase.get("skipped_reason"):
             report.degraded.append(f"video_broll: {video_phase['skipped_reason']}")
+        # One subject flooding the pictures (Raat3Baje ep2: "tiger" in 91% of the
+        # prompts, from the world line) is a prompt problem the report must name.
+        drift = generation_stats.get("prompt_drift") or {}
+        if isinstance(drift, dict) and drift:
+            report.prompt_drift = {str(k): float(v) for k, v in drift.items()}
+            worst = max(drift.items(), key=lambda kv: kv[1])
+            report.degraded.append(
+                f"prompt_drift: '{worst[0]}' is in {round(100 * float(worst[1]))}% of the prompts; "
+                "check the world/look line")
         generated, failures = result if result else ([], [])
         comfyui_made = [a for a in generated if getattr(a, "source", "generated") == "generated"]
         report.assets_generated = sum(1 for a in comfyui_made if not a.cache_hit)
@@ -557,6 +574,44 @@ async def _run_presentation_pass(
 
     # --- D. placement ------------------------------------------------------
     report_progress(0.62, "Cutting in the B-roll")
+    live_now = live_mod.read(PROJECTS_DIR / project_id)
+    if live_now:
+        before = settings
+        settings = live_mod.apply(settings, live_now)
+        made_clips = {a.beat_id for a in generated if getattr(a, "kind", "") == "video"}
+        trimmed, live_dropped = live_mod.trim_to_coverage(plan.beats, settings, program.duration_s)
+        trimmed = live_mod.rebalance_clips(trimmed, settings, made_clips)
+        kept_ids = {b.id for b in trimmed}
+        kinds = {b.id: b.kind for b in trimmed}
+        # Assets follow the beats: a dropped beat loses its picture, a beat
+        # demoted to a still keeps only its still (every clip began as one).
+        kept_assets = []
+        for a in generated:
+            if a.beat_id not in kept_ids:
+                continue
+            if getattr(a, "kind", "") == "video" and kinds.get(a.beat_id) != "broll_video":
+                continue
+            kept_assets.append(a)
+        demoted = [a.beat_id for a in generated if getattr(a, "kind", "") == "video"
+                   and a.beat_id in kept_ids and kinds.get(a.beat_id) != "broll_video"]
+        for beat_id in demoted:
+            still = next((a for a in generated if a.beat_id == beat_id and getattr(a, "kind", "") != "video"), None)
+            if still is None:
+                # The clip replaced its still in `generated`: keep the clip
+                # rather than show nothing for an important beat.
+                kept_assets.extend(a for a in generated if a.beat_id == beat_id and a not in kept_assets)
+        generated = kept_assets
+        plan.beats = trimmed
+        report.live_overrides = {
+            "settings": dict(live_now),
+            "coverage": {"from": before.target_coverage, "to": settings.target_coverage},
+            "video_share": {"from": before.video_broll_share, "to": settings.video_broll_share},
+            "beats_dropped": len(live_dropped),
+            "clips_kept": sum(1 for b in trimmed if b.kind == "broll_video"),
+        }
+        report.beats_dropped = list(report.beats_dropped) + live_dropped
+        logger.info("Presentation: live settings applied before placement (%s): %d beat(s) dropped, %d clip(s)",
+                    live_mod.describe(live_now), len(live_dropped), report.live_overrides["clips_kept"])
     rejected: List[Dict[str, str]] = []
     if (settings.broll or local_assets) and generated:
         report.broll_placed = await stages.run(
@@ -662,6 +717,9 @@ async def _run_presentation_pass(
             default=0) or 0
 
     # --- E. the zooms ------------------------------------------------------
+    # The resting frame first: every move below composes on top of it.
+    report.base_zoom = await stages.run(
+        "base_zoom", _sync(facezoom.apply_base_zoom, timeline, settings), default=1.0) or 1.0
     window_zoom_times: List[float] = []
     if settings.face_zoom:
         report_progress(0.70, "Finding the speaker")
@@ -818,7 +876,7 @@ async def _run_presentation_pass(
     # voice master. Placed last among the layers so every whoosh lands on the
     # final position of the cutaway it marks (the title stage above may have
     # shifted the programme behind a card).
-    if settings.music or settings.sfx or settings.ambience:
+    if settings.music or settings.sfx or settings.ambience or settings.sfx_diegetic:
         # A best-effort ComfyUI pre-pass for "auto"/"generated" sourcing: it
         # only fills gaps the library doesn't cover, and needs to run (and be
         # awaited) before the synchronous planning/placement below, which
@@ -835,13 +893,30 @@ async def _run_presentation_pass(
                     duration=program.duration_s),
                 default=None)
         report_progress(0.85, "Sound design")
+        # Scene sounds: the script's [sfx: <effect>] cues first, then the sound
+        # designer's (a model pass, or keywords from the beats), with the
+        # effects the library has nothing for generated before placement.
+        diegetic: List[Any] = []
+        if settings.sfx_diegetic:
+            from . import sfx_library, sound_design
+            planned = await stages.run(
+                "sound_design", sound_design.plan_diegetic(program, plan.beats, ask, genre),
+                default=[])
+            diegetic = sound_design.merge_cues(directives.get("diegetic") or [], planned or [])
+            if diegetic and settings.sfx_source in ("auto", "generated"):
+                await stages.run(
+                    "sound_effects_generation",
+                    sfx_library.warm_effects(diegetic, seed,
+                                             comfyui_online=bool(report.comfyui_online),
+                                             library_dirs=settings.sfx_library_dirs),
+                    default=None)
         sound_result = await stages.run(
             "sound",
             _sync(_apply_sound, timeline, program, settings, genre, seed,
                   window_zoom_times, list(directives["sfx"]) + list(mood_plan.sfx),
                   mood_plan.loops,
                   [(t.start_s, t.end_s, t.act or "") for t in plan.topics],
-                  list(directives.get("music_cues") or [])),
+                  list(directives.get("music_cues") or []), diegetic=diegetic),
             default=None)
         if sound_result:
             report.music_used = sound_result.get("music", "")
@@ -849,6 +924,9 @@ async def _run_presentation_pass(
             report.ambience_used = sound_result.get("ambience", "")
             report.sfx_source_used = sound_result.get("sfx_sources", {})
             report.music_source_used = sound_result.get("music_source", "")
+            report.diegetic_placed = int(sound_result.get("diegetic", 0))
+            report.diegetic_sources = sound_result.get("diegetic_sources", {})
+            report.diegetic_unresolved = sound_result.get("diegetic_unresolved", [])
             for note in sound_result.get("notes", []):
                 report.degraded.append(note)
     if settings.voice_preset and settings.voice_preset.lower() not in ("off", "none"):
@@ -1263,7 +1341,8 @@ def _apply_sound(timeline: Timeline, program, settings: PresentationSettings,
                  extra_sfx: Optional[List[Tuple[float, str]]] = None,
                  loops: Optional[List[Tuple[float, float, str, float]]] = None,
                  sections: Optional[List[Tuple[float, float, str]]] = None,
-                 music_cues: Optional[List[Tuple[float, str]]] = None) -> Dict[str, Any]:
+                 music_cues: Optional[List[Tuple[float, str]]] = None,
+                 diegetic: Optional[List[Any]] = None) -> Dict[str, Any]:
     """Plan and place the music, effects and ambience lanes."""
     from timeline.schema import frame_to_time
     broll = placement.broll_windows(timeline)
@@ -1274,7 +1353,7 @@ def _apply_sound(timeline: Timeline, program, settings: PresentationSettings,
     plan = sound_stage.plan_sound(timeline, program, settings, genre, seed,
                                   broll_windows=broll, popup_times=popups,
                                   extra_sfx=extra, loops=loops, sections=sections,
-                                  music_cues=music_cues)
+                                  music_cues=music_cues, diegetic=diegetic)
     sfx_sources: Dict[str, int] = {}
     counts = sound_stage.apply_sound(timeline, plan, settings, seed, source_counts=sfx_sources)
     music = ""
@@ -1290,7 +1369,10 @@ def _apply_sound(timeline: Timeline, program, settings: PresentationSettings,
         ambience = f"synth:{cue.kind}" if cue.synthesised else cue.kind
     music_source = plan.music[0].source if plan.music else ""
     return {"music": music, "sfx": counts.get("sfx", 0), "ambience": ambience,
-            "notes": plan.notes, "sfx_sources": sfx_sources, "music_source": music_source}
+            "notes": plan.notes, "sfx_sources": sfx_sources, "music_source": music_source,
+            "diegetic": counts.get("diegetic", 0),
+            "diegetic_sources": counts.get("diegetic_sources", {}),
+            "diegetic_unresolved": counts.get("diegetic_unresolved", [])}
 
 
 def _apply_style_profile(timeline: Timeline, settings: PresentationSettings,

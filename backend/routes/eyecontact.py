@@ -33,7 +33,7 @@ VRAM_MB = 3000.0
 # pre-filled for every run; a run may still override any of it.
 SETTINGS_KEY = "eye_contact"
 DEFAULTS = {"prompter_side": "left", "angle_deg": 0.0, "prompter_cm": 30.0, "camera_cm": 110.0,
-            "steadiness": 0.7, "aim_deg": 0.0, "pitch_deg": 0.0, "quality": "high"}
+            "steadiness": 0.7, "aim_deg": 0.0, "pitch_deg": 0.0, "auto_pitch": True, "quality": "high"}
 
 
 class EyeContactSetup(BaseModel):
@@ -45,6 +45,8 @@ class EyeContactSetup(BaseModel):
     aim_deg: Optional[float] = Field(None, ge=-15.0, le=15.0)
     # vertical re-aim, + = lower the gaze (down), - = raise it (eyecontact.plan.vertical_shift)
     pitch_deg: Optional[float] = Field(None, ge=-10.0, le=10.0)
+    # raise the gaze by the head's own bow toward a prompter below the lens (eyecontact.plan)
+    auto_pitch: Optional[bool] = None
     quality: Optional[str] = Field(None, pattern="^(standard|high|max)$")
 
 
@@ -142,7 +144,8 @@ def _settings(setup: Dict[str, Any]):
     return Settings(prompter_side=setup["prompter_side"], angle_deg=float(setup["angle_deg"]),
                     prompter_cm=float(setup["prompter_cm"]), camera_cm=float(setup["camera_cm"]),
                     steadiness=float(setup["steadiness"]), aim_deg=float(setup["aim_deg"]),
-                    pitch_deg=float(setup.get("pitch_deg") or 0.0))
+                    pitch_deg=float(setup.get("pitch_deg") or 0.0),
+                    auto_pitch=bool(setup.get("auto_pitch", True)))
 
 
 def _cleanup(dst: str):

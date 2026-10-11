@@ -411,8 +411,8 @@ export default function TranscriptEditor() {
       {showWords && reviewItems.length > 0 && (
         <div className="review-list">
           <button className="review-list-header" onClick={() => setReviewOpen(v => !v)}>
-            <span>{reviewOpen ? '▾' : '▸'} Decided under doubt · {reviewItems.length}</span>
-            <span className="text-xs text-muted">Kept unless you say otherwise. Your answers teach the editor.</span>
+            <span>{reviewOpen ? '▾' : '▸'} Listening check · {reviewItems.length}</span>
+            <span className="text-xs text-muted">Cut points the listening check flagged. The editor's own calls are decided, not listed.</span>
           </button>
           {reviewOpen && reviewItems.map((item, n) => (
             <div key={`${item.take}-${item.kind}-${n}`} className={`review-item is-${item.kind}`}>

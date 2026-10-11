@@ -242,6 +242,16 @@ def _load_timeline(project_id: str):
     return p_data, Timeline.model_validate(p_data["timeline"])
 
 
+def _load_timeline_readonly(project_id: str):
+    """`_load_timeline` for readers (filmstrips, waveforms): the project dict
+    comes from the store's per-version cache and must not be mutated; the
+    Timeline built from it is the caller's own."""
+    p_data = project_store.get_project_readonly(project_id)
+    if not p_data or "timeline" not in p_data:
+        raise HTTPException(status_code=404, detail="Project or timeline not found")
+    return p_data, Timeline.model_validate(p_data["timeline"])
+
+
 def _ensure_timeline(project_id: str):
     """Load the timeline, creating an empty one if the project has none yet.
 
@@ -340,7 +350,7 @@ async def generate_timeline(project_id: str):
 async def get_waveform(project_id: str, source_id: str):
     """Return normalized audio peaks for a timeline source (for audio-lane rendering)."""
     from utils.waveform import compute_waveform
-    p_data, tl = _load_timeline(project_id)
+    p_data, tl = await asyncio.to_thread(_load_timeline_readonly, project_id)
     src = tl.sources.get(source_id)
     if not src:
         raise HTTPException(status_code=404, detail="Source not found in timeline")
@@ -353,7 +363,7 @@ async def get_waveform(project_id: str, source_id: str):
 def _filmstrip_meta(project_id: str, source_id: str):
     """Shared lookup for the two filmstrip endpoints: (source, strip) or a 404."""
     from utils.filmstrip import compute_filmstrip
-    _p_data, tl = _load_timeline(project_id)
+    _p_data, tl = _load_timeline_readonly(project_id)
     src = tl.sources.get(source_id)
     if not src:
         raise HTTPException(status_code=404, detail="Source not found in timeline")

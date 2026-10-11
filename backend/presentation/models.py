@@ -237,6 +237,9 @@ class Asset(BaseModel):
     stock_url: Optional[str] = None
     stock_author: Optional[str] = None
     stock_licence: Optional[str] = None
+    # A clip made from a phase-1 still: that still's file, kept so placement can
+    # show it when the clip's slot cannot hold the 5 s a clip needs.
+    still_path: Optional[str] = None
 
 
 # --- Stage E: zooms --------------------------------------------------------
@@ -285,6 +288,17 @@ class SfxCue(BaseModel):
     tag: str
     at_s: float
     gain: float = 0.5
+    # A scene sound (presentation/sound_design.py): the effect in words,
+    # resolved against the creator's library at placement (sfx_library), or a
+    # file already chosen. "oneshot" = a tagged effect (whoosh, pop, stinger),
+    # "accent" = a sound on a word, "bed" = a stretch under the voice.
+    text: str = ""
+    path: str = ""
+    kind: str = "oneshot"
+    duration_s: float = 0.0
+    duck: float = 0.0
+    fade_in_s: float = 0.015
+    fade_out_s: float = 0.015
 
 
 class AmbienceCue(BaseModel):
@@ -300,6 +314,11 @@ class LoopCue(BaseModel):
     start_s: float
     end_s: float
     gain: float = 0.35
+    # A scene-sound bed (rain, insects, an engine idling): the effect in
+    # words, resolved at placement, or a file to loop over the stretch.
+    text: str = ""
+    path: str = ""
+    duck: float = 0.0
 
 
 class VoiceFxCue(BaseModel):
@@ -325,6 +344,10 @@ class SoundPlan(BaseModel):
 # BuzzcafStudio and BuzzEdit agreed on.
 # Bounds on one B-roll cutaway's screen time (and so on a generated clip).
 BROLL_SECONDS_FLOOR, BROLL_SECONDS_CAP = 1.0, 8.0
+# A generated clip runs at least this long on screen (the creator's rule,
+# 2026-10-09): a broll_video beat is planned 5-8 s, and a slot that cannot
+# hold 5 s gets a still instead.
+VIDEO_SECONDS_MIN = 5.0
 
 DENSITY_PRESETS: Dict[str, Dict[str, float]] = {
     "calm":     {"target_coverage": 0.30, "video_broll_share": 0.10,
@@ -495,6 +518,15 @@ class PresentationSettings(BaseModel):
     # Whooshes on cutaways, pops on text, stingers/thunder from the mood recipes.
     sfx: bool = True
     sfx_volume: float = 0.45
+    # Scene sounds under the voice (footsteps, rain, a door, a jeep): the
+    # script's `[sfx: <effect> | kind= | level= | seconds=]` cues and the sound
+    # designer's, placed whatever `sfx` says -- that switch keeps governing the
+    # tagged one-shots. The volume is an absolute ceiling on every scene-sound
+    # item; empty dirs = the `sfx_library_dirs` app setting, else the
+    # creator's Effects folder (presentation/sfx_library.py).
+    sfx_diegetic: bool = True
+    sfx_diegetic_volume: float = 0.35
+    sfx_library_dirs: List[str] = Field(default_factory=list)
     # A full-length ambience loop (wind for horror, room tone for true crime).
     # "auto" maps from the genre; a kind name forces one.
     ambience: bool = True
@@ -559,6 +591,12 @@ class PresentationSettings(BaseModel):
     max_broll_per_minute: Optional[float] = None
     popup_preset: str = "youtube_pop"
     zoom_depth: float = 0.10
+    # The recording's resting frame for the whole video: 1.0 is the full
+    # frame, 1.15 starts 15% tighter. Set as the timeline's master transform
+    # (the compiler applies it to the V1 programme before any overlay, so
+    # B-roll is not cropped with it), and every segment move and punch-in
+    # then works on top of it (presentation/facezoom.py::apply_base_zoom).
+    base_zoom: float = 1.0
     seed: Optional[int] = None
     # The video's category ("horror", "comedy", "finance", ...). Styles every
     # generated prompt — B-roll and thumbnail — to match the kind of video.
@@ -612,8 +650,9 @@ class PresentationSettings(BaseModel):
     # a list restricts the pass to exactly those style names.
     text_fx_styles: Optional[List[str]] = None
     # "Generative AI" in the corner of every generated picture on screen
-    # (presentation/graphics.py::place_ai_labels).
-    ai_label: bool = True
+    # (presentation/graphics.py::place_ai_labels). Off by default since
+    # 2026-10-08: the disclosure is made in the upload form instead.
+    ai_label: bool = False
     # "auto" uses the best person-segmentation backend already importable in
     # this venv (nothing is installed or downloaded to get one — see
     # presentation.matte.detect_backend); "off" skips behind_head entirely and
@@ -744,6 +783,9 @@ class PresentationReport(BaseModel):
     # Where each Studio-contract field's final value came from — see
     # presentation.models.settings_sources_for.
     settings_sources: Dict[str, str] = Field(default_factory=dict)
+    # Settings the creator changed while this pass was running (the
+    # mid-production change, presentation/live.py), and what it cost.
+    live_overrides: Dict[str, Any] = Field(default_factory=dict)
     program: Dict[str, Any] = Field(default_factory=dict)
     beats_planned: int = 0
     beats_dropped: List[Dict[str, str]] = Field(default_factory=list)
@@ -794,6 +836,7 @@ class PresentationReport(BaseModel):
     zooms_punch_in: int = 0
     zooms_punch_out: int = 0
     zooms_suppressed_by_broll: int = 0
+    base_zoom: float = 1.0
     faces_detected_pct: float = 0.0
     captions: int = 0
     # The script the captions were written in ("romanized" / "native").
@@ -830,6 +873,12 @@ class PresentationReport(BaseModel):
     voice_enhance_used: str = ""
     sfx_source_used: Dict[str, int] = Field(default_factory=dict)
     music_source_used: str = ""
+    # Scene sounds (presentation/sound_design.py): how many landed, where they
+    # came from ({"library": n, "generated": n, "none": n}), and the effects
+    # nothing could be found for.
+    diegetic_placed: int = 0
+    diegetic_sources: Dict[str, int] = Field(default_factory=dict)
+    diegetic_unresolved: List[str] = Field(default_factory=list)
     thumbnail: Optional[str] = None
     output_path: Optional[str] = None
     # The checks run on the dressed timeline and the rendered file
@@ -854,4 +903,7 @@ class PresentationReport(BaseModel):
     # the memory hand-over verdicts and, for video, clips made / kept as
     # stills and why any were skipped.
     generation: Dict[str, Any] = Field(default_factory=dict)
+    # Content words in more than 60% of the generated prompts ({"tiger": 0.91}),
+    # from presentation/assets.py -- usually a world/look line naming a subject.
+    prompt_drift: Dict[str, float] = Field(default_factory=dict)
     timings: List[StageTiming] = Field(default_factory=list)
