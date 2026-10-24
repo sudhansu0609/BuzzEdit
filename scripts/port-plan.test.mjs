@@ -74,7 +74,7 @@ async function withEnv(vars, fn) {
 
 test('the preferred ports are today\'s numbers, and the env overrides them', async () => {
   await withEnv({ BUZZEDIT_PORT: null, COMFYUI_PORT: null, BUZZEDIT_VITE_PORT: null }, () => {
-    assert.equal(plan.preferredBackendPort(), 8099);
+    assert.equal(plan.preferredBackendPort(), 8100);
     assert.equal(plan.preferredComfyPort(), 8188);
     assert.equal(plan.preferredVitePort(), 5173);
   });
@@ -85,7 +85,7 @@ test('the preferred ports are today\'s numbers, and the env overrides them', asy
   });
   // Nonsense falls back rather than producing NaN in a URL.
   await withEnv({ BUZZEDIT_PORT: 'later' }, () => {
-    assert.equal(plan.preferredBackendPort(), 8099);
+    assert.equal(plan.preferredBackendPort(), 8100);
   });
 });
 
@@ -248,9 +248,10 @@ test('no literal port survives in the launcher, the preload or the renderer', ()
     'src/components/AgentPanel.tsx',
     'src/components/Preferences.tsx',
   ];
-  // The four numbers this app used to hardcode. Anything else four digits long
-  // in these files is a window size or a timeout.
-  const oldPorts = /\b(8099|8188|8000|5173)\b/;
+  // The numbers this app has hardcoded at one point or another (8099 was the
+  // original default, now 8100 — rule 2 took it off the Studio's own port).
+  // Anything else four digits long in these files is a window size or a timeout.
+  const oldPorts = /\b(8099|8100|8188|8000|5173)\b/;
   for (const rel of files) {
     const text = fs.readFileSync(path.join(root, rel), 'utf8');
     const offenders = text.split('\n')
@@ -261,7 +262,7 @@ test('no literal port survives in the launcher, the preload or the renderer', ()
   }
   // The preferred defaults live in exactly one place each.
   const planText = fs.readFileSync(path.join(root, 'electron/port-plan.cjs'), 'utf8');
-  for (const n of ['8099', '8188', '5173']) {
+  for (const n of ['8100', '8188', '5173']) {
     const hits = planText.split(n).length - 1;
     assert.equal(hits, 1, `${n} should appear once in port-plan.cjs, found ${hits}`);
   }

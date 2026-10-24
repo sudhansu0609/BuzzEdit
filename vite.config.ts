@@ -6,7 +6,7 @@ import path from 'path';
 // port at launch and proxies to it. `scripts/dev.mjs` picks both ports and puts
 // them in the environment; the numbers below are only the preferred defaults
 // for a bare `npx vite`, and are not assumed to be free.
-const backendPort = Number.parseInt(process.env.BUZZEDIT_PORT || '', 10) || 8099;
+const backendPort = Number.parseInt(process.env.BUZZEDIT_PORT || '', 10) || 8100;
 const vitePort = Number.parseInt(process.env.BUZZEDIT_VITE_PORT || '', 10) || 5173;
 const backend = process.env.BUZZEDIT_URL || `http://127.0.0.1:${backendPort}`;
 

@@ -382,6 +382,7 @@ export default function TranscriptEditor() {
           type="text"
           className="transcript-search-input"
           placeholder="Search transcript… (Ctrl+F)"
+          aria-label="Search transcript"
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
           onKeyDown={handleSearchKeyDown}
@@ -389,8 +390,8 @@ export default function TranscriptEditor() {
         <span className="text-xs text-muted transcript-search-count">
           {searchTerm.trim() ? (matches.length > 0 ? `${currentMatchIndex + 1} of ${matches.length}` : '0 of 0') : ''}
         </span>
-        <button className="btn btn-sm" disabled={matches.length === 0} onClick={handlePrevMatch} title="Previous match (Shift+Enter)">▲</button>
-        <button className="btn btn-sm" disabled={matches.length === 0} onClick={handleNextMatch} title="Next match (Enter)">▼</button>
+        <button className="btn btn-sm" disabled={matches.length === 0} onClick={handlePrevMatch} title="Previous match (Shift+Enter)" aria-label="Previous match (Shift+Enter)">▲</button>
+        <button className="btn btn-sm" disabled={matches.length === 0} onClick={handleNextMatch} title="Next match (Enter)" aria-label="Next match (Enter)">▼</button>
         <button className={`btn btn-sm ${showReplace ? 'btn-primary' : ''}`} onClick={() => setShowReplace(v => !v)} title="Replace">🔁 Replace</button>
         {replacedMsg && <span className="text-xs text-muted transcript-replaced-msg">{replacedMsg}</span>}
         {showReplace && (
@@ -399,6 +400,7 @@ export default function TranscriptEditor() {
               type="text"
               className="transcript-search-input"
               placeholder="Replace with…"
+              aria-label="Replace with"
               value={replaceTerm}
               onChange={(e) => setReplaceTerm(e.target.value)}
             />
@@ -505,6 +507,7 @@ export default function TranscriptEditor() {
               <div className="segment-content">
                 <textarea
                   className="segment-text"
+                  aria-label={`Segment ${segment.id} text`}
                   value={displayText}
                   onChange={(e) => handleTextChange(segment.id, e.target.value)}
                   onClick={(e) => e.stopPropagation()}
@@ -519,6 +522,7 @@ export default function TranscriptEditor() {
                   </span>
                   <button
                     className="btn btn-sm btn-danger delete-btn"
+                    aria-label={`Delete segment ${segment.id}`}
                     onClick={(e) => {
                       e.stopPropagation();
                       handleDeleteSegment(segment.id);

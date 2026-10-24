@@ -67,11 +67,12 @@ export default function Transport({
   return (
     <div className="audio-transport">
       <button className={`audio-tbtn primary${playing ? ' on' : ''}`} disabled={!live} onClick={onPlayPause}
-        title={playing ? 'Pause (Space)' : 'Play (Space)'}>
+        title={playing ? 'Pause (Space)' : 'Play (Space)'} aria-label={playing ? 'Pause (Space)' : 'Play (Space)'}>
         {playing ? <Pause size={14} /> : <Play size={14} />}
       </button>
       <button className={`audio-tbtn${loopOn ? ' on' : ''}`} disabled={!live || !range} onClick={onLoop}
-        title={range ? `Loop ${ORIGIN[range.origin].toLowerCase()} ${span}` : 'Nothing to loop'}>
+        title={range ? `Loop ${ORIGIN[range.origin].toLowerCase()} ${span}` : 'Nothing to loop'}
+        aria-label={range ? `Loop ${ORIGIN[range.origin].toLowerCase()} ${span}` : 'Nothing to loop'}>
         <Repeat size={14} />
       </button>
       <button className={`audio-tbtn ab${ab ? ' on' : ''}`} disabled={!live} onClick={onAB}

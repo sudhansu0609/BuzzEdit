@@ -389,6 +389,10 @@ class PresentationSettings(BaseModel):
     # model; {} means the story has no single on-screen lead (no swaps, no
     # model call); None (absent) means find it from the transcript.
     main_character: Optional[Dict[str, Any]] = None
+    # The medium every picture, clip, thumbnail scene and text card is
+    # made in: real (photoreal), explainer, stick_figure or cartoon
+    # (presentation/art_style.py; BuzzcafStudio resolves it per project).
+    art_style: str = "real"
     popups: bool = True
     # Off by default: an animated zoom on a transparent PNG composites a black
     # box, because the canvas transform pads with black. See placement.py.
@@ -566,6 +570,11 @@ class PresentationSettings(BaseModel):
     # covered by cutaways. Gap and budget are derived from it — the old fixed
     # per-minute count and 8s gaps capped coverage near 20% however this was set.
     target_coverage: float = 0.75
+    # A face-first video (BuzzcafStudio's "face_intro" layout): the first this
+    # many seconds of the programme are the speaker alone. The planner's own
+    # cutaways never start inside it; the caller's timed script shots begin
+    # after it. 0 = off.
+    face_intro_s: float = 0.0
     # The speaker must reappear at least this long between cutaways, whatever
     # the coverage asks for — an unbroken picture wall stops being their video.
     # Kept below the gap the coverage target derives (~1s at 75%) so the target,

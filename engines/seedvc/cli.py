@@ -17,6 +17,12 @@ Commands
               one whole file into the reference's voice. The WAV is written at the engine's rate
               (22050 Hz, 44100 Hz with f0_condition) and exactly as long as the source times
               length_adjust: a drift is padded with silence or trimmed at the end.
+              --params may also carry "checkpoint" (a fine-tuned DiT .pth, VOICE_DELIVERY_PLAN.md
+              brief F3) and optionally "config" (its training config, to check sr/hop_length match
+              the loaded base model); both are swapped into the already-loaded wrapper in place,
+              and swapped back out when a later job's --ref carries neither. Omitted, --ref's own
+              folder is checked for a sidecar "<stem>.seedvc.json" ({"checkpoint", "config"}) and
+              used automatically -- the stock model otherwise, unchanged.
   apply-edit  --source <wav> --manifest <json> --out <wav>
               SkinWalker's editor manifest {duration, master_sr, regions[]}: each convert region in
               its own voice (a reference path, or a stem in --voices-dir) and engine params, cut
@@ -295,6 +301,25 @@ def _existing(path: str, flag: str) -> str:
     return str(candidate.resolve())
 
 
+def _finetune_overrides(overrides: Any, ref: str) -> Dict[str, Optional[str]]:
+    """{"checkpoint", "config"} to load for this convert: --params' own keys, else the sidecar
+    "<ref-stem>.seedvc.json" beside the reference clip (VOICE_DELIVERY_PLAN.md brief F3); the
+    stock model when neither names one."""
+    sidecar = Path(ref).with_suffix(".seedvc.json")
+    found: Dict[str, Any] = {}
+    if sidecar.is_file():
+        try:
+            found = json.loads(sidecar.read_text(encoding="utf-8-sig"))
+        except Exception:
+            found = {}
+    if isinstance(overrides, dict):
+        found = {**found, **{k: v for k, v in overrides.items() if k in ("checkpoint", "config") and v}}
+    checkpoint = found.get("checkpoint") or None
+    config = found.get("config") or None
+    return {"checkpoint": _existing(checkpoint, "checkpoint") if checkpoint else None,
+            "config": _existing(config, "config") if config else None}
+
+
 def _seedvc_dir(args: argparse.Namespace) -> Path:
     folder = Path(args.seedvc_dir or DEFAULT_SEEDVC_DIR).resolve()
     if not (folder / "seed_vc_wrapper.py").is_file():
@@ -430,6 +455,8 @@ class Engine:
         self.wrapper: Any = None
         self.torch: Any = None
         self.load_s = 0.0
+        self._base_state: Optional[Dict[str, Dict[str, Any]]] = None   # the stock DiT weights, for swap-back
+        self._finetune_ckpt: Optional[str] = None                      # the fine-tuned checkpoint now loaded, if any
 
     def load(self, fraction: float = 0.0) -> None:
         if self.wrapper is not None:
@@ -468,6 +495,37 @@ class Engine:
             os.chdir(cwd)
             stop.set()
         self.load_s = time.perf_counter() - started
+        self._base_state = {key: {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
+                            for key, module in self.wrapper.model.items()}
+
+    def ensure_finetune(self, checkpoint_path: Optional[str], config_path: Optional[str]) -> None:
+        """Swap the DiT weights for a fine-tuned checkpoint (brief F3), or back to stock when
+        `checkpoint_path` is falsy -- a no-op when the right weights are already loaded."""
+        self.load()
+        if checkpoint_path == self._finetune_ckpt:
+            return
+        if not checkpoint_path:
+            for key, state in self._base_state.items():
+                self.wrapper.model[key].load_state_dict(state)
+                self.wrapper.model[key].eval().to(self.device)
+            self._finetune_ckpt = None
+            return
+        if config_path:
+            import yaml
+            config = yaml.safe_load(open(config_path, "r"))
+            sr = config["preprocess_params"]["sr"]
+            hop = config["preprocess_params"]["spect_params"]["hop_length"]
+            if sr != self.wrapper.sr or hop != self.wrapper.hop_length:
+                raise CliError(f"checkpoint config sr/hop_length ({sr}/{hop}) does not match the "
+                               f"loaded base model ({self.wrapper.sr}/{self.wrapper.hop_length})")
+        from modules.commons import load_checkpoint
+        self.wrapper.model, _, _, _ = load_checkpoint(
+            self.wrapper.model, None, checkpoint_path, load_only_params=True,
+            ignore_modules=[], is_distributed=False)
+        for key in self.wrapper.model:
+            self.wrapper.model[key].eval()
+            self.wrapper.model[key].to(self.device)
+        self._finetune_ckpt = checkpoint_path
 
     def convert(self, source: str, ref: str, params: Dict[str, Any], source_s: float, ref_s: float,
                 on_fraction: Optional[Callable[[float], None]] = None) -> Tuple[Any, int]:
@@ -605,15 +663,19 @@ def cmd_warm(args: argparse.Namespace) -> Dict[str, Any]:
 def cmd_convert(args: argparse.Namespace) -> Dict[str, Any]:
     source = _existing(args.source, "--source")
     ref = _existing(args.ref, "--ref")
-    params = merge_params(_json_arg(args.params, "--params"))
+    overrides = _json_arg(args.params, "--params")
+    params = merge_params(overrides)
+    finetune = _finetune_overrides(overrides, ref)
     seedvc = _seedvc_dir(args)
     source_s, ref_s = _duration_s(source), _duration_s(ref)
     plan = {"source": source, "ref": ref, "out": str(Path(args.out).resolve()), "params": params,
+            "finetune_checkpoint": finetune["checkpoint"],
             "source_s": round(source_s, 3), "ref_s": round(ref_s, 3), "seedvc_dir": str(seedvc)}
     if args.dry_run:
         progress(1.0, "dry-run")
         return plan
     engine = _engine(seedvc, args.device)
+    engine.ensure_finetune(finetune["checkpoint"], finetune["config"])
     progress(LOAD_END, "load")
     started = time.perf_counter()
     audio, sr = engine.convert(

@@ -88,6 +88,7 @@ function PanelControls({ id }: { id: PanelId }) {
       <button
         className="dock-btn"
         title={locked ? 'Layout is locked' : 'Move this panel'}
+        aria-label={locked ? 'Layout is locked' : 'Move this panel'}
         disabled={locked}
         onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v); }}
         onPointerDown={(e) => e.stopPropagation()}
@@ -96,6 +97,7 @@ function PanelControls({ id }: { id: PanelId }) {
       <button
         className="dock-btn"
         title="Hide this panel"
+        aria-label="Hide this panel"
         onClick={(e) => { e.stopPropagation(); toggleVisible(id, false); }}
         onPointerDown={(e) => e.stopPropagation()}
       >✕</button>

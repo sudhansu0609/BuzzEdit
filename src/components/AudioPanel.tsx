@@ -153,6 +153,7 @@ function RackPresetBar({ names, canSave, canLoad, onSave, onLoad }: {
       <div className="audio-presets-row">
         <select className="audio-select" value="" disabled={busy || !canLoad || names.length === 0}
           title="Replace this rack with a saved rack preset"
+          aria-label="Load rack preset"
           onChange={(e) => {
             const picked = e.target.value;
             if (picked) void run(() => onLoad(picked), 'Not loaded');
@@ -168,7 +169,7 @@ function RackPresetBar({ names, canSave, canLoad, onSave, onLoad }: {
       </div>
       {saving && (
         <div className="audio-presets-row">
-          <input className="audio-text" placeholder="Rack preset name" value={name} autoFocus
+          <input className="audio-text" placeholder="Rack preset name" aria-label="Rack preset name" value={name} autoFocus
             onChange={(e) => setName(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter') void save();

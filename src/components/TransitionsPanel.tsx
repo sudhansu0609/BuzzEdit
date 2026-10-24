@@ -241,6 +241,7 @@ export default function TransitionsPanel() {
 
       <Section title={`All transitions${total ? ` (${total})` : ''}`}>
         <input className="fx-search" type="search" placeholder="Filter — wipe, slide, circle…"
+          aria-label="Filter transitions"
           value={query} onChange={(e) => setQuery(e.target.value)} />
         {groups.length === 0 && (
           <div className="text-xs text-muted">Nothing matches that.</div>

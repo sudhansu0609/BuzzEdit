@@ -1,0 +1,148 @@
+{
+ "source": "B:/youtubeProjects/beyond3baje/ep7/OXCC3995.MOV",
+ "edited": "B:/youtubeProjects/beyond3baje/ep7/ep7Final.mp4",
+ "src_duration": 567.959,
+ "cut_duration": 516.538,
+ "kept": [
+  {
+   "cut_start": 0.0,
+   "cut_end": 6.31,
+   "speech_s": 5.03,
+   "src_start": 37.056,
+   "src_end": 43.366,
+   "offset_samples": 592902,
+   "match": 0.465,
+   "margin": 0.447
+  },
+  {
+   "cut_start": 6.31,
+   "cut_end": 6.75,
+   "speech_s": 0.39,
+   "unmatched": true
+  },
+  {
+   "cut_start": 6.75,
+   "cut_end": 59.67,
+   "speech_s": 41.53,
+   "src_start": 43.806,
+   "src_end": 96.726,
+   "offset_samples": 592902,
+   "match": 0.517,
+   "margin": 0.511
+  },
+  {
+   "cut_start": 59.67,
+   "cut_end": 60.14,
+   "speech_s": 0.27,
+   "unmatched": true
+  },
+  {
+   "cut_start": 60.14,
+   "cut_end": 111.03,
+   "speech_s": 38.31,
+   "src_start": 97.196,
+   "src_end": 148.086,
+   "offset_samples": 592902,
+   "match": 0.533,
+   "margin": 0.527
+  },
+  {
+   "cut_start": 111.03,
+   "cut_end": 332.01,
+   "speech_s": 168.68,
+   "src_start": 153.212,
+   "src_end": 374.192,
+   "offset_samples": 674906,
+   "match": 0.518,
+   "margin": 0.516
+  },
+  {
+   "cut_start": 332.01,
+   "cut_end": 332.32,
+   "speech_s": 0.31,
+   "unmatched": true
+  },
+  {
+   "cut_start": 332.32,
+   "cut_end": 335.02,
+   "speech_s": 2.02,
+   "src_start": 374.502,
+   "src_end": 377.202,
+   "offset_samples": 674906,
+   "match": 0.513,
+   "margin": 0.48
+  },
+  {
+   "cut_start": 335.02,
+   "cut_end": 515.82,
+   "speech_s": 132.03,
+   "src_start": 380.16,
+   "src_end": 560.96,
+   "offset_samples": 722235,
+   "match": 0.512,
+   "margin": 0.508
+  },
+  {
+   "cut_start": 515.82,
+   "cut_end": 516.54,
+   "speech_s": 0.34,
+   "unmatched": true
+  }
+ ],
+ "spans": [
+  {
+   "start": 0.0,
+   "end": 37.056,
+   "kind": "speech",
+   "speech_s": 25.86
+  },
+  {
+   "start": 43.366,
+   "end": 43.806,
+   "kind": "speech",
+   "speech_s": 0.44
+  },
+  {
+   "start": 96.726,
+   "end": 97.196,
+   "kind": "speech",
+   "speech_s": 0.33
+  },
+  {
+   "start": 148.086,
+   "end": 153.212,
+   "kind": "speech",
+   "speech_s": 2.73
+  },
+  {
+   "start": 374.192,
+   "end": 374.502,
+   "kind": "speech",
+   "speech_s": 0.31
+  },
+  {
+   "start": 377.202,
+   "end": 380.16,
+   "kind": "speech",
+   "speech_s": 2.8
+  },
+  {
+   "start": 560.96,
+   "end": 567.959,
+   "kind": "speech",
+   "speech_s": 0.48
+  }
+ ],
+ "stats": {
+  "kept_segments": 6,
+  "kept_s": 514.6,
+  "unmatched_s": 1.94,
+  "removed_speech_s": 53.36,
+  "removed_silence_s": 0,
+  "reordered_segments": 0,
+  "weak_segments": 0
+ },
+ "language": "hi",
+ "genre": "documentary",
+ "note": "Creator's own cut of Beyond3Baje ep7 (OXCC3995.MOV -> ep7Final.mp4), matched 2026-10-09: 6 kept segments, 1.9 s of the export unmatched, 53 s of speech removed. A near-complete take: mostly tests that good speech is not removed."
+}

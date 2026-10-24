@@ -1,0 +1,15 @@
+{
+  "take": "life3baje_ep2",
+  "utterances": 109,
+  "windows": 3,
+  "removed": 39,
+  "trim": 11,
+  "kept": 59,
+  "groups": 10,
+  "drops": 26,
+  "trims": 11,
+  "removed_s_in_key": 284.4,
+  "removed_s_as_utterances": 94.7,
+  "editorial_spans": 0,
+  "made_at": "2026-10-23T00:02:24"
+}

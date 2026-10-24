@@ -10,6 +10,9 @@ __pycache__/
 logs/
 data/projects/
 data/jobs.json
+data/jobs/
+data/master_control.json
+data/supervisor_parent.json
 data/temp/
 data/models/
 backend/data/
@@ -44,3 +47,13 @@ backend/text_*.txt
 # Audio suite: generated impulse responses and the creator's voice references (large WAVs)
 data/ir/synthetic/
 data/voices/
+
+# Engine virtualenvs (engines/<name>/.venv) and runtime state files
+engines/*/.venv/
+data/comfy_status.json
+
+# Narration TTS outputs, voice-training WAVs and the normalised SFX cache are regenerated
+data/narration/
+data/narration_probe/
+data/voice_training/
+data/sfx_cache/

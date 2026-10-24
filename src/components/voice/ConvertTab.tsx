@@ -227,7 +227,8 @@ export default function ConvertTab({ projectId, voices, presets, defs, request }
           ? <div className="voice-source">{clipSource.label}</div>
           : <div className="audio-hint">Select an audio or video clip on the timeline: its whole file is converted.</div>)}
         {mode === 'media' && (media.length ? (
-          <select className="audio-select" value={mediaId} onChange={(e) => { setMediaId(e.target.value); setResult(null); }}>
+          <select className="audio-select" value={mediaId} aria-label="Media item"
+            onChange={(e) => { setMediaId(e.target.value); setResult(null); }}>
             {!media.some((m) => m.id === mediaId) && <option value={mediaId}>(pick an item)</option>}
             {media.map((m) => (
               <option key={m.id} value={m.id}>

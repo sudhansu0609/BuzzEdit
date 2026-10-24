@@ -23,6 +23,7 @@ import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from . import character as character_mod
+from . import art_style as art_mod
 from . import genre as genre_mod
 from .models import (BEAT_KINDS, BROLL_SECONDS_CAP, VIDEO_SECONDS_MIN, Beat, Character, Program,
                      PresentationSettings, ShotPlan, Topic)
@@ -139,16 +140,23 @@ BEAT_SYSTEM = (
 THUMBNAIL_CONCEPT_SYSTEM = (
     "You design the YouTube thumbnail for this video. Read the transcript excerpts and "
     "the topic list, work out the ONE core idea or payoff the whole video is about, and "
-    "answer with exactly two lines:\n"
+    "answer with exactly four lines:\n"
     "TITLE: at most five words, in the language the speaker is using, in capitals, no "
     "punctuation. It names that core idea and must promise only what the video actually "
     "delivers -- never invent a claim the transcript does not make, never a generic "
     "phrase that would fit any video.\n"
+    "THUMB: the two to four words printed big on the picture. For a Hindi or Hinglish "
+    "video write them in Devanagari script (e.g. जंगल का रेंजर, कमरा 209): the thing or "
+    "place the story turns on, concrete and specific, never a sentence, never a generic "
+    "word like 'horror' or 'story'. No punctuation.\n"
     "SCENE: one sentence for an image generator: a single clear subject doing something "
     "that shows that core idea literally (the specific objects, place and emotion the "
-    "speaker talks about), close framing, strong contrast. No text, no letters, no logos "
-    "in the scene -- the title is added on top later.\n"
-    "Answer with the two lines only."
+    "speaker talks about), close framing, strong contrast, night or low light for a "
+    "horror story. No text, no letters, no logos in the scene -- the words are added on "
+    "top later. Never mention a camera.\n"
+    "LABEL: a two-word channel label in capital English for the corner, e.g. HORROR STORY, "
+    "REAL ENCOUNTER, TRUE CRIME; or NONE.\n"
+    "Answer with the four lines only."
 )
 
 THUMBNAIL_TITLE_SYSTEM = (
@@ -655,6 +663,11 @@ def budget_beats(unique: List[Beat], program: Program,
         # It is exempt from the coverage budget and keeps only the minimum
         # on-camera gap; it still cannot sit on top of another cutaway.
         requested = beat.origin == "script"
+        # A face-first video keeps its opening on the speaker: nothing the
+        # planner proposed may start inside it.
+        if not requested and settings.face_intro_s > 0 and beat.start_s < settings.face_intro_s:
+            dropped.append({"topic": beat.topic, "reason": "inside the face-first opening"})
+            continue
         # A direction that timed itself (`seconds=`) runs exactly that long and
         # may sit back to back with the next one: the caller already spaced them.
         held = requested and bool(beat.data.get("hold")) and bool(beat.planned_duration_s)
@@ -783,13 +796,13 @@ def _too_close(beat: Beat, planned: float, placed: List[Beat], gap: float) -> bo
 # --- the model calls -------------------------------------------------------
 
 async def find_topics(program: Program, ask: AskJson,
-                      genre: str = "general") -> List[Topic]:
+                      genre: str = "general", art_style: str = "real") -> List[Topic]:
     """Ask the model what the video is about, one window at a time."""
     lines = transcript_lines(program).splitlines()
     if not lines:
         return []
 
-    system = TOPIC_SYSTEM + genre_mod.genre_block(genre)
+    system = TOPIC_SYSTEM + genre_mod.genre_block(genre, art_style)
     topics: List[Topic] = []
     start = 0
     while start < len(lines):
@@ -868,13 +881,13 @@ PARAGRAPH_SCHEMA = {
 
 
 async def describe_paragraphs(topics: List[Topic], ask: AskJson,
-                              genre: str = "general") -> List[Topic]:
+                              genre: str = "general", art_style: str = "real") -> List[Topic]:
     """Name and illustrate script-derived topics; the boundaries are the
     script's and are never moved. A topic the model skips keeps its
     provisional name."""
     if not topics:
         return topics
-    system = PARAGRAPH_SYSTEM + genre_mod.genre_block(genre)
+    system = PARAGRAPH_SYSTEM + genre_mod.genre_block(genre, art_style)
     out = [t.model_copy() for t in topics]
     starts = list(range(0, len(out), TOPIC_BATCH))
     calls = []
@@ -910,13 +923,14 @@ async def describe_paragraphs(topics: List[Topic], ask: AskJson,
 async def write_beats(topics: List[Topic], ask: AskJson,
                       genre: str = "general",
                       genre_secondary: Optional[str] = None,
-                      character: Optional[Character] = None) -> List[Beat]:
+                      character: Optional[Character] = None,
+                      art_style: str = "real") -> List[Beat]:
     """Turn topics into on-screen beats with generation prompts. With a main
     character, each beat also says whether it shows them."""
     beats: List[Beat] = []
     by_topic = {t.topic.lower(): t for t in topics}
 
-    system = BEAT_SYSTEM + genre_mod.genre_block(genre)
+    system = BEAT_SYSTEM + genre_mod.genre_block(genre, art_style)
     schema = BEAT_SCHEMA
     if character is not None:
         system += character_mod.beat_block(character)
@@ -963,13 +977,13 @@ async def write_beats(topics: List[Topic], ask: AskJson,
                 # asked for it, but a local model forgets, and one off-mood
                 # picture in a horror edit reads as a mistake.
                 image_prompt=genre_mod.apply_look(
-                    raw.get("image_prompt") or topic.visual or None, genre, genre_secondary),
-                video_prompt=genre_mod.apply_look(raw.get("video_prompt"), genre, genre_secondary),
+                    raw.get("image_prompt") or topic.visual or None, genre, genre_secondary, art_style),
+                video_prompt=genre_mod.apply_look(raw.get("video_prompt"), genre, genre_secondary, art_style),
                 popup_text=raw.get("popup_text"),
                 negative_prompt=genre_mod.apply_negative(
                     str(raw.get("negative_prompt")
                         or "text, watermark, logo, deformed hands, blurry"),
-                    genre, genre_secondary),
+                    genre, genre_secondary, art_style),
                 style_hint=(str(raw.get("style_hint", "photoreal")).strip().lower()
                             if str(raw.get("style_hint", "")).strip().lower()
                             in ("photoreal", "illustration", "diagram", "abstract")
@@ -1039,7 +1053,7 @@ async def multiply_beats(beats: List[Beat], settings: PresentationSettings,
     to_vary = [b for b in beats if slices_for(b)]
     answers: Dict[int, Optional[str]] = {}
     if ask is not None and to_vary:
-        system = VARIATION_SYSTEM + genre_mod.genre_block(genre)
+        system = VARIATION_SYSTEM + genre_mod.genre_block(genre, settings.art_style)
         replies = await _ask_all(ask, [
             (system, f"Scene: {b.image_prompt}\nN: {slices_for(b)}\n\nPrompts:", VARIATION_SCHEMA)
             for b in to_vary])
@@ -1059,7 +1073,7 @@ async def multiply_beats(beats: List[Beat], settings: PresentationSettings,
                 parsed = first_json_object(answer or "") or {}
                 # Re-stamp the look: the model rewrites the scene and routinely
                 # drops the mood suffix the base prompt carried.
-                prompts = [_clean_prompt(genre_mod.apply_look(p, genre, genre_secondary))
+                prompts = [_clean_prompt(genre_mod.apply_look(p, genre, genre_secondary, settings.art_style))
                            for p in parsed.get("prompts", []) or []]
                 prompts = [p for p in prompts if p][:count]
             except Exception as e:
@@ -1231,11 +1245,12 @@ def fallback_plan(program: Program, settings: PresentationSettings,
             kind="broll_image",
             priority=0.5,
             image_prompt=genre_mod.apply_look(
-                f"Cinematic documentary photograph representing {subject}, "
-                f"natural lighting, 35mm film still, shallow depth of field",
-                genre, genre_secondary),
+                (f"Cinematic documentary photograph representing {subject}, "
+                 f"natural lighting, 35mm film still, shallow depth of field")
+                if art_mod.is_real(settings.art_style) else f"A simple picture representing {subject}",
+                genre, genre_secondary, settings.art_style),
             negative_prompt=genre_mod.apply_negative(
-                "text, watermark, logo, deformed hands, blurry", genre, genre_secondary),
+                "text, watermark, logo, deformed hands, blurry", genre, genre_secondary, settings.art_style),
         ))
     return beats
 
@@ -1277,9 +1292,9 @@ async def plan_shots(program: Program, settings: PresentationSettings,
     if ask is not None:
         try:
             if topics:
-                topics = await describe_paragraphs(topics, ask, genre)
+                topics = await describe_paragraphs(topics, ask, genre, settings.art_style)
             else:
-                topics = await find_topics(program, ask, genre)
+                topics = await find_topics(program, ask, genre, settings.art_style)
             if topics and enrich is not None:
                 # Story structure tags the topics (acts) before the beats are
                 # weighed: an act's density multiplier scales its beats'
@@ -1291,7 +1306,8 @@ async def plan_shots(program: Program, settings: PresentationSettings,
             if topics and not named and settings.character_consistency and settings.broll:
                 character = await character_mod.find_main_character(program, ask, topics)
             if topics:
-                beats = await write_beats(topics, ask, genre, genre_secondary, character)
+                beats = await write_beats(topics, ask, genre, genre_secondary, character,
+                                          art_style=settings.art_style)
                 beats = _weigh_by_act(beats, topics)
         except Exception as e:
             logger.warning("Shot planning failed (%s); falling back to keywords", e)

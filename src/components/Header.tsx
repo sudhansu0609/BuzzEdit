@@ -134,6 +134,7 @@ export default function Header({ onReset }: Props) {
             <span className="text-xs text-muted header-label">Resolution</span>
             <select
               className="btn btn-sm"
+              aria-label="Resolution"
               value={currentResolution}
               onChange={(e) => handleResolutionChange(e.target.value)}
             >
@@ -176,9 +177,9 @@ export default function Header({ onReset }: Props) {
       </div>
 
       <div className="window-controls">
-        <button className="window-btn" onClick={handleMinimize}>─</button>
-        <button className="window-btn" onClick={handleMaximize}>□</button>
-        <button className="window-btn close" onClick={handleClose}>✕</button>
+        <button className="window-btn" onClick={handleMinimize} aria-label="Minimize">─</button>
+        <button className="window-btn" onClick={handleMaximize} aria-label="Maximize">□</button>
+        <button className="window-btn close" onClick={handleClose} aria-label="Close">✕</button>
       </div>
 
       <Preferences

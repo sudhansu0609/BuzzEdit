@@ -71,6 +71,7 @@ export default function UploadScreen({ onFile, onPick, onOpenProject }: Props) {
           <input
             ref={fileInputRef}
             type="file"
+            aria-label="Choose video file"
             accept="video/*"
             onChange={handleChange}
             style={{ display: 'none' }}

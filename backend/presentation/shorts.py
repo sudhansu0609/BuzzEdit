@@ -108,6 +108,35 @@ def vertical_variant(timeline: Timeline, program: Program,
     return vertical
 
 
+def plan_portrait(timeline: Timeline) -> Timeline:
+    """The cut timeline on the 9:16 canvas BEFORE anything is placed on it.
+
+    A Short recorded on the landscape camera used to be dressed landscape and
+    reframed at the end, so every picture and clip was generated 16:9 and then
+    cropped to a third of its width on the tall canvas (2026-10-21: "not 9:16,
+    far, elements lost"). Planning on the portrait canvas from the start makes
+    the assets portrait, the placement portrait and the main render the Short.
+    The face is followed once `follow_faces` has the anchors."""
+    return vertical_variant(timeline, None, anchors=None)
+
+
+def follow_faces(timeline: Timeline, anchors: Dict[str, Tuple[float, float]]) -> int:
+    """Centre each V1 clip's crop on its face (a portrait timeline only).
+    Returns how many clips moved."""
+    if not is_portrait(timeline) or not anchors:
+        return 0
+    moved = 0
+    for item in timeline.items:
+        if item.track != "V1" or item.kind != "media" or item.id not in anchors:
+            continue
+        pos = face_pos_x(anchors.get(item.id))
+        base = item.transform or Transform()
+        item.transform = base.model_copy(update={
+            "pos_x": pos, "pos_x_end": pos if base.is_animated() else None})
+        moved += 1
+    return moved
+
+
 # --- slicing ----------------------------------------------------------------------------------
 
 def slice_timeline(timeline: Timeline, start_s: float, end_s: float) -> Timeline:
@@ -222,7 +251,9 @@ async def render_shorts(timeline: Timeline, program: Program, topics: Sequence[T
     vertical = vertical_variant(timeline, program, anchors)
     offset_s = frame_to_time(timeline.cold_open_frames, timeline.fps_num, timeline.fps_den)
 
-    if settings.shorts_full:
+    if settings.shorts_full and not is_portrait(timeline):
+        # A programme planned on the 9:16 canvas (plan_portrait) is already the
+        # vertical file: its main render is the Short, so nothing to add here.
         path = str(output_stem) + "_vertical.mp4"
         await render_timeline_async(vertical, path, progress_callback=progress,
                                     output_resolution=f"{SHORT_W}x{SHORT_H}")

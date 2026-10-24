@@ -87,7 +87,7 @@ export function VoiceSettings({ choice, onChange, voices, presets, defs, disable
     <div className="voice-settings">
       <label className="voice-field">
         <span className="voice-label">Voice</span>
-        <select className="audio-select" disabled={disabled} value={c.voice}
+        <select className="audio-select" disabled={disabled} value={c.voice} aria-label="Voice"
           onChange={(e) => change({ ...c, voice: e.target.value }, true)}>
           <option value="">{c.preset ? `(the preset's: ${preset?.voice || 'none'})` : '(choose a voice)'}</option>
           {voices.map((v) => (
@@ -107,20 +107,20 @@ export function VoiceSettings({ choice, onChange, voices, presets, defs, disable
           onCustom={() => change({ ...c, preset: null, fx: [], voice: voice }, true)} />
       </div>
       <label className="voice-check" title="seed-vc's f0 condition: keep your own intonation, shifted into the voice">
-        <input type="checkbox" disabled={disabled} checked={!!c.params.match_pitch}
+        <input type="checkbox" disabled={disabled} checked={!!c.params.match_pitch} aria-label="Match my pitch contour"
           onChange={(e) => setParam('match_pitch', e.target.checked)} />
         Match my pitch contour
       </label>
       <label className="voice-field" title="Semitones the converted voice is moved (the engine's pitch shift)">
         <span className="voice-label">Pitch shift</span>
-        <input className="voice-slider" type="range" disabled={disabled}
+        <input className="voice-slider" type="range" disabled={disabled} aria-label="Pitch shift"
           min={PITCH_RANGE[0]} max={PITCH_RANGE[1]} step={1} value={pitch}
           onChange={(e) => setParam('pitch_shift', Number(e.target.value))} />
         <span className="voice-value">{signed(pitch)} st</span>
       </label>
       <label className="voice-field" title="Diffusion steps: more is finer and slower (SkinWalker: 25, creatures 30)">
         <span className="voice-label">Quality steps</span>
-        <input className="voice-slider" type="range" disabled={disabled}
+        <input className="voice-slider" type="range" disabled={disabled} aria-label="Quality steps"
           min={STEPS_RANGE[0]} max={STEPS_RANGE[1]} step={1} value={steps}
           onChange={(e) => setParam('steps', Number(e.target.value))} />
         <span className="voice-value">{steps}</span>

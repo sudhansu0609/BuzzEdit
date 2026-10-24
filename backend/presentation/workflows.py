@@ -29,7 +29,7 @@ logger = logging.getLogger("presentation.workflows")
 
 MANIFEST_FILE = "manifest.json"
 
-ROLES = ("broll_image", "broll_video", "thumbnail", "graphic", "audio", "music")
+ROLES = ("broll_image", "broll_video", "thumbnail", "graphic", "audio", "music", "music15")
 
 # Which settings key names the workflow for each role.
 SETTINGS_KEY = {
@@ -41,9 +41,11 @@ SETTINGS_KEY = {
     # presentation.sound's "generated" SFX/music sourcing. No bundled default:
     # there is no audio workflow shipped with the app, same as broll_video.
     "audio": "workflow_audio",
-    # Text-to-music (ACE-Step): background beds, presentation.music_gen.
+    # Text-to-music (ACE-Step 1.0): background beds, presentation.music_gen.
     # Kept apart from "audio" so SFX stay on Stable Audio Open.
     "music": "workflow_music",
+    # Text-to-music (ACE-Step 1.5): real bpm/key conditioning, presentation.music_gen.
+    "music15": "workflow_music15",
 }
 
 # Used only when neither settings nor manifest say otherwise. `broll_video` and
@@ -57,15 +59,34 @@ DEFAULT_FILE = {
 
 # The clip-generation toggle (app setting `clip_generation_mode`), consulted for
 # `broll_video` when `workflow_broll_video` names no file. Both run at Wan's
-# native 16 fps. "classic" is the 832x480 graph (fitted to full HD by ffmpeg);
-# "hq" is the 2026-10 HQ graph without its RIFE stage -- hi-res first frame,
-# 1024x576, RealESRGAN to 1920x1080 -- with the classic graph as its fallback.
+# native 16 fps. "classic" is the Q4 832x480 graph (fitted to full HD by
+# ffmpeg). "hq" (2026-10-21) is the Q5_K_M experts with the 1022 lightx2v LoRAs
+# at 832x480 through SageAttention (`PathchSageAttentionKJ`, comfyui-kjnodes),
+# delivered at 1920x1080 by the graph's own Lanczos scale: the earlier HQ graph
+# (`zimage_wan22_i2v_hq16.json`, 1024x576 + RealESRGAN on all 81 frames) took
+# 7.4 min a clip -- 300 s of sampling with half the model streamed from RAM and
+# 80 s of per-frame ESRGAN -- which put a 22-minute video past 8 hours. The
+# creator's budget is 3.5 hours for the whole video, so the per-clip ESRGAN is
+# gone (full HD comes from the final canvas; a clip is scaled once, at the end)
+# and the size is the one that fits. Its fallback is the same graph without the
+# SageAttention node, for a ComfyUI where the package is missing.
 CLIP_GENERATION_SETTING = "clip_generation_mode"
 DEFAULT_CLIP_GENERATION_MODE = "classic"
 CLIP_GENERATION_MODES: Dict[str, Dict[str, Any]] = {
     "classic": {"file": "zimage_wan22_i2v.json", "size": [832, 480], "fps": 16, "fallback": None},
-    "hq": {"file": "zimage_wan22_i2v_hq16.json", "size": [1024, 576], "fps": 16,
-           "fallback": "zimage_wan22_i2v.json"},
+    "hq": {"file": "zimage_wan22_i2v_fast16.json", "size": [832, 480], "fps": 16,
+           "fallback": "zimage_wan22_i2v_lite16.json"},
+    # 2026-10-23 -- not a `clip_generation_mode` a production ever selects (the
+    # setting's own validation only ever defaults to "classic" unless someone
+    # opts in by hand): the vibe reel's `quality="reel_hq"` resolves this entry
+    # itself (`presentation.vibe_reel`, via `resolve_override`) for hyper-
+    # realistic clips. Native portrait (Z-Image ~720x1280 -> 1.5x hires decode
+    # ~1080x1920, Wan latent 576x1024), Q5_K_M experts + the 1022 lightx2v
+    # LoRAs, FlashVSR, RIFE x2 to 32 fps -- `zimage_wan22_i2v_reel_portrait.json`.
+    # Its fallback is the plain HQ16 graph (RealESRGAN, no SageAttention/FlashVSR
+    # dependency) for a ComfyUI missing the FlashVSR node.
+    "reel_hq": {"file": "zimage_wan22_i2v_reel_portrait.json", "size": [576, 1024], "fps": 16,
+                "fallback": "zimage_wan22_i2v_hq16.json"},
 }
 
 # Node classes that carry a prompt.
@@ -121,7 +142,8 @@ class ResolvedWorkflow:
               length: Optional[int] = None, fps: Optional[int] = None,
               prefix: str = "buzzedit", steps: Optional[int] = None,
               cfg: Optional[float] = None, model: Optional[str] = None,
-              out_width: Optional[int] = None, out_height: Optional[int] = None) -> Dict[str, Any]:
+              out_width: Optional[int] = None, out_height: Optional[int] = None,
+              extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """A copy of the graph with this generation's values written into it.
 
         `steps`, `cfg` and `model` are optional overrides from the app settings:
@@ -132,6 +154,11 @@ class ResolvedWorkflow:
         in); a graph that interpolates frames saves at fps x its multiplier.
         `out_width`/`out_height` are the delivered size when the graph upscales
         after generating (`width`/`height` stay the generation size).
+
+        `extra` carries values with no fixed parameter here (ACE-Step 1.5's
+        `bpm`/`keyscale`/`timesignature`) -- bound by name exactly like the
+        others, and just as safely skipped when the role's bindings don't
+        name them.
         """
         values = {
             "positive": positive,
@@ -153,6 +180,8 @@ class ResolvedWorkflow:
             values["model"] = model
         if out_width and out_height:
             values["out_width"], values["out_height"] = out_width, out_height
+        if extra:
+            values.update(extra)
         return apply_bindings(self.graph, self.bindings, values)
 
 
@@ -401,6 +430,28 @@ def resolve(role: str) -> Optional[ResolvedWorkflow]:
         return fallback
     resolved.fallback = fallback
     return resolved
+
+
+def resolve_override(role: str, file_names: List[str]) -> Optional[ResolvedWorkflow]:
+    """Like `resolve()`, but for an explicit file list a caller gives instead
+    of settings/manifest -- the vibe reel's `quality="reel_hq"` (never a
+    production, which keeps its own `resolve(role)`). `file_names` is tried in
+    order (each one's own `.fallback`), ending at today's normal
+    `resolve(role)` result -- the same graph a production would use -- so a
+    missing node anywhere in the chain still finishes the pass rather than
+    losing the shot.
+    """
+    if role not in ROLES or not file_names:
+        return None
+    manifest = load_manifest().get("roles", {}).get(role, {})
+    chain = [w for w in (_bind(role, name, manifest) for name in file_names) if w is not None]
+    if not chain:
+        return resolve(role)
+    tail = resolve(role)
+    for i in range(len(chain) - 1):
+        chain[i].fallback = chain[i + 1]
+    chain[-1].fallback = tail if tail is not None and tail.file != chain[-1].file else None
+    return chain[0]
 
 
 def _bind(role: str, file_name: str, manifest: Dict[str, Any]) -> Optional[ResolvedWorkflow]:

@@ -181,6 +181,68 @@
           "ckpt_name"
         ]
       }
+    },
+    "music15": {
+      "file": "ace_step15_music.json",
+      "fallback_file": "ace_step_music.json",
+      "bindings": {
+        "positive": [
+          "5",
+          "inputs",
+          "tags"
+        ],
+        "seed": [
+          [
+            "5",
+            "inputs",
+            "seed"
+          ],
+          [
+            "8",
+            "inputs",
+            "seed"
+          ]
+        ],
+        "length": [
+          [
+            "7",
+            "inputs",
+            "seconds"
+          ],
+          [
+            "5",
+            "inputs",
+            "duration"
+          ]
+        ],
+        "prefix": [
+          "10",
+          "inputs",
+          "filename_prefix"
+        ],
+        "bpm": [
+          "5",
+          "inputs",
+          "bpm"
+        ],
+        "keyscale": [
+          "5",
+          "inputs",
+          "keyscale"
+        ],
+        "timesignature": [
+          "5",
+          "inputs",
+          "timesignature"
+        ],
+        "steps": [],
+        "cfg": [],
+        "model": []
+      }
+    },
+    "broll_image": {
+      "file": "zimage1_fast.json",
+      "fallback_file": "zimage1_esrgan.json"
     }
   }
 }

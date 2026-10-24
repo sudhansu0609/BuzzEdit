@@ -786,12 +786,15 @@ def plan_sound(timeline: Timeline, program: Program, settings: PresentationSetti
 
     if settings.music:
         cue_sections = music_cue_sections(settings, music_cues, duration)
-        if settings.music_tracks:
-            # The creator's own picks, at their own levels, replace the
-            # automatic choice; picks that cannot be used leave silence (and
-            # a note) rather than a track nobody chose.
-            chosen = chosen_tracks(settings)
-            plan.music = _plan_chosen_music(settings, duration, chosen) if chosen else []
+        # The creator's own picks, at their own levels, replace the automatic
+        # choice. When none of them exists any more (674aefab, 2026-10-21: its
+        # one upload was gone from the library) the automatic music plays
+        # instead -- a horror episode with no music bed is nobody's choice.
+        chosen = chosen_tracks(settings) if settings.music_tracks else []
+        if settings.music_tracks and not chosen:
+            plan.notes.append("chosen_music_missing")
+        if chosen:
+            plan.music = _plan_chosen_music(settings, duration, chosen)
         elif cue_sections:
             plan.music = _plan_cue_music(genre, settings, rng, duration, cue_sections)
         else:

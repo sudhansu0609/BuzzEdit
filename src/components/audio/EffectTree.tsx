@@ -44,7 +44,7 @@ export default function EffectTree({
 
   return (
     <div className="audio-tree">
-      <input className="fx-search" placeholder="Search effects" value={query}
+      <input className="fx-search" placeholder="Search effects" aria-label="Search effects" value={query}
         onChange={(e) => setQuery(e.target.value)} />
       {(notes || []).filter(Boolean).map((note) => (
         <div key={note as string} className="audio-note">{note}</div>

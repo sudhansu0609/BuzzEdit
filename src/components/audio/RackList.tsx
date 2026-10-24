@@ -92,6 +92,7 @@ export default function RackList({
               <span className="audio-grip" title="Drag to reorder"><GripVertical size={13} /></span>
               <button className={`audio-power${fx.enabled ? ' on' : ''}`}
                 title={fx.enabled ? 'On: click to bypass' : 'Bypassed: click to switch on'}
+                aria-label={fx.enabled ? 'On: click to bypass' : 'Bypassed: click to switch on'}
                 onClick={() => onToggle(fx.id)}>
                 <Power size={12} />
               </button>
@@ -101,13 +102,14 @@ export default function RackList({
                 <span className="audio-rack-label">{def?.name || fx.effect}</span>
                 {fx.preset && <span className="audio-rack-preset">{fx.preset}</span>}
               </button>
-              <button className="audio-icon" title="Move up" disabled={index === 0}
+              <button className="audio-icon" title="Move up" aria-label="Move up" disabled={index === 0}
                 onClick={() => onMove(index, index - 1)}>↑</button>
-              <button className="audio-icon" title="Move down" disabled={index === rack.length - 1}
+              <button className="audio-icon" title="Move down" aria-label="Move down" disabled={index === rack.length - 1}
                 onClick={() => onMove(index, index + 1)}>↓</button>
               <button className={`audio-icon${windowed ? ' active' : ''}`} disabled={!canWindow}
-                title={windowTitle(def, fx, selection)} onClick={() => onWindow(fx.id)}>⇥</button>
-              <button className="audio-icon danger" title="Remove from the rack"
+                title={windowTitle(def, fx, selection)} aria-label={windowTitle(def, fx, selection)}
+                onClick={() => onWindow(fx.id)}>⇥</button>
+              <button className="audio-icon danger" title="Remove from the rack" aria-label="Remove from the rack"
                 onClick={() => onRemove(fx.id)}>✕</button>
             </div>
             {windowed && (

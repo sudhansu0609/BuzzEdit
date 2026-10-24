@@ -28,6 +28,7 @@ export default function LayoutMenu() {
       <button
         className={`btn btn-sm ${locked ? 'btn-primary' : ''}`}
         title={locked ? 'Layout is locked — click to unlock' : 'Lock the layout so panels cannot move'}
+        aria-label={locked ? 'Layout is locked — click to unlock' : 'Lock the layout so panels cannot move'}
         onClick={() => setLocked(!locked)}
       >
         {locked ? '🔒' : '🔓'}
@@ -54,6 +55,7 @@ export default function LayoutMenu() {
             <label key={id} className="layout-item checkbox">
               <input
                 type="checkbox"
+                aria-label={PANEL_TITLES[id]}
                 checked={panels[id].visible}
                 onChange={(e) => toggleVisible(id, e.target.checked)}
               />
@@ -66,7 +68,7 @@ export default function LayoutMenu() {
 
           <div className="layout-section-title">Layout</div>
           <label className="layout-item checkbox">
-            <input type="checkbox" checked={locked} onChange={(e) => setLocked(e.target.checked)} />
+            <input type="checkbox" aria-label="Lock layout" checked={locked} onChange={(e) => setLocked(e.target.checked)} />
             Lock layout
           </label>
           <button className="layout-item" onClick={() => { resetLayout(); setOpen(false); }}>

@@ -9,9 +9,10 @@ this one; never construct another.
 """
 
 from comfyui_bridge.client import ComfyUIClient
+from comfyui_bridge.errors import ComfyUIUnavailableError
 from comfyui_bridge.queue_manager import ComfyUIQueueManager
 
 client = ComfyUIClient()
 queue_manager = ComfyUIQueueManager(client)
 
-__all__ = ["ComfyUIClient", "ComfyUIQueueManager", "client", "queue_manager"]
+__all__ = ["ComfyUIClient", "ComfyUIQueueManager", "ComfyUIUnavailableError", "client", "queue_manager"]

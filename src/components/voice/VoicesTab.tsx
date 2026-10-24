@@ -244,7 +244,7 @@ export default function VoicesTab({ voices, loaded, missing, loadNote, presets, 
             <button type="button" className="audio-btn" onClick={() => fileInput.current?.click()}>Choose a file…</button>
             <span className="audio-hint">Any audio (or video with sound) ffmpeg reads; 3-60 s.</span>
             <input ref={fileInput} type="file" hidden accept="audio/*,video/*,.wav,.mp3,.m4a,.flac,.ogg,.opus,.webm,.aac"
-              onChange={pickFile} />
+              aria-label="Choose a file" onChange={pickFile} />
           </div>
         )}
         {clip && (
@@ -255,7 +255,7 @@ export default function VoicesTab({ voices, loaded, missing, loadNote, presets, 
             </div>
             <label className="voice-field">
               <span className="voice-label">Name</span>
-              <input className="audio-text" value={name} maxLength={63} placeholder="e.g. demon"
+              <input className="audio-text" value={name} maxLength={63} placeholder="e.g. demon" aria-label="Name"
                 onChange={(e) => setName(e.target.value)} />
             </label>
             {presetVoices.some((p) => !p.present) && (
@@ -265,14 +265,14 @@ export default function VoicesTab({ voices, loaded, missing, loadNote, presets, 
             )}
             <label className="voice-field">
               <span className="voice-label">Kind</span>
-              <select className="audio-select" value={kind} onChange={(e) => setKind(e.target.value)}>
+              <select className="audio-select" value={kind} aria-label="Kind" onChange={(e) => setKind(e.target.value)}>
                 {KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
               </select>
             </label>
             <label className="voice-field">
               <span className="voice-label">Consent note</span>
               <input className="audio-text" value={consent} placeholder="my own voice / consent from <name>, <date>"
-                onChange={(e) => setConsent(e.target.value)} />
+                aria-label="Consent note" onChange={(e) => setConsent(e.target.value)} />
             </label>
             {name.trim() && nameProblem && <div className="audio-hint">{nameProblem}</div>}
             {nameTaken && <div className="audio-hint">A voice named "{name.trim()}" exists: rename or delete it first.</div>}
@@ -303,6 +303,7 @@ export default function VoicesTab({ voices, loaded, missing, loadNote, presets, 
                   <div className="voice-row">
                     {renaming === v.name ? (
                       <input className="audio-text" autoFocus defaultValue={v.name} maxLength={63}
+                        aria-label={`Rename ${v.name}`}
                         onBlur={(e) => void rename(v, e.target.value)}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter') (e.target as HTMLInputElement).blur();

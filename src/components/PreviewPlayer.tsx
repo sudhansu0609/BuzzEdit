@@ -599,7 +599,7 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
         </div>
 
         <div className="controls-row">
-          <button className="btn btn-icon" onClick={togglePlay}>
+          <button className="btn btn-icon" onClick={togglePlay} aria-label={isPlaying ? 'Pause' : 'Play'}>
             {isPlaying ? '⏸' : '▶'}
           </button>
 
@@ -608,11 +608,11 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
           </span>
 
           <div className="volume-control">
-            <button className="btn btn-icon" onClick={toggleMute}>
+            <button className="btn btn-icon" onClick={toggleMute} aria-label={isMuted ? 'Unmute' : 'Mute'}>
               {isMuted ? '🔇' : volume < 0.5 ? '🔉' : '🔊'}
             </button>
             <input
-              type="range" min="0" max="1" step="0.01"
+              type="range" min="0" max="1" step="0.01" aria-label="Volume"
               value={volume} onChange={handleVolumeChange} className="volume-slider"
             />
           </div>

@@ -25,7 +25,7 @@ WHISPER_DEVICE = "cuda"
 APP_NAME = "buzzedit"
 APP_VERSION = "0.2.0"
 BIND_HOST = os.environ.get("BUZZEDIT_HOST", "127.0.0.1")
-PREFERRED_PORT = int(os.environ.get("BUZZEDIT_PORT") or 8099)
+PREFERRED_PORT = int(os.environ.get("BUZZEDIT_PORT") or 8100)
 COMFYUI_PREFERRED_PORT = int(os.environ.get("COMFYUI_PORT") or 8188)
 PORT_SPAN = 20
 

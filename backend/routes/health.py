@@ -12,6 +12,7 @@ when the DLL search path has both a cu118 and a cu12 toolchain on it.
 Availability is therefore checked by *finding* the module, never importing it.
 """
 
+import asyncio
 import importlib.util
 import os
 
@@ -20,6 +21,8 @@ from fastapi import APIRouter
 
 from config import APP_NAME, APP_VERSION, COMFYUI_URL, bound_port
 from models import HealthResponse
+from runtime import code_reload
+from runtime.comfy_status import comfy_state_and_detail
 from utils.ffmpeg_utils import run_ffprobe
 
 router = APIRouter()
@@ -54,23 +57,63 @@ async def health_check():
         version=APP_VERSION,
     )
 
-    try:
-        run_ffprobe("NUL")
-    except FileNotFoundError:
-        response.ffmpeg_available = False
-    except Exception:
-        response.ffmpeg_available = True
+    # The ffprobe spawn and the ComfyUI request are blocking calls; run on the
+    # event loop they held every other request (the Studio's transcription
+    # status polls included) for as long as they took. Off the loop, and the
+    # ffmpeg answer is remembered: the binary does not come and go.
+    global _ffmpeg_available
+    if _ffmpeg_available is None:
+        _ffmpeg_available = await asyncio.to_thread(_probe_ffmpeg)
+    response.ffmpeg_available = _ffmpeg_available
 
     # faster-whisper is the engine this app transcribes with; the old probe
     # looked for `whisper` (openai-whisper), which is not a dependency, so a
     # working install always reported transcription unavailable.
     response.whisper_available = _module_installed("faster_whisper")
 
-    try:
-        resp = requests.get(f"{COMFYUI_URL}/system_stats",
-                            timeout=_COMFYUI_TIMEOUT_SECONDS)
-        response.comfyui_connected = resp.status_code == 200
-    except Exception:
-        response.comfyui_connected = False
+    response.comfyui_connected = await asyncio.to_thread(_probe_comfyui)
+
+    # The launcher's own view (starting/running/repairing/down/repair_failed).
+    # A file that still says "running" when our own probe just failed is stale
+    # -- the probe above is the truth, so that disagreement is reported as down.
+    comfy_state, comfy_detail = comfy_state_and_detail()
+    if comfy_state == "running" and not response.comfyui_connected:
+        comfy_state = "down"
+    response.comfyui_state = comfy_state
+    response.comfyui_detail = comfy_detail
+    response.reload_pending = code_reload.reload_pending()
 
     return response
+
+
+@router.get("/reload/busy")
+async def reload_busy():
+    """{busy, reason}: why this process must not be restarted/quit right now
+    (STUDIO_DIRECTOR_PLAN.md enhancement 4) -- `code_reload.busy_reason`'s own
+    check (reels, narration, the scheduler, ComfyUI, a master-pause hold),
+    the one the Electron watchdog polls instead of quitting a working
+    BuzzEdit the moment its Studio parent disappears."""
+    route_tasks = code_reload._route_tasks()
+    reason = await asyncio.to_thread(code_reload.busy_reason, route_tasks)
+    return {"busy": bool(reason), "reason": reason}
+
+
+_ffmpeg_available = None
+
+
+def _probe_ffmpeg() -> bool:
+    try:
+        run_ffprobe("NUL")
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def _probe_comfyui() -> bool:
+    try:
+        resp = requests.get(f"{COMFYUI_URL}/system_stats", timeout=_COMFYUI_TIMEOUT_SECONDS)
+        return resp.status_code == 200
+    except Exception:
+        return False

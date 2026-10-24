@@ -455,28 +455,48 @@ def style_for(genre: Optional[str]) -> GenreStyle:
     return GENRE_STYLES[normalise(genre)]
 
 
-def genre_block(genre: Optional[str]) -> str:
-    """The paragraph appended to prompt-writing system prompts."""
+def genre_block(genre: Optional[str], art_style: Optional[str] = None) -> str:
+    """The paragraph appended to prompt-writing system prompts. With a
+    drawn `art_style` the genre keeps only its mood (its look words are
+    photographic) and the medium's own block follows."""
+    from . import art_style as art_mod
     name = normalise(genre)
-    if name == "general":
-        return ""
-    style = GENRE_STYLES[name]
-    return (
-        f"\n\nVIDEO GENRE: this is a {name.replace('_', ' ')} video. Every "
-        f"scene you describe must belong in one — carry this mood in every "
-        f"prompt: {style.look}."
-    )
+    drawn = art_style is not None and not art_mod.is_real(art_style)
+    out = ""
+    if name != "general":
+        style = GENRE_STYLES[name]
+        mood = art_mod.genre_mood(name) if drawn else style.look
+        out = (
+            f"\n\nVIDEO GENRE: this is a {name.replace('_', ' ')} video. Every "
+            f"scene you describe must belong in one — carry this mood in every "
+            f"prompt: {mood}."
+        ) if mood else ""
+    if drawn:
+        out += art_mod.block(art_style)
+    return out
 
 
 def apply_look(prompt: Optional[str], genre: Optional[str],
-              secondary: Optional[str] = None) -> Optional[str]:
+              secondary: Optional[str] = None,
+              art_style: Optional[str] = None) -> Optional[str]:
     """The genre's look stamped onto a positive prompt, exactly once.
 
     `secondary`, when given, blends its own style words in behind the
     primary's (see `blended_style_tags`) — the primary genre still leads.
+    A drawn `art_style` replaces the genre's photographic look with the
+    genre's mood plus the medium's own look (presentation/art_style.py).
     """
     if not prompt:
         return prompt
+    from . import art_style as art_mod
+    if art_style is not None and not art_mod.is_real(art_style):
+        parts = [p for p in (art_mod.genre_mood(normalise(genre)), art_mod.look_for(art_style))
+                 if p and p.lower() not in prompt.lower()]
+        out = f"{prompt}, {', '.join(parts)}" if parts else prompt
+        prefix = art_mod.prefix_for(art_style)
+        if prefix and not out.lower().startswith(prefix[:40].lower()):
+            out = f"{prefix} {out[:1].lower() + out[1:]}"
+        return out
     look = (", ".join(blended_style_tags(genre, secondary)) if secondary
            else style_for(genre).look)
     if not look or look in prompt:
@@ -485,7 +505,14 @@ def apply_look(prompt: Optional[str], genre: Optional[str],
 
 
 def apply_negative(negative: str, genre: Optional[str],
-                   secondary: Optional[str] = None) -> str:
+                   secondary: Optional[str] = None,
+                   art_style: Optional[str] = None) -> str:
+    from . import art_style as art_mod
+    if art_style is not None and not art_mod.is_real(art_style):
+        drawn = art_mod.negative_for(art_style)
+        if drawn and drawn not in (negative or ""):
+            negative = f"{negative}, {drawn}" if negative else drawn
+        return negative
     extra = style_for(genre).negative
     if secondary and normalise(secondary) not in ("general", normalise(genre)):
         sec_negative = style_for(secondary).negative

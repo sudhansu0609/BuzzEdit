@@ -143,8 +143,10 @@ def engine_files(tmp_path):
     sf.write(str(voices / "demon.wav"), _noise(1.5, seed=4) * 0.2, SR)
     source = tmp_path / "line.wav"
     sf.write(str(source), _noise(2.0, seed=5) * 0.2, SR)
+    checkpoint = tmp_path / "ft_model.pth"
+    checkpoint.write_bytes(b"not a real checkpoint, just a path that exists")
     return SimpleNamespace(root=tmp_path, seedvc=seedvc, voices=voices, source=source,
-                           ref=voices / "demon.wav")
+                           ref=voices / "demon.wav", checkpoint=checkpoint)
 
 
 def test_cli_convert_dry_run_speaks_the_protocol(engine_files):
@@ -161,7 +163,53 @@ def test_cli_convert_dry_run_speaks_the_protocol(engine_files):
     assert result["params"] == {"diffusion_steps": 30, "length_adjust": 1.0, "inference_cfg_rate": 0.7,
                                 "f0_condition": True, "auto_f0_adjust": True, "pitch_shift": -5}
     assert result["source_s"] == pytest.approx(2.0, abs=0.001)
+    assert result["finetune_checkpoint"] is None                      # no override, no sidecar: stock model
     assert not out.exists()                                           # a dry run writes nothing
+
+
+def test_cli_convert_uses_an_explicit_finetune_checkpoint(engine_files):
+    out = engine_files.root / "out.wav"
+    params = {"checkpoint": str(engine_files.checkpoint)}
+    code, events, result = _cli(engine_files.root, "convert", "--dry-run", "--source", engine_files.source,
+                                "--ref", engine_files.ref, "--out", out, "--params", json.dumps(params),
+                                "--seedvc-dir", engine_files.seedvc)
+    assert code == 0
+    assert result["finetune_checkpoint"] == str(engine_files.checkpoint.resolve())
+    assert result["params"]["diffusion_steps"] == 25                 # unrelated defaults untouched
+
+
+def test_cli_convert_picks_up_a_voice_sidecar_without_params(engine_files):
+    sidecar = engine_files.ref.with_suffix(".seedvc.json")
+    sidecar.write_text(json.dumps({"checkpoint": str(engine_files.checkpoint)}), encoding="utf-8")
+    out = engine_files.root / "out.wav"
+    code, events, result = _cli(engine_files.root, "convert", "--dry-run", "--source", engine_files.source,
+                                "--ref", engine_files.ref, "--out", out, "--seedvc-dir", engine_files.seedvc)
+    assert code == 0
+    assert result["finetune_checkpoint"] == str(engine_files.checkpoint.resolve())
+
+
+def test_cli_convert_explicit_params_override_the_sidecar(engine_files):
+    sidecar = engine_files.ref.with_suffix(".seedvc.json")
+    sidecar.write_text(json.dumps({"checkpoint": str(engine_files.checkpoint)}), encoding="utf-8")
+    other = engine_files.root / "other.pth"
+    other.write_bytes(b"a second, explicitly chosen checkpoint")
+    out = engine_files.root / "out.wav"
+    code, events, result = _cli(engine_files.root, "convert", "--dry-run", "--source", engine_files.source,
+                                "--ref", engine_files.ref, "--out", out,
+                                "--params", json.dumps({"checkpoint": str(other)}),
+                                "--seedvc-dir", engine_files.seedvc)
+    assert code == 0
+    assert result["finetune_checkpoint"] == str(other.resolve())
+
+
+def test_cli_convert_missing_checkpoint_errors(engine_files):
+    out = engine_files.root / "out.wav"
+    params = {"checkpoint": str(engine_files.root / "nowhere.pth")}
+    code, events, result = _cli(engine_files.root, "convert", "--dry-run", "--source", engine_files.source,
+                                "--ref", engine_files.ref, "--out", out, "--params", json.dumps(params),
+                                "--seedvc-dir", engine_files.seedvc)
+    assert code == 1
+    assert "checkpoint" in result["error"] and "does not exist" in result["error"]
 
 
 @pytest.mark.parametrize("args, message", [

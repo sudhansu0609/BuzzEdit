@@ -263,9 +263,9 @@ def test_resolve_follows_the_clip_generation_mode(isolated_app_settings):
 
     isolated_app_settings._cache["clip_generation_mode"] = "hq"
     hq = workflows.resolve("broll_video")
-    assert hq.file == "zimage_wan22_i2v_hq16.json"
-    assert hq.fallback is not None and hq.fallback.file == "zimage_wan22_i2v.json"
-    built = hq.build(positive="mist toward a door", width=1024, height=576, seed=11, length=81,
+    assert hq.file == "zimage_wan22_i2v_fast16.json"
+    assert hq.fallback is not None and hq.fallback.file == "zimage_wan22_i2v_lite16.json"
+    built = hq.build(positive="mist toward a door", width=832, height=480, seed=11, length=81,
                      fps=16, prefix="beat_b02", out_width=1920, out_height=1080)
     assert built["v_create"]["inputs"]["fps"] == 16
     assert (built["u_scale"]["inputs"]["width"], built["u_scale"]["inputs"]["height"]) == (1920, 1080)
@@ -284,7 +284,7 @@ def test_resolve_follows_the_clip_generation_mode(isolated_app_settings):
 def test_the_selection_shown_follows_the_clip_generation_mode(isolated_app_settings):
     assert workflows.current_selection()["broll_video"] == "zimage_wan22_i2v.json"
     isolated_app_settings._cache["clip_generation_mode"] = "hq"
-    assert workflows.current_selection()["broll_video"] == "zimage_wan22_i2v_hq16.json"
+    assert workflows.current_selection()["broll_video"] == "zimage_wan22_i2v_fast16.json"
     isolated_app_settings._cache["workflow_broll_video"] = "zimage_wan22_i2v_hq.json"
     assert workflows.current_selection()["broll_video"] == "zimage_wan22_i2v_hq.json", \
         "a graph named in the settings still wins"
@@ -295,9 +295,11 @@ def test_video_generation_size_follows_the_mode(isolated_app_settings):
     w, h = assets._video_canvas_default((1920, 1080))
     assert w * h <= 832 * 480
     isolated_app_settings._cache["clip_generation_mode"] = "hq"
-    assert assets.max_video_gen_pixels() == 1024 * 576
+    # 2026-10-21: hq runs at the classic size too (the time budget); the mode
+    # table is the one source of the size.
+    assert assets.max_video_gen_pixels() == 832 * 480
     w, h = assets._video_canvas_default((1920, 1080))
-    assert 832 * 480 < w * h <= 1024 * 576 and abs(w / h - 16 / 9) < 0.05
+    assert w * h <= 832 * 480 and abs(w / h - 16 / 9) < 0.05
 
 
 @pytest.fixture
@@ -313,8 +315,8 @@ def test_the_clip_generation_route_reads_stores_and_validates_the_mode(client, i
     body = got.json()
     assert body["mode"] == "classic"
     assert body["modes"]["classic"]["file"] == "zimage_wan22_i2v.json"
-    assert body["modes"]["hq"]["file"] == "zimage_wan22_i2v_hq16.json"
-    assert body["modes"]["hq"]["size"] == [1024, 576]
+    assert body["modes"]["hq"]["file"] == "zimage_wan22_i2v_fast16.json"
+    assert body["modes"]["hq"]["size"] == [832, 480]
     assert body["modes"]["hq"]["fps"] == body["modes"]["classic"]["fps"] == 16
 
     put = client.put("/api/settings/clip_generation", json={"mode": "hq"})
@@ -345,3 +347,52 @@ def test_frozen_frames_inside_a_clip_are_reported(tmp_path):
     assert frozen[0]["seconds"] >= 1.5
     moving = verify.frozen_clip_frames(str(render), [{"start_s": 0.0, "end_s": 2.0, "beat_id": "b08"}])
     assert moving == []
+
+
+# --- E5: the 3.5-hour budget (2026-10-21) -------------------------------------------------------
+
+def test_the_fast_clip_graph_samples_through_sage_and_scales_once_at_the_end():
+    fast = workflows.load_graph("zimage_wan22_i2v_fast16.json")
+    lite = workflows.load_graph("zimage_wan22_i2v_lite16.json")
+    hq = workflows.load_graph("zimage_wan22_i2v_hq16.json")
+    for graph in (fast, lite):
+        # No per-frame RealESRGAN: 80 s of the 7.4-minute clip. Full HD comes
+        # from one Lanczos scale of the decoded frames.
+        assert "u_model" not in graph and "u_frames" not in graph
+        assert graph["u_scale"]["inputs"]["image"] == ["w_decode", 0]
+        assert graph["v_create"]["inputs"]["images"] == ["u_scale", 0]
+        assert graph["v_create"]["inputs"]["fps"] == 16.0
+        # The same experts, LoRAs and 2+2 steps as the HQ graph.
+        for node in ("w_unet_high", "w_unet_low", "w_lora_high", "w_lora_low", "w_sample_high", "w_sample_low"):
+            assert graph[node] == hq[node]
+        detail = workflows.describe(graph is fast and "zimage_wan22_i2v_fast16.json" or "zimage_wan22_i2v_lite16.json")
+        assert detail["valid"] and detail["roles_ok"]["broll_video"]
+    # SageAttention patches both experts in the fast graph; the lite fallback is the same graph without it.
+    for side in ("high", "low"):
+        assert fast[f"w_sage_{side}"]["class_type"] == "PathchSageAttentionKJ"
+        assert fast[f"w_sage_{side}"]["inputs"]["model"] == [f"w_lora_{side}", 0]
+        assert fast[f"w_shift_{side}"]["inputs"]["model"] == [f"w_sage_{side}", 0]
+        assert lite[f"w_shift_{side}"]["inputs"]["model"] == [f"w_lora_{side}", 0]
+    assert not any(n.get("class_type") == "PathchSageAttentionKJ" for n in lite.values())
+
+
+def test_the_still_graph_upscales_with_esrgan_and_falls_back_without_sage(isolated_app_settings):
+    fast = workflows.load_graph("zimage1_fast.json")
+    plain = workflows.load_graph("zimage1_esrgan.json")
+    base = workflows.load_graph("zimage1.json")
+    for graph in (fast, plain):
+        assert graph["u_model"]["inputs"]["model_name"] == "RealESRGAN_x2plus.pth"
+        assert graph["u_img"]["inputs"]["image"] == ["65", 0]
+        assert graph["9"]["inputs"]["images"] == ["u_img", 0]
+        assert graph["66"] == base["66"] and graph["69"]["inputs"]["steps"] == base["69"]["inputs"]["steps"]
+    assert fast["z_sage"]["inputs"]["model"] == ["72", 0] and fast["67"]["inputs"]["model"] == ["z_sage", 0]
+    assert plain["67"]["inputs"]["model"] == ["72", 0]
+    isolated_app_settings._cache["workflow_broll_image"] = "zimage1_fast.json"
+    resolved = workflows.resolve("broll_image")
+    assert resolved.file == "zimage1_fast.json" and resolved.output_kind == "image"
+    assert resolved.fallback is not None and resolved.fallback.file == "zimage1_esrgan.json"
+    built = resolved.build(positive="a lantern on a wet road", width=1024, height=576, seed=3, prefix="b01")
+    assert (built["66"]["inputs"]["width"], built["66"]["inputs"]["height"]) == (1024, 576)
+    assert built["70"]["inputs"]["text"] == "a lantern on a wet road"
+    # Stills are asked for at 1024x576 and come back x2 from the graph.
+    assert assets._image_gen_size((1920, 1080)) == (1024, 576)

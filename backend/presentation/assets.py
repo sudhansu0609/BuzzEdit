@@ -56,7 +56,12 @@ MAX_VIDEO_FRAMES = ((int(round((BROLL_SECONDS_CAP + 0.3) * DEFAULT_VIDEO_FPS)) -
 # Z-Image Turbo cost scales with pixels: 1920x1080 (2.1MP) spent ~25s of each
 # ~35s image sampling. ~1.4MP samples in about half that, and the 1.2x Lanczos
 # step up to 1080p at composite time is not visible on a 2-4s cutaway.
-MAX_IMAGE_GEN_PIXELS = 1600 * 896
+# Stills are generated at 1024x576 (Z-Image Turbo's native class; 8 steps take
+# ~8 s here against 18 s at 1600x896) and the still graph itself enlarges them
+# with RealESRGAN x2 to 2048x1152 in ~1.5 s, so a Ken Burns push on the 1080p
+# canvas still has real pixels (2026-10-21; the 224 stills of a 22-minute
+# video took 95 min at 1600x896).
+MAX_IMAGE_GEN_PIXELS = 1024 * 576
 
 
 def _video_length_for(seconds: float, fps: int) -> int:
@@ -151,7 +156,8 @@ def _canvas_default(canvas_size: Optional[Tuple[int, int]],
 # docs/GENERATION_UPGRADE_PLAN.md -- so that size is only asked for in the "hq"
 # clip-generation mode (workflows.clip_generation_mode).
 def max_video_gen_pixels() -> int:
-    return 1024 * 576 if workflows.clip_generation_mode() == "hq" else 832 * 480
+    size = workflows.CLIP_GENERATION_MODES[workflows.clip_generation_mode()]["size"]
+    return int(size[0]) * int(size[1])
 
 
 # Every delivered clip is full HD (the creator's rule): generated at the size
@@ -388,18 +394,129 @@ def _probe(path: Path) -> Tuple[int, int, float]:
             return 0, 0, 0.0
 
 
+# How often a pass found without ComfyUI checks again, and the budget it gets
+# before giving up -- see `_wait_for_comfyui`. 2026-10-20: an 8-day outage
+# rendered 263 planned beats with zero B-roll rather than waiting or failing;
+# ComfyUI now restarts and repairs itself, so waiting is usually enough.
+COMFY_OFFLINE_POLL_S = 15.0
+COMFY_OFFLINE_WAIT_MIN_DEFAULT = 60.0
+COMFY_OFFLINE_WAIT_MIN_EXTENDED = 120.0
+# Below this share of the wanted beats, a cache made by an earlier run is not
+# enough to call the result a presentable pass -- see both call sites below.
+COMFY_CACHE_COVERAGE_MIN = 0.90
+
+
+async def _wait_for_comfyui(queue_manager, report: Callable[[float, str], None],
+                            fraction: float) -> Tuple[bool, float, Dict[str, Any]]:
+    """Poll ComfyUI every `COMFY_OFFLINE_POLL_S` instead of giving up on it: it
+    restarts itself after a crash, and can now repair its own Python
+    environment too, which takes far longer than a restart.
+
+    The budget is `comfy_offline_wait_minutes` (default
+    `COMFY_OFFLINE_WAIT_MIN_DEFAULT`); while ComfyUI's own status file
+    (comfyui_bridge.status) says it is "repairing" or "starting", the budget
+    is extended to `COMFY_OFFLINE_WAIT_MIN_EXTENDED` total, since that is
+    genuinely how long a repair can take. `report` gets a status message
+    naming what ComfyUI itself says it is doing.
+
+    Returns `(back, waited_s, last_status)`.
+    """
+    from comfyui_bridge.status import read_status
+    base_s = max(0.0, float(_setting("comfy_offline_wait_minutes", COMFY_OFFLINE_WAIT_MIN_DEFAULT))) * 60.0
+    extended_s = max(base_s, COMFY_OFFLINE_WAIT_MIN_EXTENDED * 60.0)
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    status: Dict[str, Any] = {}
+    while True:
+        if await asyncio.to_thread(queue_manager.client.is_connected, 5.0):
+            return True, loop.time() - start, status
+        status = read_status() or {}
+        state = status.get("state")
+        cap_s = extended_s if state in ("repairing", "starting") else base_s
+        elapsed = loop.time() - start
+        if elapsed >= cap_s:
+            return False, elapsed, status
+        detail = str(status.get("detail") or "")
+        if state == "repairing":
+            message = "Waiting for ComfyUI (repairing its Python environment%s)..." % (
+                f": {detail}" if detail else "")
+        elif detail:
+            message = f"Waiting for ComfyUI ({detail})..."
+        else:
+            message = "Waiting for ComfyUI..."
+        report(fraction, message)
+        await asyncio.sleep(COMFY_OFFLINE_POLL_S)
+
+
+async def _lookup_cached_assets(beats: List[Beat],
+                                resolved: Dict[str, Optional[workflows.ResolvedWorkflow]],
+                                directory: Path, queue_manager, seed_base: int,
+                                canvas_size: Optional[Tuple[int, int]],
+                                face: Optional["_Face"]) -> Tuple[List[Asset], List[Dict[str, str]]]:
+    """Whichever of `beats` already has a picture on disk, keyed by its own
+    prompt hash -- what a ComfyUI that never came back can still deliver,
+    cache-only (never generates)."""
+    found_assets: List[Asset] = []
+    missed: List[Dict[str, str]] = []
+    for b in beats:
+        found = None
+        for candidate in ([b, b.model_copy(update={"kind": "broll_image"})]
+                          if b.kind == "broll_video" else [b]):
+            try:
+                found = await _generate_one(candidate, resolved, directory, queue_manager,
+                                            seed_base, canvas_size, cache_only=True,
+                                            face=face if b.shows_character else None)
+            except Exception as e:
+                logger.debug("Cache lookup for beat %s failed: %s", b.id, e)
+            if found:
+                found.beat_id = b.id
+                break
+        if found:
+            found_assets.append(found)
+        else:
+            missed.append({"beat_id": b.id, "reason": "ComfyUI offline"})
+    return found_assets, missed
+
+
 async def generate_assets(beats: List[Beat], project_dir: Path,
                           settings: PresentationSettings,
                           progress_cb: Optional[Callable[[float, str], None]] = None,
                           seed_base: int = 0,
                           canvas_size: Optional[Tuple[int, int]] = None,
                           stats: Optional[Dict[str, Any]] = None,
-                          character: Optional[Character] = None) -> Tuple[List[Asset], List[Dict[str, str]]]:
+                          character: Optional[Character] = None,
+                          character_cache_dir: Optional[Path] = None,
+                          workflow_files: Optional[Dict[str, List[str]]] = None,
+                          gen_size_override: Optional[Dict[str, Tuple[int, int]]] = None,
+                          start_image_override: Optional[str] = None
+                          ) -> Tuple[List[Asset], List[Dict[str, str]]]:
     """Generate what every cutaway beat needs. Returns (assets, failures).
+
+    `start_image_override`, when given, is the exact image-to-video start
+    frame for every `broll_video` beat in `beats` -- phase 1's own still
+    generation is skipped for it (`presentation.vibe_reel`'s continuous-shot
+    chaining, VR7: a later segment starts from the previous one's own last
+    frame instead of a fresh picture). None (the default) is today's
+    behaviour, unchanged for every other caller.
+
+    `workflow_files` and `gen_size_override`, when given, name an explicit
+    file (plus fallbacks, `workflows.resolve_override`) and generation size
+    for a role (`broll_image`/`broll_video`) for THIS call only -- the global
+    `clip_generation_mode`/settings resolution (and every other caller) is
+    untouched. The vibe reel's `quality="reel_hq"` is the one caller that
+    uses this (`presentation.vibe_reel`).
 
     `character`, the story's lead (ShotPlan.character): every beat tagged
     `shows_character` gets that one face swapped into its still, so it and the
     clip made from it show the same person. Other beats are never swapped.
+
+    `character_cache_dir`, when given, is where the one reference portrait is
+    looked up / cached instead of this call's own `project_dir` -- a caller
+    that generates one beat per call (its own cache directory each time, so
+    near-match reuse never matches two different shots to the same picture)
+    still makes and reuses a single reference across every call by pointing
+    them all at the same `character_cache_dir`. None (the default) keeps the
+    old behaviour: the reference lives alongside this call's own assets.
 
     `stats`, when given, is filled with how each phase went (the memory
     hand-over verdicts, clips made / kept as stills and why) for the report.
@@ -423,7 +540,9 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
 
     resolved: Dict[str, Optional[workflows.ResolvedWorkflow]] = {}
     for role in ("broll_image", "broll_video", "graphic"):
-        resolved[role] = workflows.resolve(role)
+        override_files = (workflow_files or {}).get(role)
+        resolved[role] = (workflows.resolve_override(role, override_files) if override_files
+                         else workflows.resolve(role))
 
     if resolved["broll_image"] is None:
         logger.warning("No image workflow is configured; skipping asset generation")
@@ -432,42 +551,47 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
         return await _fill_stock_fallback(wanted, project_dir, settings, failures, canvas_size)
 
     from comfyui_bridge import queue_manager
+    from comfyui_bridge.errors import ComfyUIUnavailableError
 
     face: Optional[_Face] = None
+    from . import art_style as art_mod
     if (character is not None and settings.character_consistency
+            and art_mod.uses_face_swap(settings.art_style)
             and any(b.shows_character for b in wanted)):
         face = _Face(key=_face_key(character, seed_base))
-
-    if not await asyncio.to_thread(queue_manager.client.is_connected):
-        # Pictures an earlier run already made are on disk: a retry after a
-        # crash must still use them rather than render with none at all.
-        directory = _cache_dir(project_dir)
-        cached: List[Asset] = []
-        failures = []
-        for b in wanted:
-            found = None
-            for candidate in ([b, b.model_copy(update={"kind": "broll_image"})]
-                              if b.kind == "broll_video" else [b]):
-                try:
-                    found = await _generate_one(candidate, resolved, directory, queue_manager,
-                                                seed_base, canvas_size, cache_only=True,
-                                                face=face if b.shows_character else None)
-                except Exception as e:
-                    logger.debug("Cache lookup for beat %s failed: %s", b.id, e)
-                if found:
-                    found.beat_id = b.id
-                    break
-            if found:
-                cached.append(found)
-            else:
-                failures.append({"beat_id": b.id, "reason": "ComfyUI offline"})
-        logger.warning("ComfyUI is offline; using %d cached picture(s), %d beat(s) without one",
-                       len(cached), len(failures))
-        missing = [b for b in wanted if any(f["beat_id"] == b.id for f in failures)]
-        more, failures = await _fill_stock_fallback(missing, project_dir, settings, failures, canvas_size)
-        return cached + list(more), failures
+    elif character is not None and not art_mod.uses_face_swap(settings.art_style):
+        logger.info("Art style %s: the main character keeps a drawn face, no face swap",
+                    settings.art_style)
 
     directory = _cache_dir(project_dir)
+
+    if not await asyncio.to_thread(queue_manager.client.is_connected):
+        # ComfyUI restarts itself after a crash, and can now repair its own
+        # Python environment too -- wait for it instead of giving up, so an
+        # outage that was always going to end on its own does not cost the
+        # whole run its pictures (2026-10-20: 8 days offline rendered 263
+        # planned beats with zero B-roll).
+        came_back, waited_s, status = await _wait_for_comfyui(queue_manager, report, 0.0)
+        if not came_back:
+            # Pictures an earlier run already made are on disk: a retry after a
+            # crash must still use them rather than render with none at all --
+            # but only when the cache actually covers the plan; a mostly empty
+            # cache fails the job instead of rendering face-only.
+            cached, failures = await _lookup_cached_assets(
+                wanted, resolved, directory, queue_manager, seed_base, canvas_size, face)
+            if len(cached) < COMFY_CACHE_COVERAGE_MIN * len(wanted):
+                state = (status or {}).get("state")
+                raise ComfyUIUnavailableError(
+                    f"ComfyUI did not come back after waiting {waited_s / 60:.1f} min "
+                    f"(comfy_state={state or 'unknown'}); only {len(cached)}/{len(wanted)} "
+                    "wanted beats have a cached picture")
+            logger.warning("ComfyUI is offline; using %d cached picture(s), %d beat(s) without one",
+                           len(cached), len(failures))
+            missing = [b for b in wanted if any(f["beat_id"] == b.id for f in failures)]
+            more, failures = await _fill_stock_fallback(missing, project_dir, settings, failures, canvas_size)
+            return cached + list(more), failures
+        logger.info("ComfyUI is back after %.0fs; continuing asset generation", waited_s)
+
     assets: List[Asset] = []
     failures: List[Dict[str, str]] = []
 
@@ -482,7 +606,8 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
             made = await _generate_one(b, resolved, directory, queue_manager,
                                        seed_base, canvas_size, start_image=start_image,
                                        face=face if b.shows_character else None,
-                                       boilerplate=boilerplate, used_paths=used_paths)
+                                       boilerplate=boilerplate, used_paths=used_paths,
+                                       size_override=gen_size_override)
             return made, "" if made else "no output produced"
         except Exception as e:
             logger.warning("Beat %s (%s) failed to generate: %s", b.id, b.topic, e)
@@ -499,13 +624,26 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
         character_stats = {"name": character.name, "description": character.description,
                            "beats": sum(1 for b in wanted if b.shows_character)}
         stats["character"] = character_stats
-        face = await _prepare_face(character, face, resolved["broll_image"], directory,
+        face_dir = _cache_dir(character_cache_dir) if character_cache_dir is not None else directory
+        face = await _prepare_face(character, face, resolved["broll_image"], face_dir,
                                    queue_manager, seed_base, character_stats)
 
     consecutive_failures = 0
     total = len(wanted) + len(video_beats)
     for index, beat in enumerate(wanted):
         report(index / max(1, total), f"Generating picture {index + 1}/{len(wanted)}")
+        if start_image_override and beat.kind == "broll_video":
+            # Chaining (presentation.vibe_reel, VR7): the caller already has
+            # the start frame for this beat (the previous chain segment's own
+            # last frame) -- skip phase 1's still generation for it and hand
+            # that frame straight to phase 2 below, same prompt, so the next
+            # clip continues from it rather than starting a new picture.
+            override_asset = Asset(beat_id=beat.id, kind="image", path=start_image_override,
+                                   source="generated")
+            assets.append(override_asset)
+            stills_by_beat[beat.id] = override_asset
+            consecutive_failures = 0
+            continue
         as_still = beat.model_copy(update={"kind": "broll_image"}) if beat.kind == "broll_video" else beat
         asset, reason = await attempt(as_still)
         if asset:
@@ -523,8 +661,34 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
             online = await asyncio.to_thread(queue_manager.client.is_connected)
             if online and consecutive_failures < 2 * MAX_CONSECUTIVE_FAILURES:
                 continue
+            if not online:
+                # Wait for it the same way as a ComfyUI found offline at the
+                # start, then resume the remaining beats rather than abort.
+                came_back, waited_s, status = await _wait_for_comfyui(
+                    queue_manager, report, index / max(1, total))
+                if came_back:
+                    logger.info("ComfyUI is back after %.0fs; resuming asset generation", waited_s)
+                    consecutive_failures = 0
+                    continue
+                remaining = wanted[index + 1:]
+                cached, cache_failures = await _lookup_cached_assets(
+                    remaining, resolved, directory, queue_manager, seed_base, canvas_size, face)
+                if (len(assets) + len(cached)) < COMFY_CACHE_COVERAGE_MIN * len(wanted):
+                    state = (status or {}).get("state")
+                    raise ComfyUIUnavailableError(
+                        f"ComfyUI did not come back after waiting {waited_s / 60:.1f} min "
+                        f"(comfy_state={state or 'unknown'}); only {len(assets) + len(cached)}/"
+                        f"{len(wanted)} wanted beats have a picture")
+                logger.warning("ComfyUI stayed offline after waiting; using %d cached picture(s) "
+                               "for the %d beat(s) not attempted", len(cached), len(remaining))
+                for a in cached:
+                    assets.append(a)
+                    stills_by_beat[a.beat_id] = a
+                failures.extend(cache_failures)
+                video_beats = []
+                break
             remaining = wanted[index + 1:]
-            why = "ComfyUI offline" if not online else f"{consecutive_failures} consecutive failures"
+            why = f"{consecutive_failures} consecutive failures"
             logger.warning("Aborting asset generation (%s); %d beats not attempted", why, len(remaining))
             failures.extend(
                 {"beat_id": b.id, "reason": f"not attempted: aborted ({why})"}
@@ -727,14 +891,17 @@ async def _generate_one(beat: Beat, resolved: Dict[str, Optional[workflows.Resol
                         cache_only: bool = False,
                         face: Optional["_Face"] = None,
                         boilerplate: Optional[set] = None,
-                        used_paths: Optional[set] = None) -> Optional[Asset]:
+                        used_paths: Optional[set] = None,
+                        size_override: Optional[Dict[str, Tuple[int, int]]] = None) -> Optional[Asset]:
     """One beat's asset: from the cache when this exact prompt was made
     before, otherwise generated. `cache_only` never generates (ComfyUI down).
     `face`, for a beat that shows the main character: a still gets that face
     swapped in (a clip only keys its cache on it -- it starts from the
     swapped still). `boilerplate` is the run's shared prompt words, left out of
     near matching; `used_paths` the files already serving a beat in this run --
-    none is handed out twice, and the file returned here is added to it."""
+    none is handed out twice, and the file returned here is added to it.
+    `size_override`, keyed by role, bypasses the usual canvas-budget sizing
+    for this call only (see `generate_assets`' own `gen_size_override`)."""
     role = "graphic" if beat.kind == "graphic" else (
         "broll_video" if beat.kind == "broll_video" else "broll_image")
     workflow = resolved.get(role)
@@ -750,6 +917,13 @@ async def _generate_one(beat: Beat, resolved: Dict[str, Optional[workflows.Resol
     positive = beat.prompt() or beat.image_prompt or beat.topic
     if not positive:
         return None
+    if canvas_size and all(canvas_size) and canvas_size[1] > canvas_size[0]:
+        # A Short: the picture must read on a phone held upright -- the
+        # subject close and large, nothing that matters near the side edges
+        # (a landscape composition squeezed tall loses its ends).
+        positive = (f"{positive.rstrip('. ')}. Vertical 9:16 composition, close-up, the subject "
+                    "large and centred, filling the frame top to bottom, nothing important near "
+                    "the left or right edge.")
     negative = beat.negative_prompt or ""
 
     # Optional generation overrides from app settings; None/blank keeps whatever
@@ -765,11 +939,14 @@ async def _generate_one(beat: Beat, resolved: Dict[str, Optional[workflows.Resol
     except (TypeError, ValueError):
         upscale = 1.0
 
+    video_size_override = (size_override or {}).get("broll_video")
+    image_size_override = (size_override or {}).get("broll_image")
     if is_video:
         # Match the media's aspect by default, capped to a generation-sized
-        # resolution so a clip takes minutes, not the whole night.
+        # resolution so a clip takes minutes, not the whole night. An explicit
+        # per-call override (reel_hq) wins over that budget outright.
         width, height = tuple(_setting(
-            "gen_video_size", _video_canvas_default(canvas_size)))
+            "gen_video_size", video_size_override or _video_canvas_default(canvas_size)))
         fps = int(_setting("gen_video_fps", DEFAULT_VIDEO_FPS))
         explicit_length = _setting("gen_video_length", None)
         length = (int(explicit_length) if explicit_length
@@ -778,7 +955,7 @@ async def _generate_one(beat: Beat, resolved: Dict[str, Optional[workflows.Resol
         out_width, out_height = _video_output_size(canvas_size)
     else:
         width, height = tuple(_setting(
-            "gen_image_size", _image_gen_size(_canvas_default(canvas_size, DEFAULT_IMAGE_SIZE))))
+            "gen_image_size", image_size_override or _image_gen_size(_canvas_default(canvas_size, DEFAULT_IMAGE_SIZE))))
         length = fps = out_width = out_height = None
         timeout = int(_setting("gen_image_timeout_s", IMAGE_TIMEOUT))
 
@@ -1026,7 +1203,9 @@ def _thumbnail_excerpt(program, topics=()) -> str:
 
 
 async def generate_thumbnail_concept(program, ask, topics=()) -> Optional[Dict[str, str]]:
-    """{"title", "scene"} for the thumbnail, read from the whole video, or None."""
+    """{"title", "thumb", "scene", "label"} for the thumbnail, read from the whole
+    video, or None. `thumb` is what is printed on the picture (2-4 words,
+    Devanagari for a Hindi video); `title` doubles as the listing title."""
     if ask is None:
         return None
     from .shotplan import THUMBNAIL_CONCEPT_SYSTEM
@@ -1043,10 +1222,17 @@ async def generate_thumbnail_concept(program, ask, topics=()) -> Optional[Dict[s
     for line in str(answer).splitlines():
         key, _, value = line.partition(":")
         key = key.strip().strip("*# ").lower()
-        if key in ("title", "scene") and value.strip():
+        if key in ("title", "scene", "thumb", "label") and value.strip():
             concept[key] = " ".join(value.split()).strip(' "\'*')
     if "title" in concept:
         concept["title"] = concept["title"][:60].strip()
+    if "thumb" in concept:
+        # Two to four words on the picture; more than that will not read.
+        concept["thumb"] = " ".join(concept["thumb"].split()[:4])
+    if concept.get("label", "").strip().upper() in ("NONE", "NO", "-"):
+        concept.pop("label", None)
+    elif "label" in concept:
+        concept["label"] = " ".join(concept["label"].upper().split()[:3])
     elif str(answer).strip() and "scene" not in concept:
         # A model that ignored the format and just wrote a title.
         concept["title"] = " ".join(str(answer).split())[:60].strip(' "\'')

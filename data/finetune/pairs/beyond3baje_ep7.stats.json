@@ -1,0 +1,15 @@
+{
+  "take": "beyond3baje_ep7",
+  "utterances": 126,
+  "windows": 3,
+  "removed": 7,
+  "trim": 3,
+  "kept": 116,
+  "groups": 1,
+  "drops": 2,
+  "trims": 3,
+  "removed_s_in_key": 53.4,
+  "removed_s_as_utterances": 27.3,
+  "editorial_spans": 0,
+  "made_at": "2026-10-22T23:57:10"
+}

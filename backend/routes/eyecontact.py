@@ -32,11 +32,14 @@ VRAM_MB = 3000.0
 # The speaker's prompter setup rarely changes between recordings: it is saved once and
 # pre-filled for every run; a run may still override any of it.
 SETTINGS_KEY = "eye_contact"
-DEFAULTS = {"prompter_side": "left", "angle_deg": 0.0, "prompter_cm": 30.0, "camera_cm": 110.0,
+DEFAULTS = {"mode": "auto", "prompter_side": "left", "angle_deg": 0.0, "prompter_cm": 30.0, "camera_cm": 110.0,
             "steadiness": 0.7, "aim_deg": 0.0, "pitch_deg": 0.0, "auto_pitch": True, "quality": "high"}
 
 
 class EyeContactSetup(BaseModel):
+    # "auto": the target is measured from the speaker's own looks into the lens (sideways
+    # and up/down); the prompter geometry below is the fallback. "manual": the geometry.
+    mode: Optional[str] = Field(None, pattern="^(auto|manual)$")
     prompter_side: Optional[str] = Field(None, pattern="^(left|right|auto)$")
     angle_deg: Optional[float] = Field(None, ge=0.0, le=45.0)
     prompter_cm: Optional[float] = Field(None, ge=0.0, le=200.0)
@@ -141,7 +144,8 @@ async def start_eye_contact(project_id: str, media_id: str, body: EyeContactSetu
 
 def _settings(setup: Dict[str, Any]):
     from eyecontact import Settings
-    return Settings(prompter_side=setup["prompter_side"], angle_deg=float(setup["angle_deg"]),
+    return Settings(mode=str(setup.get("mode") or "manual"),
+                    prompter_side=setup["prompter_side"], angle_deg=float(setup["angle_deg"]),
                     prompter_cm=float(setup["prompter_cm"]), camera_cm=float(setup["camera_cm"]),
                     steadiness=float(setup["steadiness"]), aim_deg=float(setup["aim_deg"]),
                     pitch_deg=float(setup.get("pitch_deg") or 0.0),
@@ -154,6 +158,88 @@ def _cleanup(dst: str):
             os.remove(leftover)
         except OSError:
             pass
+
+
+@router.post("/projects/{project_id}/media/{media_id}/analyse")
+async def start_eye_contact_analyse(project_id: str, media_id: str, body: EyeContactSetup):
+    """Track the whole recording and plan it (nothing rendered): the measured numbers --
+    where the prompter is, how much of the take looks into the lens, how far the eyes
+    will move -- and the landmark cache every preview and the full run then reuse."""
+    from eyecontact import available
+    ok, reason = available()
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Eye contact correction unavailable: {reason}")
+    p_data = project_store.get_project(project_id)
+    if not p_data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    entry = _entry(p_data, media_id)
+    if entry.get("kind") != "video":
+        raise HTTPException(status_code=400, detail="Eye contact correction needs a video clip")
+    src = entry.get("eye_contact", {}).get("original_path") or entry.get("path")
+    if not src or not os.path.isfile(src):
+        raise HTTPException(status_code=400, detail=f"Source file not found: {src}")
+    running = next((j for j in jobs.values() if j["media_id"] == media_id and j["job_type"] == "eye_contact_analyse"
+                    and j["status"] in ("queued", "running")), None)
+    if running:
+        return {"job_id": running["id"]}
+    job_id = f"eyeanalyse_{uuid.uuid4().hex[:8]}"
+    jobs[job_id] = {"id": job_id, "project_id": project_id, "media_id": media_id,
+                    "job_type": "eye_contact_analyse", "status": "queued", "progress": 0.0,
+                    "stage": "Waiting for the GPU", "result": None, "error": None, "cancel": False}
+    asyncio.create_task(_run_analyse(job_id, src, _merged(body)))
+    return {"job_id": job_id}
+
+
+def _plan_summary(plan, settings) -> Dict[str, Any]:
+    import numpy as np
+    from dataclasses import asdict
+    valid = plan["valid"]
+    moved = np.abs(plan["corr"]) > 1e-3
+    w = float(np.median(plan["w_e"]["R"][valid])) if valid.any() else 0.0
+    return {
+        "mode": plan.get("mode", settings.mode),
+        "auto_measured": bool(plan.get("auto_measured")),
+        "measured_shift_deg": round(float(plan.get("measured_shift_deg", 0.0)), 1),
+        "face_found_pct": round(100 * float(valid.mean()), 1) if len(valid) else 0.0,
+        "corrected_pct": round(100 * float(moved.mean()), 1) if len(moved) else 0.0,
+        "camera_look_pct": round(float(plan.get("camera_pct", 0.0)), 1),
+        "prompter_offset_deg": round(float(plan["offset_deg"]), 1),
+        "symmetry_offset_deg": round(float(plan["symmetry_offset_deg"]), 1),
+        "reading_sweep_deg": round(float(plan["sweep_deg"]), 1),
+        "head_pitch_deg": round(float(plan.get("head_pitch_deg", 0.0)), 1),
+        "eyes_raised_deg": round(-float(plan.get("vertical_deg", 0.0)), 1),
+        "median_shift_px": round(float(np.median(np.abs(plan["corr"][moved]))) * w, 2) if moved.any() else 0.0,
+        "eye_width_px": round(w, 1),
+        "lens_per_eye": {k: round(float(v), 3) for k, v in (plan.get("lens_e") or {}).items()},
+        "settings": asdict(settings),
+    }
+
+
+async def _run_analyse(job_id: str, src: str, setup: Dict[str, Any]):
+    from eyecontact import analyse
+    job = jobs[job_id]
+
+    def progress(f: float):
+        job["progress"] = round(f, 4)
+        job["stage"] = "Finding your eyes"
+
+    try:
+        await gpu_broker.acquire_lease("eye_contact", required_vram_mb=VRAM_MB)
+        try:
+            job["status"] = "running"
+            settings = _settings(setup)
+            info, plan = await asyncio.to_thread(analyse, src, settings, progress, lambda: job["cancel"])
+        finally:
+            await gpu_broker.release_lease("eye_contact")
+        summary = _plan_summary(plan, settings)
+        summary["duration_s"] = round(float(getattr(info, "duration", 0.0) or len(plan["valid"]) / max(info.fps, 1.0)), 1)
+        summary["fps"] = float(info.fps)
+        job.update(status="completed", progress=1.0, stage="Done", result=summary)
+    except InterruptedError:
+        job.update(status="cancelled", stage="Cancelled")
+    except Exception as e:
+        logger.exception("Eye contact analysis failed")
+        job.update(status="failed", error=str(e), stage="Failed")
 
 
 class PreviewRequest(EyeContactSetup):

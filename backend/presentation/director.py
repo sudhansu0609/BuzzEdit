@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from config import OUTPUT_DIR, PROJECTS_DIR
 from store.project_store import ProjectStore
-from timeline import Timeline, Transition, generate_captions
+from timeline import Timeline, Transition, clip_ops, generate_captions
 from timeline.authoring import CAPTION_ORIGIN, clear_generated
 
 from . import assets as assets_stage
@@ -55,12 +55,25 @@ class _Stages:
         self.report = report
 
     async def run(self, name: str, coro, required: bool = False, default=None):
+        from comfyui_bridge.errors import ComfyUIUnavailableError
         started = time.time()
         try:
             result = await coro
             self.report.timings.append(
                 StageTiming(stage=name, seconds=round(time.time() - started, 2), ok=True))
             return result
+        except ComfyUIUnavailableError:
+            # A B-roll run that could not get its pictures must fail the whole
+            # pass -- the scheduler job ends "failed" and is retried later --
+            # rather than "degrade" and deliver a video with none. See the
+            # 2026-10-20 incident. Recorded like any other failed stage, then
+            # let through regardless of `required`.
+            logger.exception("Presentation stage %r failed: ComfyUI never came back", name)
+            self.report.timings.append(
+                StageTiming(stage=name, seconds=round(time.time() - started, 2),
+                            ok=False, note="ComfyUI did not come back"))
+            self.report.degraded.append(name)
+            raise
         except Exception as e:
             logger.exception("Presentation stage %r failed", name)
             self.report.timings.append(
@@ -269,6 +282,12 @@ async def _run_presentation_pass(
         raise RuntimeError("No timeline: the auto-edit has not run and could not be run")
     if timeline.default_transition is None:
         timeline.default_transition = Transition(type="fade", duration=0.25)
+    if settings.shorts_full and not shorts_stage.is_portrait(timeline):
+        # The whole programme is wanted as a Short: plan it on the 9:16 canvas
+        # from the start (portrait pictures and clips, close framing), rather
+        # than dressing it landscape and cropping at the end.
+        timeline = shorts_stage.plan_portrait(timeline)
+        logger.info("Presentation: planning on the 9:16 canvas (the programme is a Short)")
 
     # --- the script, when there is one ---------------------------------------
     #
@@ -379,6 +398,8 @@ async def _run_presentation_pass(
                 "translate", captions_stage.translate_lines(program, ask), default=[]))
     thumb_title: Optional[str] = directives.get("title")
     thumb_scene: Optional[str] = None
+    thumb_words: Optional[str] = directives.get("thumbnail_words")
+    thumb_label: Optional[str] = directives.get("thumbnail_label")
     thumb_task = None
     if (settings.thumbnail or (settings.title and thumb_title is None)) and ask is not None:
         thumb_task = asyncio.create_task(stages.run(
@@ -466,6 +487,8 @@ async def _run_presentation_pass(
         concept = await thumb_task or {}
         thumb_title = thumb_title or concept.get("title")
         thumb_scene = concept.get("scene")
+        thumb_words = thumb_words or concept.get("thumb")
+        thumb_label = thumb_label if thumb_label is not None else concept.get("label")
 
     # The listing — titles, description with chapters, tags — while the model
     # is still resident; chapters shift by the cold open's length once it is cut.
@@ -659,6 +682,9 @@ async def _run_presentation_pass(
         face_anchors = dict(await stages.run(
             "face_detect", asyncio.to_thread(facezoom.detect_faces, source_video, program),
             default={}) or {})
+        followed = shorts_stage.follow_faces(timeline, face_anchors)
+        if followed:
+            logger.info("Presentation: %d clip(s) of the 9:16 crop now follow the face", followed)
 
     # --- designed graphics: the live speaker in each layout's slot, the
     #     overlays on the speaker, and the AI disclosure tag -----------------
@@ -986,7 +1012,8 @@ async def _run_presentation_pass(
         # Title was written up front (before the LLM was ejected); this stage is
         # only the ComfyUI image now.
         report.thumbnail = await stages.run(
-            "thumbnail", _make_thumbnail(project_id, data, thumb_title, genre, thumb_scene),
+            "thumbnail", _make_thumbnail(project_id, data, thumb_title, genre, thumb_scene,
+                                         thumb_words, thumb_label, art_style=settings.art_style),
             default=None)
 
     # --- render ------------------------------------------------------------
@@ -1211,18 +1238,21 @@ RECREATION_GENRES = ("true_crime", "horror")
 
 def _apply_recreations(timeline: Timeline, settings: PresentationSettings,
                        genre: str) -> int:
-    """Give reenactment B-roll a 'dramatization' look.
+    """Give reenactment B-roll a 'recreation' look.
 
     In the investigative genres the generated cutaways ARE reconstructions of a
-    past event, so they get a desaturated, grainy grade and — sparingly — a
-    'DRAMATIZATION' super, the broadcast convention that keeps a recreation from
-    being read as real footage. Only the pass's own layer is replaced on a
-    re-run; anything the user added stays."""
+    past event, so they get a desaturated, grainy grade. The broadcast-style
+    'DRAMATIZATION' super that used to accompany it is gone (2026-10-21, the
+    creator: "no need for this"; a story channel carries no text over its
+    pictures). Only the pass's own layer is replaced on a re-run; anything the
+    user added stays."""
     from timeline.authoring import clear_generated
-    from timeline.schema import AtmosphereEffect, time_to_frame
+    from timeline.schema import AtmosphereEffect
 
     clear_generated(timeline, RECREATION_ORIGIN)
-    if genre not in RECREATION_GENRES:
+    from . import art_style as art_mod
+    if genre not in RECREATION_GENRES or not art_mod.is_real(settings.art_style):
+        # A drawing is not a reconstruction: no grain on a stick figure.
         return 0
 
     broll = sorted(
@@ -1233,9 +1263,7 @@ def _apply_recreations(timeline: Timeline, settings: PresentationSettings,
     if not broll:
         return 0
 
-    fps = timeline.fps_num / max(1, timeline.fps_den)
     count = 0
-    last_label_s = -1e9
     for item in broll:
         start_frame = item.timeline_start_frame
         frames = max(1, item.timeline_end_frame - item.timeline_start_frame)
@@ -1247,18 +1275,6 @@ def _apply_recreations(timeline: Timeline, settings: PresentationSettings,
         layer.atmosphere.append(AtmosphereEffect(
             type="grain", intensity=0.25, origin=RECREATION_ORIGIN))
         count += 1
-        # The super lands on the first reenactment and then no more often than
-        # every 40s, so it reads as a standing convention, not a per-shot label.
-        start_s = start_frame / fps
-        if start_s - last_label_s >= 40.0:
-            label_frames = min(frames, time_to_frame(1.6, timeline.fps_num, timeline.fps_den))
-            label = clip_ops.add_text_item(
-                timeline, "DRAMATIZATION", start_frame, max(1, label_frames),
-                track=placement.POPUP_TRACK, preset=settings.popup_preset,
-                style={"pos_y": -0.62, "animation": "fade", "animation_duration": 0.3})
-            label.origin = RECREATION_ORIGIN
-            label.label = "dramatization super"
-            last_label_s = start_s
 
     timeline.recalculate_duration()
     timeline.revision += 1
@@ -1447,7 +1463,10 @@ def _regenerate_captions(timeline: Timeline, settings: PresentationSettings,
 async def _make_thumbnail(project_id: str, data: Dict[str, Any],
                           title: Optional[str],
                           genre: str = "general",
-                          scene: Optional[str] = None) -> Optional[str]:
+                          scene: Optional[str] = None,
+                          words: Optional[str] = None,
+                          label: Optional[str] = None,
+                          art_style: str = "real") -> Optional[str]:
     """The thumbnail image, from a title already written up front (no LLM here)."""
     from agents.thumbnail_agent import ThumbnailAgent
     from runtime import gpu_handover
@@ -1458,7 +1477,8 @@ async def _make_thumbnail(project_id: str, data: Dict[str, Any],
     project = Project.model_validate(data)
     agent = ThumbnailAgent()
     return await agent.generate_thumbnail(project, PROJECTS_DIR / project_id,
-                                          title=title, genre=genre, scene=scene)
+                                          title=title, genre=genre, scene=scene,
+                                          words=words, label=label, art_style=art_style)
 
 
 def _comfyui_online() -> bool:

@@ -18,7 +18,7 @@ const HOST = '127.0.0.1';
 
 /** The port BuzzEdit's backend would *like*. A wish, never a fact. */
 function preferredBackendPort() {
-  return Number.parseInt(process.env.BUZZEDIT_PORT || '', 10) || 8099;
+  return Number.parseInt(process.env.BUZZEDIT_PORT || '', 10) || 8100;
 }
 
 /** The port ComfyUI would like. */

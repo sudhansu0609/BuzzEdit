@@ -45,3 +45,18 @@ def _a_clear_card(monkeypatch):
     from runtime import gpu_handover
     monkeypatch.setattr(gpu_handover, "free_vram_mb", lambda: 16000.0)
     monkeypatch.setattr(gpu_handover, "lm_studio_has_models", lambda base_url="": False)
+
+
+@pytest.fixture(autouse=True)
+def _no_local_editor_model(monkeypatch):
+    """Tests never load or eject a model on this machine: the local editor
+    (asr.editor) sees nothing loaded and cannot load anything. Without this a
+    planner test with no editor client ran `lms unload --all` and `lms load`
+    for real (2026-10-21)."""
+    import asr.editor as editor
+    monkeypatch.setattr(editor, "ollama_loaded", lambda *a, **k: [])
+    monkeypatch.setattr(editor, "lm_studio_loaded", lambda *a, **k: [])
+
+    def refuse(cfg):
+        raise RuntimeError("no local model in tests")
+    monkeypatch.setattr(editor, "ensure_local_loaded", refuse)

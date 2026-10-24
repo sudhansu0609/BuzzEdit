@@ -16,6 +16,7 @@ instead of inferred.
 
 import difflib
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -65,24 +66,41 @@ def build_cut_audio(timeline: Timeline, source_path: str, out_wav: str,
     the caller needs cut-time to map linearly back to source frames (the repair
     path). Returns the path, or None if there is nothing to build.
     """
-    from utils.ffmpeg_utils import run_ffmpeg
+    import shutil
+    import subprocess
+    import tempfile
+    from utils.ffmpeg_utils import FFMPEG_BIN, FFmpegError, run_ffmpeg
+    from utils.proc import NO_WINDOW
 
     spans = _cut_spans(timeline)
     if not spans:
         return None
     pad = f",apad=pad_dur={seam_silence}" if seam_silence > 0 else ""
-    parts = [f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS{pad}[a{k}]"
-             for k, (s, e) in enumerate(spans)]
-    concat_inputs = "".join(f"[a{k}]" for k in range(len(spans)))
-    filter_complex = ";".join(parts) + \
-        f";{concat_inputs}concat=n={len(spans)}:v=0:a=1[out]"
-    run_ffmpeg([
-        "-i", source_path,
-        "-filter_complex", filter_complex,
-        "-map", "[out]",
-        "-ar", "16000", "-ac", "1",
-        "-y", out_wav,
-    ])
+    # The speech is pulled out once at Whisper's rate, then every span reads it
+    # through its own seeking `amovie`. One input split into a branch per span
+    # pushed the whole take through every branch (685 spans x 42 minutes on
+    # 674aefab, still running after 10 minutes), and the graph inline made a
+    # 50K-character command line that died on WinError 206 -- so it goes in a
+    # script file, and FFmpeg runs in the work folder where the WAV's name
+    # needs no escaping.
+    work = tempfile.mkdtemp(prefix="cutverify_", dir=os.path.dirname(os.path.abspath(out_wav)) or None)
+    try:
+        run_ffmpeg(["-i", source_path, "-vn", "-ac", "1", "-ar", "16000",
+                    "-c:a", "pcm_s16le", "-y", os.path.join(work, "src.wav")])
+        parts = [f"amovie=filename=src.wav:seek_point={max(0.0, s - 1.0):.3f},"
+                 f"atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS{pad}[a{k}]"
+                 for k, (s, e) in enumerate(spans)]
+        concat_inputs = "".join(f"[a{k}]" for k in range(len(spans)))
+        with open(os.path.join(work, "graph.txt"), "w", encoding="utf-8") as fh:
+            fh.write(";".join(parts) + f";{concat_inputs}concat=n={len(spans)}:v=0:a=1[out]")
+        result = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-filter_complex_script", "graph.txt", "-map", "[out]",
+             "-ar", "16000", "-ac", "1", "-y", os.path.abspath(out_wav)],
+            cwd=work, capture_output=True, text=True, timeout=3600, creationflags=NO_WINDOW)
+        if result.returncode != 0:
+            raise FFmpegError(f"FFmpeg failed: {result.stderr[-2000:]}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     return out_wav
 
 
@@ -279,7 +297,13 @@ async def verify_cut(timeline: Timeline, source_path: str,
     from asr.faster_whisper_engine import whisper_engine
 
     out_wav = str(Path(TEMP_DIR) / f"cutcheck_{Path(source_path).stem}.wav")
-    built = build_cut_audio(timeline, source_path, out_wav)
+    # ffmpeg joins every kept span of the recording here -- 70 s on a 42-minute
+    # take. Off the event loop: run inline it froze the whole server, the
+    # Studio's health probe and status polls went unanswered, and its watchdog
+    # took the silence for a hang and killed BuzzEdit mid-transcription
+    # (2026-10-20, three runs in a row).
+    import asyncio
+    built = await asyncio.to_thread(build_cut_audio, timeline, source_path, out_wav)
     if not built:
         return {"error": "no cut spans to verify"}
 

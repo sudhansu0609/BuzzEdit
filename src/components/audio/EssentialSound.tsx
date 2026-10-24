@@ -67,7 +67,7 @@ function Control({ title, hint, fx, disabled, onSwitch, children }: {
   return (
     <div className={`audio-param-group${on ? '' : ' off'}`}>
       <label className="audio-group-head" title={hint}>
-        <input type="checkbox" checked={on} disabled={disabled} onChange={(e) => onSwitch(e.target.checked)} />
+        <input type="checkbox" checked={on} disabled={disabled} aria-label={title} onChange={(e) => onSwitch(e.target.checked)} />
         {title}
         {fx && !fx.enabled && <span className="audio-unit">bypassed</span>}
       </label>
@@ -87,6 +87,7 @@ function PresetSelect({ names, current, disabled, onPick }: {
   return (
     <Row label="Preset">
       <select className="audio-select" value={value} disabled={disabled || names.length === 0}
+        aria-label="Preset"
         onChange={(e) => { if (names.includes(e.target.value)) onPick(e.target.value); }}>
         {value === '' && <option value="">Choose…</option>}
         {value === '__custom__' && <option value="__custom__">Custom</option>}

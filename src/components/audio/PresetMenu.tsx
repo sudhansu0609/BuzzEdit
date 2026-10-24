@@ -87,7 +87,7 @@ export default function PresetMenu({ def, userPresets, current, active, onApply,
   return (
     <div className="audio-presets">
       <div className="audio-presets-row">
-        <select className="audio-select" value={activeKey} title="Presets"
+        <select className="audio-select" value={activeKey} title="Presets" aria-label="Presets"
           onChange={(e) => pick(e.target.value)}>
           <option value="">{active && !activeKey ? active : 'Presets…'}</option>
           <option value={DEFAULT_KEY}>Default settings</option>
@@ -108,14 +108,14 @@ export default function PresetMenu({ def, userPresets, current, active, onApply,
         </button>
         {activeIsMine && (
           <button className="audio-btn danger" disabled={busy} onClick={remove}
-            title={`Delete your preset "${active}"`}>
+            title={`Delete your preset "${active}"`} aria-label={`Delete your preset "${active}"`}>
             ✕
           </button>
         )}
       </div>
       {saving && (
         <div className="audio-presets-row">
-          <input className="audio-text" placeholder="Preset name" value={name} autoFocus
+          <input className="audio-text" placeholder="Preset name" aria-label="Preset name" value={name} autoFocus
             onChange={(e) => setName(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter') void save();

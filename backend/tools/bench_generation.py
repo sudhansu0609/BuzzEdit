@@ -88,7 +88,14 @@ def run(graph: Dict[str, Any], timeout: float = 1800) -> Dict[str, Any]:
     t0 = time.time()
     prompt_id = _post("/prompt", {"prompt": graph})["prompt_id"]
     while time.time() - t0 < timeout:
-        hist = _get(f"/history/{prompt_id}")
+        try:
+            hist = _get(f"/history/{prompt_id}", timeout=30)
+        except (TimeoutError, OSError):
+            # ComfyUI's HTTP goes quiet while SageAttention kernels compile and
+            # the card is full (2026-10-22: a 10 s poll aborted the whole
+            # check); the job is still running, so keep waiting.
+            time.sleep(5.0)
+            continue
         if prompt_id in hist:
             entry = hist[prompt_id]
             status = entry.get("status", {})

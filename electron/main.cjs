@@ -4,6 +4,12 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 
 const plan = require('./port-plan.cjs');
+const { looksLikeBrokenEnv, diedAtStartup } = require('./comfy-crash.cjs');
+
+// Dexter drives this window through Windows UI Automation. Chromium only
+// publishes the page to it when a screen reader is around, so ask for it
+// outright: every labelled control is then visible to Dexter by name.
+app.commandLine.appendSwitch('force-renderer-accessibility');
 
 let mainWindow = null;
 let tray = null;
@@ -34,6 +40,19 @@ let comfyUrl = null;
 // True when *we* spawned the backend, i.e. when we own its ledger entry. An
 // already-running backend was published by whoever started it.
 let ownsLedgerEntry = false;
+
+// ─────────────────────── backend supervisor state ───────────────────────
+//
+// The backend used to exit and stay dead: the 'close' handler only logged it,
+// so a crash — an unhandled exception, an OOM, a GPU driver reset mid-render —
+// left Electron alive with no backend, and the Studio's Music page waited on
+// it forever (2026-10-20). See the 'close' handler below and restartBackend().
+const BACKEND_RESTART_DELAYS_MS = [3000, 10000, 30000];
+const BACKEND_RESTART_STEADY_MS = 60000;
+const BACKEND_STABLE_MS = 10 * 60 * 1000; // up this long resets the backoff
+let backendRestartTimer = null;
+let backendRestartAttempts = 0;
+let backendStartedAt = 0; // 0 while down; set once waitForBackend() succeeds
 
 // ComfyUI (the "AI Engine") used to be launched by START_APP.bat with
 // `start /min`, which left a console window of its own in the taskbar and
@@ -166,15 +185,192 @@ function killProcessTree(pid) {
   });
 }
 
+// ─────────────────────── ComfyUI environment repair ───────────────────────
+//
+// scripts/comfy_repair.py checks (and, when broken, fixes) the Python
+// environment ComfyUI runs in -- see its own docstring for why. It already
+// checks first and only repairs when that check fails, so every call here
+// just runs it and waits; "nothing to do" and "fixed it" both exit 0.
+//
+// Single-flight: a missing COMFY_PYTHON at startup, a crash whose stderr
+// tail looks like a broken environment, and three crashes inside the restart
+// window can all ask for a repair around the same time. They share one
+// promise so only one repair process ever runs, and the watchdog/restart
+// paths check the same flag so they never start ComfyUI, or a second repair,
+// while one is in flight.
+let comfyRepairPromise = null;
+let comfyLastRepairAttempt = 0; // Date.now() of the last attempt (0 = never)
+// Exit timestamps, independent of whether a restart was actually scheduled --
+// used only to notice "crashed 3 times in a row" so ensureComfyEnv() runs
+// before trying a 4th time. Declared here, ahead of startComfyUI's use of it.
+let comfyExitTimes = [];
+const COMFY_REPAIR_RETRY_MS = 60 * 60 * 1000; // a failed repair: at most once/hour
+// How long a crash still counts as "at startup" for looksLikeBrokenEnv() below
+// (electron/comfy-crash.cjs) — a broken environment dies right away, not
+// twenty minutes into a render, and that module also drops the custom-node /
+// optional-backend noise a healthy start itself prints before the pattern runs.
+const COMFY_STARTUP_CRASH_MS = 180 * 1000;
+const COMFY_REPAIR_SCRIPT = path.join(__dirname, '../scripts/comfy_repair.py');
+const COMFY_REPAIR_STATE_PATH = path.join(COMFY_DATA, '.venv_repair.json');
+const COMFY_STATUS_PATH = path.join(__dirname, '../data/comfy_status.json');
+
+function readComfyRepairState() {
+  try {
+    return JSON.parse(fs.readFileSync(COMFY_REPAIR_STATE_PATH, 'utf-8'));
+  } catch (err) {
+    return null;
+  }
+}
+
+function writeJsonAtomic(filePath, payload) {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf-8');
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    console.warn('Could not write ComfyUI status file:', err);
+  }
+}
+
+// data/comfy_status.json: our own account of ComfyUI, for the backend's
+// health routes to read (it has no window into this process). Written
+// atomically (tmp + rename) every time the state actually changes.
+let comfyStatusState = null;
+let comfyStatusSince = null;
+
+function setComfyStatus(state, detail) {
+  const now = new Date().toISOString();
+  if (state !== comfyStatusState) {
+    comfyStatusState = state;
+    comfyStatusSince = now;
+  }
+  writeJsonAtomic(COMFY_STATUS_PATH, {
+    state: comfyStatusState,
+    since: comfyStatusSince,
+    detail: detail || '',
+    repair: readComfyRepairState(),
+    updated_at: now,
+  });
+}
+
+// Spawns comfy_repair.py hidden, streaming every line it prints through
+// logLine('ComfyUI repair: ', ...) so a repair is visible in logs/backend.log
+// as it happens, not just at the end.
+function spawnComfyRepair(pythonPath, extraArgs) {
+  return new Promise((resolve) => {
+    const args = [COMFY_REPAIR_SCRIPT, '--data', COMFY_DATA, '--code', COMFY_CODE,
+      '--log', backendLogPath, ...extraArgs];
+    let child;
+    try {
+      child = spawn(pythonPath, args, {
+        cwd: path.join(__dirname, '..'),
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } catch (err) {
+      resolve({ code: 1, lastLine: '', error: String(err) });
+      return;
+    }
+    let lastLine = '';
+    const onData = (d) => {
+      const text = d.toString();
+      logLine('ComfyUI repair: ', text);
+      const lines = text.split(/\r?\n/).filter(Boolean);
+      if (lines.length) lastLine = lines[lines.length - 1];
+    };
+    child.stdout?.on('data', onData);
+    child.stderr?.on('data', onData);
+    child.on('close', (code) => resolve({ code: code == null ? 1 : code, lastLine }));
+    child.on('error', (err) => resolve({ code: 1, lastLine: '', error: String(err) }));
+  });
+}
+
+// Runs the repair script (which checks first, and only truly repairs when
+// broken) and returns whether the environment is healthy afterwards. Never
+// throws. `reason` is only for the log line.
+function ensureComfyEnv(reason) {
+  if (comfyRepairPromise) return comfyRepairPromise;
+  const now = Date.now();
+  if (comfyLastRepairAttempt && now - comfyLastRepairAttempt < COMFY_REPAIR_RETRY_MS) {
+    logLine('ComfyUI err: ', `repair skipped -- last attempt ${Math.round((now - comfyLastRepairAttempt) / 60000)} min ago, retried at most once/hour (${reason})`);
+    return Promise.resolve(false);
+  }
+  comfyRepairPromise = (async () => {
+    comfyLastRepairAttempt = Date.now();
+    logLine('ComfyUI err: ', `environment repair starting (${reason})`);
+    setComfyStatus('repairing', reason);
+    let pythonPath;
+    try {
+      pythonPath = await findPython();
+    } catch (err) {
+      logLine('ComfyUI err: ', `repair could not run, no backend python: ${err}`);
+      setComfyStatus('repair_failed', String(err).slice(0, 500));
+      return false;
+    }
+    const result = await spawnComfyRepair(pythonPath, []);
+    if (result.code === 0) {
+      logLine('ComfyUI: ', 'environment repair finished: healthy');
+      return true;
+    }
+    const state = readComfyRepairState();
+    const errMsg = (state && state.error) || result.lastLine || result.error || `exit ${result.code}`;
+    logLine('ComfyUI err: ', `environment repair failed: ${errMsg}`);
+    setComfyStatus('repair_failed', String(errMsg).slice(0, 500));
+    return false;
+  })();
+  return comfyRepairPromise.finally(() => {
+    comfyRepairPromise = null;
+  });
+}
+
+// A one-off, read-only `--check` run at app start, purely to get the state of
+// the environment into the log before anything goes wrong with it. It never
+// repairs -- a broken environment found here is left for the crash path
+// (ensureComfyEnv, below) to fix.
+async function backgroundComfyCheck() {
+  if (!fs.existsSync(COMFY_PYTHON)) return; // startComfyUI's own repair path handles this
+  try {
+    const pythonPath = await findPython();
+    const result = await spawnComfyRepair(pythonPath, ['--check']);
+    if (result.code === 0) {
+      logLine('ComfyUI: ', 'startup environment check: healthy');
+    } else {
+      logLine('ComfyUI err: ', `startup environment check: broken (${result.lastLine || result.error || `exit ${result.code}`}); will repair on the next crash`);
+    }
+  } catch (err) {
+    logLine('ComfyUI err: ', `startup environment check could not run: ${err}`);
+  }
+}
+
 // ───────────────────────────── the children ─────────────────────────────
 
 async function startComfyUI(adopt) {
   if (adopt) return;
+  // A repair already in flight will start ComfyUI itself once it resolves;
+  // starting it here too would race two copies onto the same port.
+  if (comfyRepairPromise) return;
   if (!fs.existsSync(COMFY_PYTHON)) {
-    console.warn('ComfyUI python not found, skipping AI engine:', COMFY_PYTHON);
-    return;
+    logLine('ComfyUI err: ', `python not found at ${COMFY_PYTHON}; repairing the environment`);
+    setComfyStatus('down', 'python not found');
+    const healthy = await ensureComfyEnv('python not found at startup');
+    if (quitting || !healthy) return;
+    if (!fs.existsSync(COMFY_PYTHON)) {
+      logLine('ComfyUI err: ', 'repair finished but python is still missing; not starting ComfyUI');
+      return;
+    }
   }
 
+  setComfyStatus('starting', 'launching ComfyUI');
+  // A fresh process gets a full silence window of its own. Without this, a
+  // start that follows a long repair (30+ min) inherits the old "last answered"
+  // time and the watchdog kills it 30 s later, before it has loaded.
+  comfyLastAnswer = Date.now();
+  comfySpawnedAt = Date.now();
+  // Reset per process: only this spawn's own stderr should decide whether its
+  // own exit looks like a broken environment.
+  const stderrTail = [];
   comfyProcess = spawn(
     COMFY_PYTHON,
     // ComfyUI's own main.py takes --listen/--port; this is how the port we
@@ -191,14 +387,36 @@ async function startComfyUI(adopt) {
   );
   const child = comfyProcess;
   child.stdout?.on('data', (d) => logLine('ComfyUI: ', d));
-  child.stderr?.on('data', (d) => logLine('ComfyUI err: ', d));
+  child.stderr?.on('data', (d) => {
+    logLine('ComfyUI err: ', d);
+    const lines = d.toString().split(/\r?\n/).filter(Boolean);
+    stderrTail.push(...lines);
+    if (stderrTail.length > 60) stderrTail.splice(0, stderrTail.length - 60);
+  });
   child.on('close', (code, signal) => {
     logLine('ComfyUI: ', `exited with code ${code}${signal ? ` (signal ${signal})` : ''}`);
     if (comfyProcess === child) comfyProcess = null;
     // Nothing stops ComfyUI on purpose except quitting the app, so any other
     // exit is a crash (or a sleep/wake that took the GPU context with it). A
     // production waiting on it would otherwise sit out a timeout per asset.
-    if (!quitting) scheduleComfyRestart();
+    if (quitting) return;
+    setComfyStatus('down', `exited with code ${code}${signal ? ` (signal ${signal})` : ''}`);
+    const now = Date.now();
+    comfyExitTimes = comfyExitTimes.filter((t) => now - t < COMFY_RESTART_WINDOW_MS);
+    comfyExitTimes.push(now);
+    const envLooksBroken = diedAtStartup(comfySpawnedAt, now, COMFY_STARTUP_CRASH_MS)
+      && looksLikeBrokenEnv(stderrTail.join('\n'));
+    const crashedThrice = comfyExitTimes.length >= 3;
+    if (envLooksBroken || crashedThrice) {
+      const reason = envLooksBroken
+        ? 'stderr matched a known environment failure'
+        : 'crashed 3 times within the restart window';
+      ensureComfyEnv(reason).finally(() => {
+        if (!quitting) scheduleComfyRestart();
+      });
+      return;
+    }
+    scheduleComfyRestart();
   });
 }
 
@@ -211,7 +429,8 @@ let comfyRestarts = [];
 let comfyRestartTimer = null;
 
 function scheduleComfyRestart() {
-  if (comfyRestartTimer || comfyProcess) return;
+  // A repair in flight already restarts ComfyUI itself once it resolves.
+  if (comfyRepairPromise || comfyRestartTimer || comfyProcess) return;
   const now = Date.now();
   comfyRestarts = comfyRestarts.filter((t) => now - t < COMFY_RESTART_WINDOW_MS);
   if (comfyRestarts.length >= COMFY_RESTART_DELAYS_MS.length) {
@@ -223,9 +442,79 @@ function scheduleComfyRestart() {
   logLine('ComfyUI: ', `restarting in ${delay / 1000}s (attempt ${comfyRestarts.length})`);
   comfyRestartTimer = setTimeout(() => {
     comfyRestartTimer = null;
-    if (quitting || comfyProcess) return;
+    if (quitting || comfyProcess || comfyRepairPromise) return;
     startComfyUI(false).catch((err) => logLine('ComfyUI err: ', `restart failed: ${err}`));
   }, delay);
+}
+
+// A ComfyUI that is alive but mute is as bad as one that crashed -- the crash
+// handler above never fires for it, and a production waited an hour per asset
+// on it (2026-10-20). So its /system_stats is probed every COMFY_WATCH_MS; one
+// we own that has not answered for COMFY_SILENT_MS is stopped, and the 'close'
+// handler restarts it. One we did not start (adopted) that goes mute that long
+// is replaced by our own. And a ComfyUI that stayed down because it crashed
+// three times in ten minutes is started again once that window has passed,
+// instead of staying down until someone restarts BuzzEdit.
+const COMFY_WATCH_MS = 30 * 1000;
+const COMFY_SILENT_MS = 10 * 60 * 1000;
+let comfyAdopted = false;
+let comfyLastAnswer = Date.now();
+let comfySpawnedAt = 0; // set by startComfyUI(); read by the 'close' handler above
+let comfyGiveUpNoted = false;
+
+async function comfyWatchTick() {
+  // While a repair is in flight ComfyUI is expected to be down; let
+  // ensureComfyEnv() finish and start it back up rather than racing it.
+  if (quitting || !comfyPort || comfyRepairPromise) return;
+  const stats = await getJson(`${comfyUrl}/system_stats`, 10000);
+  const now = Date.now();
+  if (stats && stats.system) {
+    comfyLastAnswer = now;
+    comfyGiveUpNoted = false;
+    if (comfyStatusState !== 'running') setComfyStatus('running', 'answered /system_stats');
+    return;
+  }
+  const silentMs = now - comfyLastAnswer;
+  if (comfyProcess) {
+    if (silentMs < COMFY_SILENT_MS) return;
+    logLine('ComfyUI err: ', `has not answered for ${Math.round(silentMs / 60000)} min; stopping it so it restarts`);
+    comfyLastAnswer = now; // the restarted one gets a full window of its own
+    try {
+      comfyProcess.kill();
+    } catch (err) {
+      logLine('ComfyUI err: ', `could not stop it: ${err}`);
+    }
+    return; // the 'close' handler schedules the restart
+  }
+  if (comfyRestartTimer) return;
+  if (comfyAdopted) {
+    if (silentMs < COMFY_SILENT_MS) return;
+    logLine('ComfyUI: ', `the ComfyUI we adopted on ${comfyPort} has not answered for ${Math.round(silentMs / 60000)} min; starting our own`);
+    comfyAdopted = false;
+    comfyLastAnswer = now;
+    startComfyUI(false).catch((err) => logLine('ComfyUI err: ', `start failed: ${err}`));
+    return;
+  }
+  const recent = comfyRestarts.filter((t) => now - t < COMFY_RESTART_WINDOW_MS).length;
+  if (recent >= COMFY_RESTART_DELAYS_MS.length) {
+    if (!comfyGiveUpNoted) {
+      comfyGiveUpNoted = true;
+      logLine('ComfyUI err: ', 'still down after repeated crashes; trying again once ten minutes have passed');
+    }
+    return;
+  }
+  comfyGiveUpNoted = false;
+  logLine('ComfyUI: ', 'is down; starting it again');
+  scheduleComfyRestart();
+}
+
+function startComfyWatchdog(adopt) {
+  comfyAdopted = Boolean(adopt);
+  comfyLastAnswer = Date.now();
+  const watch = setInterval(() => {
+    comfyWatchTick().catch((err) => logLine('ComfyUI err: ', `watchdog: ${err}`));
+  }, COMFY_WATCH_MS);
+  watch.unref();
 }
 
 async function startBackend(adopt) {
@@ -246,7 +535,7 @@ async function startBackend(adopt) {
 
   try {
     const pythonPath = await findPython();
-    backendProcess = spawn(pythonPath, ['main.py', '--port', String(backendPort)], {
+    const child = spawn(pythonPath, ['main.py', '--port', String(backendPort)], {
       cwd: backendPath,
       // PYTHONIOENCODING: the backend logs non-ASCII (Devanagari captions, emoji
       // from third-party libs) and the default cp1252 codepage makes the logging
@@ -257,12 +546,16 @@ async function startBackend(adopt) {
       //
       // BUZZEDIT_PORT: the health route reports the port it was told to take, so
       // the identity payload matches reality even before the socket is up.
+      //
+      // BUZZEDIT_SUPERVISED: this supervisor restarts the backend on any exit,
+      // so runtime/code_reload.py may exit an idle backend onto changed code.
       env: {
         ...process.env,
         PYTHONPATH: backendPath,
         PYTHONIOENCODING: 'utf-8',
         COMFYUI_URL: comfyUrl,
         BUZZEDIT_PORT: String(backendPort),
+        BUZZEDIT_SUPERVISED: '1',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       // The app launches without a console of its own, so python.exe — a console
@@ -270,24 +563,118 @@ async function startBackend(adopt) {
       // cmd window next to the UI. stdout/stderr stay piped here regardless.
       windowsHide: true,
     });
+    backendProcess = child;
 
-    backendProcess.stdout?.on('data', (data) => {
+    child.stdout?.on('data', (data) => {
       logLine('Backend: ', data);
     });
 
-    backendProcess.stderr?.on('data', (data) => {
+    child.stderr?.on('data', (data) => {
       logLine('Backend err: ', data);
     });
 
-    backendProcess.on('close', (code) => {
-      console.log(`Backend exited with code ${code}`);
+    // The supervisor: only an actual exit of *this* child ever restarts
+    // anything — never a slow or failed health check, which waitForBackend()
+    // below handles on its own and which a render in progress must never pay
+    // for with a kill.
+    child.on('close', (code, signal) => {
+      if (backendProcess === child) backendProcess = null;
+      if (quitting) return;
+      onBackendExit(code, signal).catch((err) => logLine('Backend err: ', `exit handling failed: ${err}`));
     });
 
     await waitForBackend();
     console.log(`Backend started successfully on ${apiUrl}`);
     ownsLedgerEntry = true;
+    backendStartedAt = Date.now();
   } catch (err) {
     console.error('Failed to start backend:', err);
+  }
+}
+
+/** The backend's own 'close' handler, once we know we are not quitting. */
+async function onBackendExit(code, signal) {
+  logLine('Backend err: ', `backend exited with code ${code}${signal ? ` (signal ${signal})` : ''}; restarting`);
+  // Still us, but now a pid with nothing listening behind it: left in the
+  // ledger it strands every app that discovers 'buzzedit' the way the
+  // Studio's Music page did on 2026-10-20, because main.py's own atexit
+  // never got to run — it was the one just killed. We are still alive, so we
+  // take it back ourselves rather than leaving it for a `finally` that will
+  // never fire -- and we do it before scheduling the restart, so nothing can
+  // discover the dead entry in between.
+  try {
+    await withdrawPorts();
+  } catch (err) {
+    logLine('Backend err: ', `could not withdraw the stale ledger entry: ${err}`);
+  }
+  if (backendStartedAt && Date.now() - backendStartedAt >= BACKEND_STABLE_MS) {
+    backendRestartAttempts = 0; // it earned a fresh run at the short delays
+  }
+  backendStartedAt = 0;
+  scheduleBackendRestart();
+}
+
+function scheduleBackendRestart() {
+  if (quitting || backendRestartTimer || backendProcess) return;
+  const delay = backendRestartAttempts < BACKEND_RESTART_DELAYS_MS.length
+    ? BACKEND_RESTART_DELAYS_MS[backendRestartAttempts]
+    : BACKEND_RESTART_STEADY_MS;
+  backendRestartAttempts += 1;
+  logLine('Backend: ', `restarting in ${delay / 1000}s (attempt ${backendRestartAttempts})`);
+  backendRestartTimer = setTimeout(() => {
+    backendRestartTimer = null;
+    if (quitting || backendProcess) return;
+    restartBackend().catch((err) => logLine('Backend err: ', `restart failed: ${err}`));
+  }, delay);
+}
+
+/**
+ * Brings the backend back after an unexpected exit — never gives up.
+ *
+ * `resolveBackend()` is the same helper `app.whenReady()` used for the very
+ * first launch: it tries BuzzEdit's preferred port first (where the backend
+ * almost always still is, since it was free when we parked there) and only
+ * steps to another free one in the span if something else has taken it in
+ * the meantime — rule 2, never evict. The ComfyUI URL we hand the restarted
+ * backend is untouched; only the backend's own port can move.
+ */
+async function restartBackend() {
+  const oldPort = backendPort;
+  const backend = await resolveBackend();
+  backendPort = backend.port;
+  apiUrl = `http://${HOST}:${backendPort}`;
+  const changedPort = backendPort !== oldPort;
+  if (changedPort) {
+    logLine('Backend: ', `port ${oldPort} is held by something else now; restarting on ${backendPort} instead`);
+  }
+  await startBackend(backend.adopt);
+  await publishPorts();
+  if (changedPort) followNewBackendUrl();
+}
+
+/**
+ * Makes the UI follow a backend that landed on a different port.
+ *
+ * The renderer only ever learns the API base once, from `additionalArguments`
+ * at window construction (see `createWindow()`) — there is no live channel to
+ * tell an already-open page its base changed. Recreating the window is the
+ * same trick `createWindow()` already uses at first launch, just run again.
+ */
+function followNewBackendUrl() {
+  const old = mainWindow;
+  if (!old) {
+    createWindow();
+    return;
+  }
+  // createWindow() already has an `on('closed', ...)` that clears `mainWindow`
+  // — registered first, so it runs before this one — so waiting for the old
+  // window's own 'closed' event (guaranteed even for a forced destroy()) is
+  // what keeps a late event from wiping out the *new* window instead.
+  old.once('closed', () => createWindow());
+  try {
+    old.destroy();
+  } catch (err) {
+    logLine('Backend err: ', `could not close the window for the new port: ${err}`);
   }
 }
 
@@ -369,7 +756,12 @@ app.whenReady().then(async () => {
   createTray();
 
   startBackend(backend.adopt).then(publishPorts);
-  startComfyUI(comfy.adopt);
+  startComfyUI(comfy.adopt).catch((err) => logLine('ComfyUI err: ', `start failed: ${err}`));
+  startComfyWatchdog(comfy.adopt);
+  // Read-only, non-blocking: just gets the environment's state into the log
+  // before anything goes wrong with it. A broken environment found here is
+  // left for the crash path to actually repair.
+  backgroundComfyCheck().catch((err) => logLine('ComfyUI err: ', `startup check failed: ${err}`));
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -383,6 +775,10 @@ function stopBackend() {
   if (comfyRestartTimer) {
     clearTimeout(comfyRestartTimer);
     comfyRestartTimer = null;
+  }
+  if (backendRestartTimer) {
+    clearTimeout(backendRestartTimer);
+    backendRestartTimer = null;
   }
   if (backendProcess && backendProcess.pid) {
     // Kill the whole tree — the python launcher may have spawned children
@@ -420,10 +816,22 @@ app.on('before-quit', (event) => {
 // then hold Whisper, the aligner and ComfyUI's models on the GPU with nobody
 // left to use them. `process.kill(pid, 0)` only tests that the pid exists (it
 // never signals on Windows); EPERM means it exists and is someone else's.
+//
+// STUDIO_DIRECTOR_PLAN.md enhancement 4 (2026-10-24): quitting the instant the
+// pid is gone killed a reel/narration mid-job, since any Studio exit (crash,
+// close, the reaper) took the headless BuzzEdit it started down with it. Now:
+// while the backend reports work (`GET /api/reload/busy`), the watchdog only
+// polls and waits (hard cap `QUIT_HARD_CAP_MS`); a *new* Studio can adopt this
+// BuzzEdit instead of spawning a second one (`POST /api/supervisor/parent`,
+// routes/supervisor.py) -- `currentParentPid()` reads that pid once set,
+// cancelling the pending quit.
 const STUDIO_PID = Number(process.env.BUZZCAF_STUDIO_PID || 0);
 const STUDIO_POLL_MS = 3000;
+const BUSY_POLL_MS = 30000;
+const QUIT_HARD_CAP_MS = 6 * 60 * 60 * 1000;
 
 function studioAlive(pid) {
+  if (!(pid > 0)) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -432,11 +840,58 @@ function studioAlive(pid) {
   }
 }
 
+// The pid to watch: a Studio that adopted this BuzzEdit (`/api/supervisor/parent`)
+// instead of starting a new one, or the env var it was started with.
+async function currentParentPid() {
+  if (!apiUrl) return STUDIO_PID;
+  const body = await getJson(`${apiUrl}/api/supervisor/parent`, 2000);
+  if (body && Number.isInteger(body.pid) && body.pid > 0) return body.pid;
+  return STUDIO_PID;
+}
+
+// Whether the backend itself says it must not be restarted/quit right now.
+// Unreachable/unsure counts as busy -- never quit blind on a bad poll.
+async function backendBusy() {
+  if (!apiUrl) return true;
+  const body = await getJson(`${apiUrl}/api/reload/busy`, 5000);
+  if (!body) return true;
+  return Boolean(body.busy);
+}
+
 if (HEADLESS && STUDIO_PID > 0) {
-  const watch = setInterval(() => {
-    if (quitting || studioAlive(STUDIO_PID)) return;
+  let quitPendingSince = 0;
+  let lastBusyCheckAt = 0;
+  let busyNow = true;
+  const watch = setInterval(async () => {
+    if (quitting) return;
+    const parentPid = await currentParentPid();
+    if (studioAlive(parentPid)) {
+      if (quitPendingSince) {
+        console.log(`Buzzcaf Studio (pid ${parentPid}) is back (or a new one adopted this BuzzEdit); cancelling the quit.`);
+      }
+      quitPendingSince = 0;
+      return;
+    }
+    if (!quitPendingSince) {
+      quitPendingSince = Date.now();
+      lastBusyCheckAt = 0;
+      console.log(`Buzzcaf Studio (pid ${parentPid}) is gone; waiting for BuzzEdit to be idle before quitting `
+        + `(checked every ${BUSY_POLL_MS / 1000}s, hard cap ${QUIT_HARD_CAP_MS / 3600000}h).`);
+    }
+    if (Date.now() - quitPendingSince > QUIT_HARD_CAP_MS) {
+      clearInterval(watch);
+      console.log('Buzzcaf Studio has been gone for the full hard cap; quitting the headless BuzzEdit regardless of work.');
+      app.quit();
+      return;
+    }
+    const now = Date.now();
+    if (now - lastBusyCheckAt >= BUSY_POLL_MS) {
+      lastBusyCheckAt = now;
+      busyNow = await backendBusy();
+    }
+    if (busyNow) return;
     clearInterval(watch);
-    console.log(`Buzzcaf Studio (pid ${STUDIO_PID}) is gone; quitting the headless BuzzEdit it started.`);
+    console.log(`Buzzcaf Studio (pid ${parentPid}) is gone and BuzzEdit is idle; quitting the headless BuzzEdit it started.`);
     app.quit();
   }, STUDIO_POLL_MS);
   watch.unref();

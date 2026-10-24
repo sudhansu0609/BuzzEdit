@@ -64,20 +64,26 @@ class AutoCutEditorRequest(BaseModel):
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     planner: Optional[str] = None      # "editor" | "classic": the default for every project
-    model: Optional[str] = None        # the editor's model: claude* | opus* | sonnet* | fable*
+    model: Optional[str] = None        # the Claude editor's model: claude* | opus* | sonnet* | fable*
     effort: Optional[str] = None       # "low" | "medium" | "high" | "xhigh" | "max"
+    provider: Optional[str] = None     # "local" | "claude": the editor tried first
+    local_model: Optional[str] = None  # the local editor's model (LM Studio id, or Ollama's name)
 
 
 @router.get("/auto_cut_editor")
 async def get_auto_cut_editor():
-    """Which planner cuts by default, and whether the AI editor has a proxy to call."""
+    """Which planner cuts by default, which editor is tried first, and what each one runs on."""
     from asr.auto_edit import choose_planner
-    from asr.editor import DEFAULT_BASE_URL, proxy_config
+    from asr.editor import DEFAULT_BASE_URL, editor_provider, local_config, proxy_config
     proxy = proxy_config()
     own = app_settings.get("auto_cut_editor") or {}
-    return {"planner": choose_planner(None), "model": proxy["model"], "effort": proxy["effort"],
+    local = local_config()
+    return {"planner": choose_planner(None), "provider": editor_provider(),
+            "model": proxy["model"], "effort": proxy["effort"],
             "base_url": proxy["base_url"] or DEFAULT_BASE_URL, "key_configured": bool(proxy["api_key"]),
-            "key_source": "app_settings" if own.get("api_key") else ("env" if proxy["api_key"] else None)}
+            "key_source": "app_settings" if own.get("api_key") else ("env" if proxy["api_key"] else None),
+            "local_model": local["model"], "local_backend": local["backend"],
+            "local_loaded": not local["load"]}
 
 
 @router.put("/auto_cut_editor")
@@ -99,6 +105,12 @@ async def put_auto_cut_editor(body: AutoCutEditorRequest):
         own["base_url"] = body.base_url
     if body.api_key is not None:
         own["api_key"] = body.api_key
+    if body.provider is not None:
+        if body.provider not in ("local", "claude"):
+            raise HTTPException(status_code=400, detail="provider must be 'local' or 'claude'")
+        own["provider"] = body.provider
+    if body.local_model is not None:
+        own["local_model"] = body.local_model.strip()
     app_settings.set("auto_cut_editor", own)
     if body.planner is not None:
         if body.planner not in ("editor", "classic"):

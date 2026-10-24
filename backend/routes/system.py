@@ -4,6 +4,7 @@ from utils.gpu_utils import get_gpu_info, clear_vram_cache
 from utils.ffmpeg_utils import run_ffprobe
 from config import FFMPEG_BIN, COMFYUI_URL, COMFYUI_INPUT_DIR, COMFYUI_OUTPUT_DIR
 from comfyui_bridge.client import ComfyUIClient
+from runtime.comfy_status import comfy_state_and_detail
 import shutil
 
 router = APIRouter()
@@ -28,10 +29,16 @@ async def system_paths_status():
     input_dir_exists = Path(COMFYUI_INPUT_DIR).exists()
     output_dir_exists = Path(COMFYUI_OUTPUT_DIR).exists()
 
+    comfy_state, comfy_detail = comfy_state_and_detail()
+    if comfy_state == "running" and not comfy_conn:
+        comfy_state = "down"
+
     return {
         "ffmpeg_available": ffmpeg_ok,
         "ffmpeg_bin": FFMPEG_BIN,
         "comfyui_connected": comfy_conn,
+        "comfyui_state": comfy_state,
+        "comfyui_detail": comfy_detail,
         "comfyui_url": COMFYUI_URL,
         "comfyui_input_dir": str(COMFYUI_INPUT_DIR),
         "comfyui_input_dir_exists": input_dir_exists,

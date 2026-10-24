@@ -208,6 +208,7 @@ export default function Workspace() {
               <span className="text-xs text-muted">Fumbles</span>
               <input
                 type="range" min={0} max={1} step={0.05}
+                aria-label="Fumbles"
                 value={aggressiveness}
                 onChange={(e) => handleAggressivenessChange(parseFloat(e.target.value))}
                 style={{ width: 90 }}
@@ -219,6 +220,7 @@ export default function Workspace() {
               <span className="text-xs text-muted">Pauses</span>
               <input
                 type="range" min={0.15} max={1.2} step={0.05}
+                aria-label="Pauses"
                 value={maxPause}
                 onChange={(e) => saveSetting('max_pause_seconds', parseFloat(e.target.value))}
                 style={{ width: 90 }}

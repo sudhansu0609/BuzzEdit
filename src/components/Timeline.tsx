@@ -1738,9 +1738,9 @@ export default function Timeline() {
         </div>
         <div style={{ display: 'flex', gap: 4 }}>
           <button className="btn btn-sm" disabled={!canUndo} onClick={() => undo()}
-            title={`Undo (${chordOf('edit.undo')})`}>↶</button>
+            title={`Undo (${chordOf('edit.undo')})`} aria-label={`Undo (${chordOf('edit.undo')})`}>↶</button>
           <button className="btn btn-sm" disabled={!canRedo} onClick={() => redo()}
-            title={`Redo (${chordOf('edit.redo')})`}>↷</button>
+            title={`Redo (${chordOf('edit.redo')})`} aria-label={`Redo (${chordOf('edit.redo')})`}>↷</button>
           <button className="btn btn-sm" disabled={busy || !canSplitNow} onClick={handleSplit}
             title={`Split at the playhead (${chordOf('edit.splitAtPlayhead')})`}>✂ Split</button>
           <button className="btn btn-sm" disabled={busy || !canDetach(detachTarget)} onClick={handleDetachAudio}
@@ -1769,7 +1769,8 @@ export default function Timeline() {
             ⇤ Ripple Delete
           </button>
           <button className={`btn btn-sm ${snap ? 'btn-toggle-on' : ''}`} onClick={toggleSnap}
-            title={`Snapping ${snap ? 'on' : 'off'} — clips snap to edges and the playhead (${chordOf('timeline.toggleSnap')})`}>
+            title={`Snapping ${snap ? 'on' : 'off'} — clips snap to edges and the playhead (${chordOf('timeline.toggleSnap')})`}
+            aria-label={`Snapping ${snap ? 'on' : 'off'} — clips snap to edges and the playhead (${chordOf('timeline.toggleSnap')})`}>
             🧲
           </button>
         </div>
@@ -1815,7 +1816,7 @@ export default function Timeline() {
         {notice && <span className="timeline-notice">{notice}</span>}
         <div className="timeline-follow" title="Keep the playhead in view while playing or scrubbing">
           <label className="text-xs text-muted">Follow:</label>
-          <select value={followMode} onChange={(e) => setFollowMode(e.target.value as FollowMode)}>
+          <select value={followMode} aria-label="Follow" onChange={(e) => setFollowMode(e.target.value as FollowMode)}>
             <option value="off">Off</option>
             <option value="left">Left</option>
             <option value="center">Center</option>
@@ -1823,10 +1824,10 @@ export default function Timeline() {
           </select>
         </div>
         <div className="timeline-zoom">
-          <button className="btn btn-sm" onClick={() => setZoom(Math.max(MIN_ZOOM, zoom - 0.2))}>-</button>
+          <button className="btn btn-sm" onClick={() => setZoom(Math.max(MIN_ZOOM, zoom - 0.2))} aria-label="Zoom out">-</button>
           <span className="text-xs text-muted">{Math.round(zoom * 100)}%</span>
-          <button className="btn btn-sm" onClick={() => setZoom(Math.min(MAX_ZOOM, zoom + 0.2))}>+</button>
-          <button className="btn btn-sm" onClick={zoomFit} title={`Zoom to fit (${chordOf('view.zoomFit')})`}>⤢</button>
+          <button className="btn btn-sm" onClick={() => setZoom(Math.min(MAX_ZOOM, zoom + 0.2))} aria-label="Zoom in">+</button>
+          <button className="btn btn-sm" onClick={zoomFit} title={`Zoom to fit (${chordOf('view.zoomFit')})`} aria-label={`Zoom to fit (${chordOf('view.zoomFit')})`}>⤢</button>
         </div>
         <div className="timeline-duration">{formatTime(durationSec)}</div>
       </div>
@@ -1858,24 +1859,28 @@ export default function Timeline() {
                 <div className="track-switches">
                   <button className={`track-sw ${state.hidden ? 'on' : ''}`}
                     title={state.hidden ? `${track} is hidden — click to show` : `Hide ${track}`}
+                    aria-label={state.hidden ? `${track} is hidden — click to show` : `Hide ${track}`}
                     onClick={(e) => { e.stopPropagation(); toggleTrack(track, 'hidden'); }}>
                     {state.hidden ? '🚫' : '👁'}
                   </button>
                   {trackKind(track) === 'A' && (
                     <button className={`track-sw ${state.muted ? 'on' : ''}`}
                       title={state.muted ? `${track} is muted — click to unmute` : `Mute ${track}`}
+                      aria-label={state.muted ? `${track} is muted — click to unmute` : `Mute ${track}`}
                       onClick={(e) => { e.stopPropagation(); toggleTrack(track, 'muted'); }}>
                       {state.muted ? '🔇' : '🔊'}
                     </button>
                   )}
                   <button className={`track-sw ${state.locked ? 'on' : ''}`}
                     title={state.locked ? `${track} is locked — click to unlock` : `Lock ${track}`}
+                    aria-label={state.locked ? `${track} is locked — click to unlock` : `Lock ${track}`}
                     onClick={(e) => { e.stopPropagation(); toggleTrack(track, 'locked'); }}>
                     {state.locked ? '🔒' : '🔓'}
                   </button>
                   {track.toUpperCase() !== 'CAP' && (
                     <button className="track-sw"
                       title={trackKind(track) === 'T' ? `Add text to ${track}` : `Add media to ${track}`}
+                      aria-label={trackKind(track) === 'T' ? `Add text to ${track}` : `Add media to ${track}`}
                       onClick={(e) => {
                         e.stopPropagation();
                         trackKind(track) === 'T' ? handleAddText(track) : handleAddMedia(track);
@@ -1883,6 +1888,7 @@ export default function Timeline() {
                   )}
                   <button className="track-sw danger"
                     title={`Delete ${track} and everything on it`}
+                    aria-label={`Delete ${track} and everything on it`}
                     onClick={(e) => { e.stopPropagation(); handleDeleteTrack(track); }}>🗑</button>
                 </div>
               </div>
@@ -2095,7 +2101,7 @@ export default function Timeline() {
         <div className="timeline-dialog-backdrop" onMouseDown={() => setRename(null)}>
           <div className="timeline-dialog" onMouseDown={(e) => e.stopPropagation()}>
             <div className="timeline-dialog-title">Rename clip</div>
-            <input autoFocus value={rename.value}
+            <input autoFocus aria-label="Rename clip" value={rename.value}
               onChange={(e) => setRename({ ...rename, value: e.target.value })}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') submitRename();

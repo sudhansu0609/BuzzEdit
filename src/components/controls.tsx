@@ -44,7 +44,7 @@ export function Slider({ label, value, min, max, step = 0.01, onChange, format, 
 }) {
   return (
     <Row label={label} hint={hint}>
-      <input type="range" min={min} max={max} step={step} value={value}
+      <input type="range" aria-label={label} min={min} max={max} step={step} value={value}
         onChange={(e) => onChange(parseFloat(e.target.value))} />
       <span className="insp-value">{format ? format(value) : value.toFixed(2)}</span>
     </Row>
@@ -58,10 +58,10 @@ export function ColorField({ label, value, onChange, allowAlpha = true }: {
   const alpha = alphaOf(value);
   return (
     <Row label={label}>
-      <input type="color" value={hex} onChange={(e) => onChange(composeColor(e.target.value, alpha))} />
+      <input type="color" aria-label={label} value={hex} onChange={(e) => onChange(composeColor(e.target.value, alpha))} />
       {allowAlpha && (
         <>
-          <input type="range" min={0} max={1} step={0.05} value={alpha}
+          <input type="range" aria-label={`${label} opacity`} min={0} max={1} step={0.05} value={alpha}
             onChange={(e) => onChange(composeColor(hex, parseFloat(e.target.value)))} />
           <span className="insp-value">{Math.round(alpha * 100)}%</span>
         </>

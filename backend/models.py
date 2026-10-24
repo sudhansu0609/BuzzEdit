@@ -185,4 +185,13 @@ class HealthResponse(BaseModel):
 
     whisper_available: bool = False
     comfyui_connected: bool = False
+    # electron/main.cjs's own view of ComfyUI (starting/running/repairing/down/
+    # repair_failed) and a short reason, read from data/comfy_status.json. None
+    # when that file is missing or unreadable -- comfyui_connected alone still
+    # answers the question for everyone who does not care why.
+    comfyui_state: Optional[str] = None
+    comfyui_detail: Optional[str] = None
     ffmpeg_available: bool = False
+    # The source changed under this process; it restarts itself at the next idle
+    # moment (runtime/code_reload.py). A caller about to start work waits for that.
+    reload_pending: bool = False

@@ -173,6 +173,7 @@ export default function JobQueue() {
               value={jobType}
               onChange={(e: any) => setJobType(e.target.value)}
               title="A presentation pass generates B-roll, zooms, pop-ups and captions. A full edit just cuts and renders."
+              aria-label="Job type"
               style={{ padding: '8px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}
             >
               <option value="presentation">🎬 Presentation pass</option>
@@ -181,6 +182,7 @@ export default function JobQueue() {
             <select
               value={selectedPriority}
               onChange={(e: any) => setSelectedPriority(e.target.value)}
+              aria-label="Priority"
               style={{ padding: '8px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}
             >
               <option value="urgent">🔥 Urgent Priority</option>
@@ -192,6 +194,7 @@ export default function JobQueue() {
               Start at
               <input
                 type="time"
+                aria-label="Start at"
                 value={startAt}
                 onChange={(e) => setStartAt(e.target.value)}
                 style={{ padding: '7px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}
@@ -224,6 +227,7 @@ export default function JobQueue() {
                 <label key={key} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                   <input
                     type="checkbox"
+                    aria-label={label}
                     checked={passOptions[key]}
                     onChange={(e) => setPassOptions(o => ({ ...o, [key]: e.target.checked }))}
                   />
@@ -257,6 +261,7 @@ export default function JobQueue() {
                       <span style={{ minWidth: 120 }}>{label}</span>
                       <select
                         value={current}
+                        aria-label={label}
                         disabled={savingRole === role}
                         onChange={(e) => handlePickWorkflow(role, e.target.value)}
                         style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}
@@ -300,7 +305,7 @@ export default function JobQueue() {
                     {job.status}
                   </span>
                   {job.status === 'pending' && (
-                    <button className="btn btn-sm btn-danger" style={{ padding: '2px 6px' }} onClick={() => handleCancel(job.id)}>✕</button>
+                    <button className="btn btn-sm btn-danger" style={{ padding: '2px 6px' }} aria-label={`Cancel ${job.project_id}`} onClick={() => handleCancel(job.id)}>✕</button>
                   )}
                 </div>
               </div>

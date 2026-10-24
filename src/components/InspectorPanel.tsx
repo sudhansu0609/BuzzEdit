@@ -108,6 +108,7 @@ function Wheel({ label, value, onChange, hint }: {
           <span className="insp-label">{c.name}</span>
           <div className="insp-control">
             <input type="range" min={-1} max={1} step={0.01} value={value[c.key]}
+              aria-label={`${label} ${c.name}`}
               onChange={(e) => onChange({ [c.key]: parseFloat(e.target.value) } as Partial<ColorWheel>)} />
             <span className="insp-value">{value[c.key].toFixed(2)}</span>
           </div>
@@ -527,6 +528,7 @@ export default function InspectorPanel() {
         <Section title="Text">
           <textarea className="insp-textarea" rows={3}
             value={draftContent ?? item.text?.content ?? ''}
+            aria-label="Text content"
             onChange={(e) => {
               const next = e.target.value;
               setDraftContent(next);
@@ -537,6 +539,7 @@ export default function InspectorPanel() {
 
           <Row label="Font">
             <select value={style.font_family}
+              aria-label="Font"
               onChange={(e) => patchStyle({ font_family: e.target.value, font_file: null })}>
               {fonts.length === 0 && <option>{style.font_family}</option>}
               {fonts.map((f) => <option key={f.family} value={f.family}>{f.family}</option>)}
@@ -547,7 +550,7 @@ export default function InspectorPanel() {
               onClick={() => patchStyle({ bold: !style.bold })}><b>B</b></button>
             <button className={`btn btn-xs ${style.italic ? 'btn-primary' : ''}`}
               onClick={() => patchStyle({ italic: !style.italic })}><i>I</i></button>
-            <select value={style.align} onChange={(e) => patchStyle({ align: e.target.value as any })}>
+            <select value={style.align} aria-label="Text alignment" onChange={(e) => patchStyle({ align: e.target.value as any })}>
               <option value="left">Left</option>
               <option value="center">Center</option>
               <option value="right">Right</option>
@@ -573,7 +576,7 @@ export default function InspectorPanel() {
               onChange={(v) => patchStyle({ shadow_color: v })} />
           )}
           <Row label="Background">
-            <input type="checkbox" checked={style.box} onChange={(e) => patchStyle({ box: e.target.checked })} />
+            <input type="checkbox" checked={style.box} aria-label="Box behind text" onChange={(e) => patchStyle({ box: e.target.checked })} />
             <span className="text-xs text-muted">Box behind text</span>
           </Row>
           {style.box && (
@@ -590,7 +593,7 @@ export default function InspectorPanel() {
           <Slider label="Line spacing" value={style.line_spacing} min={0} max={60} step={1}
             onChange={(v) => patchStyle({ line_spacing: Math.round(v) })} format={(v) => `${Math.round(v)}`} />
           <Row label="Animation">
-            <select value={style.animation} onChange={(e) => patchStyle({ animation: e.target.value as any })}>
+            <select value={style.animation} aria-label="Animation" onChange={(e) => patchStyle({ animation: e.target.value as any })}>
               <option value="none">None</option>
               <option value="fade">Fade</option>
               <option value="pop">Pop</option>
@@ -622,6 +625,7 @@ export default function InspectorPanel() {
             hint="1.0 fills the frame. Below 1 shrinks with black bars." />
           <Row label="Animate zoom" hint="Ken Burns: the clip moves from the zoom above to the one below.">
             <input type="checkbox" checked={animatedZoom}
+              aria-label="Animate zoom"
               onChange={(e) => patchTransform({ scale_end: e.target.checked ? transform.scale * 1.2 : null })} />
             <span className="text-xs text-muted">{animatedZoom ? 'on' : 'off'}</span>
           </Row>
@@ -636,6 +640,7 @@ export default function InspectorPanel() {
             onChange={(v) => patchTransform({ pos_y: v })} />
           <Row label="Animate pan">
             <input type="checkbox" checked={animatedPan}
+              aria-label="Animate pan"
               onChange={(e) => patchTransform({
                 pos_x_end: e.target.checked ? transform.pos_x + 0.3 : null,
                 pos_y_end: e.target.checked ? transform.pos_y : null,
@@ -744,7 +749,7 @@ export default function InspectorPanel() {
               if (picked) patchColor({ lut_file: picked });
             }}>Load…</button>
             {color.lut_file && (
-              <button className="btn btn-xs" onClick={() => patchColor({ lut_file: null })}>✕</button>
+              <button className="btn btn-xs" aria-label="Clear LUT" onClick={() => patchColor({ lut_file: null })}>✕</button>
             )}
           </Row>
           <Slider label="Denoise" value={color.denoise} min={0} max={1}
@@ -788,6 +793,7 @@ export default function InspectorPanel() {
                 onChange={(v) => patchChroma({ color: v })} />
               <Row label="Keying" hint="Chroma keys on hue, which tolerates a screen that is lit unevenly. Colour keys on RGB distance — right for a flat graphic, wrong for a screen.">
                 <select value={chroma.key_type}
+                  aria-label="Keying"
                   onChange={(e) => patchChroma({ key_type: e.target.value as 'chroma' | 'color' })}>
                   <option value="chroma">Chroma (lit screen)</option>
                   <option value="color">Colour (flat graphic)</option>
@@ -819,6 +825,7 @@ export default function InspectorPanel() {
                 <span className="insp-label">Show matte</span>
                 <div className="insp-control">
                   <input type="checkbox" checked={chroma.show_matte}
+                    aria-label="Show matte"
                     onChange={(e) => patchChroma({ show_matte: e.target.checked })} />
                   <span className="insp-value">{chroma.show_matte ? 'matte' : 'picture'}</span>
                 </div>
@@ -860,12 +867,14 @@ export default function InspectorPanel() {
                 hint="How hard the A1 voice pushes this down while somebody is speaking." />
               <Row label="Loop">
                 <input type="checkbox" checked={clipAudio.loop}
+                  aria-label="Loop"
                   onChange={(e) => patchClipAudio({ loop: e.target.checked })} />
               </Row>
             </>
           )}
           <Row label="Mute">
             <input type="checkbox" checked={clipAudio.mute}
+              aria-label="Mute"
               onChange={(e) => patchClipAudio({ mute: e.target.checked })} />
           </Row>
           {isA1Clip && (
@@ -889,6 +898,7 @@ export default function InspectorPanel() {
           />
           <Row label="Clean / Enhance">
             <select value={master.voice_enhance}
+              aria-label="Clean / Enhance"
               onChange={(e) => patchMaster({ voice_enhance: e.target.value })}>
               {audioCatalogue.enhance_modes.length === 0 && <option>{master.voice_enhance}</option>}
               {audioCatalogue.enhance_modes.map((m) => <option key={m} value={m}>{m}</option>)}
@@ -902,6 +912,7 @@ export default function InspectorPanel() {
             onChange={(v) => patchMaster({ voice_compress: v })} format={(v) => `${Math.round(v * 100)}%`} />
           <Row label="EQ preset">
             <select value={master.voice_eq_preset}
+              aria-label="EQ preset"
               onChange={(e) => patchMaster({ voice_eq_preset: e.target.value })}>
               <option value="">None</option>
               {audioCatalogue.eq_presets.map((p) => <option key={p} value={p}>{p}</option>)}
@@ -911,6 +922,7 @@ export default function InspectorPanel() {
             onChange={(v) => patchMaster({ voice_saturation: v })} format={(v) => `${Math.round(v * 100)}%`} />
           <Row label="Reverb">
             <select value={master.voice_reverb}
+              aria-label="Reverb"
               onChange={(e) => patchMaster({ voice_reverb: e.target.value })}>
               <option value="">None</option>
               {audioCatalogue.reverbs.map((r) => <option key={r} value={r}>{r}</option>)}
@@ -918,6 +930,7 @@ export default function InspectorPanel() {
           </Row>
           <Row label="Normalise">
             <input type="checkbox" checked={master.loudness_lufs != null}
+              aria-label="Normalise"
               onChange={(e) => patchMaster({ loudness_lufs: e.target.checked ? (master.loudness_lufs ?? -14) : null })} />
           </Row>
           {master.loudness_lufs != null && (
@@ -956,6 +969,7 @@ export default function InspectorPanel() {
         <Row label="More">
           <select
             value={activeTransition?.type ?? ''}
+            aria-label="More"
             onChange={(e) => projectId && run(() => setTransition(
               projectId, item && !isText && !isAdjustment ? selectedClipId : null,
               { updates: { type: e.target.value, duration: activeTransition?.duration ?? 0.5 } }))}>
@@ -1001,11 +1015,12 @@ export default function InspectorPanel() {
                 </span>
                 <label className="text-xs text-muted" style={{ display: 'flex', gap: 4 }}>
                   <input type="checkbox" checked={effect.enabled}
+                    aria-label={`Enable ${effect.type.replace(/_/g, ' ')}`}
                     onChange={(e) => projectId && run(() =>
                       updateEffect(projectId, index, { enabled: e.target.checked }, effectOwner))} />
                   on
                 </label>
-                <button className="btn btn-xs btn-danger" title="Remove"
+                <button className="btn btn-xs btn-danger" title="Remove" aria-label="Remove"
                   onClick={() => projectId && run(() => removeEffect(projectId, index, effectOwner))}>✕</button>
               </div>
               <Slider label="Amount" value={effect.intensity} min={0} max={1}
@@ -1025,6 +1040,7 @@ export default function InspectorPanel() {
               {hasText && (
                 <Row label="Text">
                   <input type="text" key={`text-${index}`} defaultValue={extra.text}
+                    aria-label={`Text for ${effect.type.replace(/_/g, ' ')}`}
                     onBlur={(e) => {
                       const v = e.target.value;
                       if (v !== extra.text && projectId) run(() =>
@@ -1093,10 +1109,10 @@ export default function InspectorPanel() {
         {styles.length > 0 && (
           <>
             <Row label="Style">
-              <select value={styleId} onChange={(e) => { setStyleId(e.target.value); setStyleReport(null); }}>
+              <select value={styleId} aria-label="Reference style" onChange={(e) => { setStyleId(e.target.value); setStyleReport(null); }}>
                 {styles.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
-              <button className="btn btn-xs btn-danger" title="Delete this style"
+              <button className="btn btn-xs btn-danger" title="Delete this style" aria-label="Delete this style"
                 disabled={busy || !styleId}
                 onClick={async () => {
                   await deleteStyleProfile(styleId).catch(() => {});
@@ -1144,7 +1160,7 @@ export default function InspectorPanel() {
 
       <Section title="Captions" defaultOpen={!item}>
         <Row label="Style">
-          <select value={captionPreset} onChange={(e) => setCaptionPreset(e.target.value)}>
+          <select value={captionPreset} aria-label="Caption style" onChange={(e) => setCaptionPreset(e.target.value)}>
             {(presets?.caption ?? []).map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
           </select>
         </Row>
@@ -1163,15 +1179,15 @@ export default function InspectorPanel() {
 
       <Section title="Intro" defaultOpen={false}>
         <Row label="Preset">
-          <select value={introPreset} onChange={(e) => setIntroPreset(e.target.value)}>
+          <select value={introPreset} aria-label="Intro preset" onChange={(e) => setIntroPreset(e.target.value)}>
             {(presets?.intro ?? []).map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
           </select>
         </Row>
         <Row label="Title">
-          <input type="text" value={introTitle} onChange={(e) => setIntroTitle(e.target.value)} />
+          <input type="text" value={introTitle} aria-label="Intro title" onChange={(e) => setIntroTitle(e.target.value)} />
         </Row>
         <Row label="Subtitle">
-          <input type="text" value={introSubtitle} onChange={(e) => setIntroSubtitle(e.target.value)} />
+          <input type="text" value={introSubtitle} aria-label="Intro subtitle" onChange={(e) => setIntroSubtitle(e.target.value)} />
         </Row>
         <div className="insp-actions">
           <button className="btn btn-sm btn-primary" disabled={busy || !projectId}

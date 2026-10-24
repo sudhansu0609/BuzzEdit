@@ -104,3 +104,22 @@ def test_a_long_topic_keeps_its_conclusion_and_ends_on_a_sentence():
     assert end == pytest.approx(89.8 + 0.3, abs=0.01)
     # Trimmed from the front, at a sentence start (a multiple of 10 s).
     assert round(start + 0.1) % 10 == 0
+
+
+def test_a_short_is_planned_on_the_portrait_canvas_from_the_start():
+    # 2026-10-21: a Short dressed landscape and reframed at the end had its
+    # pictures generated 16:9 and cropped to a third; the programme now moves
+    # to the 9:16 canvas before anything is placed, and follows the face later.
+    timeline = _timeline()
+    program = build_program(timeline)
+    portrait = shorts.plan_portrait(timeline)
+    assert shorts.is_portrait(portrait) and (portrait.width, portrait.height) == (1080, 1920)
+    first = program.segments[0].item_id
+    v1 = next(i for i in portrait.items if i.id == first)
+    assert v1.transform.scale == pytest.approx(shorts.cover_scale(1920, 1080, 1080, 1920))
+    assert v1.transform.pos_x == 0.0                      # centred until the faces are known
+    assert shorts.follow_faces(portrait, {first: (0.3, -0.1)}) == 1
+    v1 = next(i for i in portrait.items if i.id == first)
+    assert v1.transform.pos_x == pytest.approx(shorts.face_pos_x((0.3, -0.1)))
+    assert shorts.follow_faces(timeline, {first: (0.3, -0.1)}) == 0   # a landscape programme is left alone
+    assert shorts.plan_portrait(portrait).width == 1080               # already portrait: unchanged

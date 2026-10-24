@@ -18,10 +18,13 @@ otherwise restart its animation there. Programme-wide atmosphere effects are
 the exception; they are noise and simply continue with a new seed.
 """
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import shutil
-import tempfile
+import sys
+import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -46,6 +49,28 @@ MIN_PROGRAMME_S = 90.0
 # Parallel chunk renders: NVENC on consumer cards allows 8 sessions; each ffmpeg
 # also runs its own filter threads, so a few at once fills a 28-thread CPU.
 MAX_WORKERS = 4
+# A chunk this many times over the target is worth a log line naming what
+# blocked it -- there is no settings system in this backend for render
+# internals (every other constant here is a plain module constant too), so
+# this is the override point for the next person who needs one.
+_LONG_CHUNK_FACTOR = 3.0
+
+# How long an ffmpeg chunk may go with neither playback progress (`out_time_ms`)
+# nor its own output file growing before `_follow` kills it. Overridable like
+# any other BUZZEDIT_* knob (see config.py); no settings store exists for the
+# render internals to read instead.
+STALL_SECONDS = float(os.environ.get("BUZZEDIT_CHUNK_STALL_S", "600"))
+# How often the stall watchdog samples progress/output size.
+_STALL_POLL_S = 5.0
+# A chunk is retried this many times (alone, after everything else running
+# finishes) before render_chunked gives up and raises.
+MAX_CHUNK_RETRIES = 2
+# chunks_* work directories older than this are swept at the start of a run.
+_WORK_DIR_MAX_AGE_DAYS = 3.0
+
+
+class ChunkStalledError(RuntimeError):
+    """A chunk's ffmpeg made no progress for STALL_SECONDS and was killed."""
 
 
 # Peak memory of one chunk's ffmpeg at 1080p, measured on a 14-minute episode
@@ -94,8 +119,34 @@ def _visual(item: TimelineItem) -> bool:
 
 
 def _splittable(item: TimelineItem) -> bool:
-    return (item.kind == "media" and item.track == "V1" and not item.children
-            and (item.transform is None or item.transform.is_identity()))
+    """Whether a chunk boundary may cut through this item's own stream.
+
+    True for:
+      * a `media` item on any visual track with no children, since its only
+        time-dependent behaviour is its own transform animation (Ken Burns)
+        and/or colour fades -- `sub_timeline` re-anchors both across the cut
+        (`Transform.anim_total_frames`/`anim_offset_frames`, and the fade
+        split rule: the left piece keeps fade_in, the right keeps fade_out).
+      * an `adjustment` item (kind == "adjustment") with no children, for the
+        same reason -- `_apply_adjustment` windows its transform/colour the
+        same way a media item's own chain does.
+
+    False for anything else with time-dependent behaviour this module cannot
+    re-anchor: a `transition` (only ever meaningful on a V1 junction, and the
+    existing ±1s edge guard below is what protects it), `children` (a
+    compound moves and trims as one block), or an `effects`/animated
+    `atmosphere` list (named effects and generated overlays, neither
+    describable as a simple before/after split).
+    """
+    if item.children or item.transition is not None or item.effects:
+        return False
+    if any(e.enabled for e in item.atmosphere):
+        return False
+    return item.kind == "adjustment" or (item.kind == "media" and _visual(item))
+
+
+def _fade_frames(seconds: float, fps: float) -> int:
+    return max(0, int(round(seconds * fps)))
 
 
 def plan_chunks(timeline: Timeline, target_s: float = CHUNK_TARGET_S
@@ -106,6 +157,10 @@ def plan_chunks(timeline: Timeline, target_s: float = CHUNK_TARGET_S
     if total <= 0:
         return []
     blocked = bytearray(total + 1)
+    # (lo, hi, label) for every unsplittable item's interior -- the usual
+    # cause of a chunk that cannot shrink to the target; kept so an oversize
+    # chunk can be explained in the log rather than just measured.
+    blockers: List[Tuple[int, int, str]] = []
 
     def block(lo: int, hi: int) -> None:
         for f in range(max(0, lo), min(total, hi) + 1):
@@ -119,8 +174,24 @@ def plan_chunks(timeline: Timeline, target_s: float = CHUNK_TARGET_S
         if _splittable(item):
             block(s - guard, s + guard)
             block(e - guard, e + guard)
+            # A cut inside a fade region cannot be split by the plain
+            # keep-this-side/drop-that-side rule sub_timeline uses, so the
+            # fade's own span -- on whichever side(s) it is set -- stays whole.
+            fi = _fade_frames(item.color.fade_in, fps) if item.color else 0
+            fo = _fade_frames(item.color.fade_out, fps) if item.color else 0
+            if fi > 0:
+                block(s, s + fi - 1)
+            if fo > 0:
+                block(e - fo + 1, e)
+            afi = _fade_frames(item.audio_fade_in, fps)
+            afo = _fade_frames(item.audio_fade_out, fps)
+            if afi > 0:
+                block(s, s + afi - 1)
+            if afo > 0:
+                block(e - afo + 1, e)
         else:
             block(s + 1, e - 1)
+            blockers.append((s, e, f"{item.track}:{item.id} ({item.kind})"))
     # The intro pad and cold open belong to the first chunk.
     block(0, max(timeline.program_offset_frames, timeline.cold_open_frames) + guard)
 
@@ -144,6 +215,16 @@ def plan_chunks(timeline: Timeline, target_s: float = CHUNK_TARGET_S
         chunks.append((a, cut))
         a = cut
     chunks.append((a, total))
+
+    limit = target_s * _LONG_CHUNK_FACTOR
+    for a, b in chunks:
+        length_s = (b - a) / fps
+        if length_s <= limit:
+            continue
+        names = sorted({name for lo, hi, name in blockers if lo < b and hi > a})
+        logger.warning(
+            "Chunked render: a %.0fs chunk is %.1fx the %.0fs target -- blocked by: %s",
+            length_s, length_s / target_s, target_s, ", ".join(names) or "(nothing recorded)")
     return chunks
 
 
@@ -161,8 +242,29 @@ def sub_timeline(timeline: Timeline, a: int, b: int) -> Timeline:
             if not _splittable(item):
                 raise ValueError(f"item {item.id} on {item.track} crosses a chunk boundary")
             cut_s, cut_e = max(s, a), min(e, b)
-            item.source_start_frame += cut_s - s
-            item.source_end_frame -= e - cut_e
+            if item.kind != "adjustment":
+                item.source_start_frame += cut_s - s
+                item.source_end_frame -= e - cut_e
+            left_trimmed, right_trimmed = cut_s > s, cut_e < e
+            if item.transform is not None and item.transform.is_animated():
+                t = item.transform
+                if t.anim_total_frames is None:
+                    t.anim_total_frames = e - s
+                t.anim_offset_frames = (t.anim_offset_frames or 0) + (cut_s - s)
+            if item.color is not None:
+                # The left piece (keeps the original start) keeps fade_in and
+                # drops fade_out; the right piece (keeps the original end)
+                # keeps fade_out and drops fade_in. A piece that is neither
+                # (both trimmed) drops both -- plan_chunks never cuts inside
+                # either fade's own span, so this never clips one short.
+                if left_trimmed:
+                    item.color.fade_in = 0.0
+                if right_trimmed:
+                    item.color.fade_out = 0.0
+            if left_trimmed:
+                item.audio_fade_in = 0.0
+            if right_trimmed:
+                item.audio_fade_out = 0.0
             s, e = cut_s, cut_e
         item.timeline_start_frame, item.timeline_end_frame = s - a, e - a
         items.append(item)
@@ -180,24 +282,58 @@ def sub_timeline(timeline: Timeline, a: int, b: int) -> Timeline:
     return copy
 
 
-async def _run(cmd: List[str], on_progress: Optional[Callable[[float], None]] = None) -> None:
+async def _run(cmd: List[str], on_progress: Optional[Callable[[float], None]] = None,
+               output_path: Optional[Path] = None) -> None:
     with fit_command(cmd) as (cmd, cwd):
-        await _run_fitted(cmd, cwd, on_progress)
+        await _run_fitted(cmd, cwd, on_progress, output_path)
 
 
 async def _run_fitted(cmd: List[str], cwd: Optional[str],
-                      on_progress: Optional[Callable[[float], None]]) -> None:
+                      on_progress: Optional[Callable[[float], None]],
+                      output_path: Optional[Path] = None) -> None:
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=cwd, creationflags=NO_WINDOW)
     # Not the first thing Sentinel kills under memory pressure.
     with sentinel_priority.ffmpeg(proc.pid):
-        await _follow(proc, on_progress)
+        await _follow(proc, on_progress, output_path)
+
+
+async def _kill_tree(proc: "asyncio.subprocess.Process") -> None:
+    """Kill `proc` and anything it spawned. ffmpeg is a leaf process on every
+    platform this ships on, but `/T` still catches a wrapper in front of it."""
+    try:
+        if sys.platform == "win32":
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/T", "/F", "/PID", str(proc.pid),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                creationflags=NO_WINDOW)
+            await killer.wait()
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+    except Exception as e:
+        logger.debug("Killing stalled ffmpeg (pid %s) failed (%s); trying proc.kill()", proc.pid, e)
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
 
 async def _follow(proc: "asyncio.subprocess.Process",
-                  on_progress: Optional[Callable[[float], None]]) -> None:
+                  on_progress: Optional[Callable[[float], None]],
+                  output_path: Optional[Path] = None) -> None:
     tail: List[bytes] = []
+    loop = asyncio.get_event_loop()
+    state = {"sec": None, "changed": loop.time(), "stalled": False}
+
+    def progress(sec: float) -> None:
+        if state["sec"] is None or sec > state["sec"]:
+            state["changed"] = loop.time()
+        state["sec"] = sec
+        if on_progress:
+            on_progress(sec)
 
     async def drain() -> None:
         while True:
@@ -207,29 +343,95 @@ async def _follow(proc: "asyncio.subprocess.Process",
             tail.append(chunk)
             del tail[:-8]
 
+    async def watchdog() -> None:
+        """Kill ffmpeg if neither its reported progress nor its output file's
+        size has moved for STALL_SECONDS -- the 578s chunk of the 25eff765
+        incident ran at 0.05x realtime on one thread with _follow having no
+        timeout at all, so nothing noticed it had effectively hung."""
+        last_size = -1
+        while True:
+            await asyncio.sleep(min(_STALL_POLL_S, max(0.1, STALL_SECONDS)))
+            size = -1
+            if output_path is not None:
+                try:
+                    size = os.path.getsize(output_path)
+                except OSError:
+                    size = -1
+            if size != last_size:
+                last_size = size
+                state["changed"] = loop.time()
+            if loop.time() - state["changed"] >= STALL_SECONDS:
+                state["stalled"] = True
+                logger.warning("ffmpeg stalled (no progress for %.0fs): killing pid %s (%s)",
+                               STALL_SECONDS, proc.pid, output_path)
+                await _kill_tree(proc)
+                return
+
     drainer = asyncio.create_task(drain())
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            break
-        text = line.decode("utf-8", "ignore").strip()
-        if on_progress and text.startswith("out_time_ms="):
-            try:
-                on_progress(int(text.split("=", 1)[1]) / 1_000_000.0)
-            except ValueError:
-                pass
-    await drainer
+    watcher = asyncio.create_task(watchdog())
+    try:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", "ignore").strip()
+            if text.startswith("out_time_ms="):
+                try:
+                    progress(int(text.split("=", 1)[1]) / 1_000_000.0)
+                except ValueError:
+                    pass
+    finally:
+        # Cancel before awaiting the drainer: a killed process closes its
+        # pipes and lets drain() finish on its own, but the watchdog's own
+        # sleep would otherwise outlive this chunk and keep the task alive.
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+    try:
+        await asyncio.wait_for(drainer, timeout=30)
+    except asyncio.TimeoutError:
+        logger.warning("ffmpeg stderr drain did not finish within 30s (pid %s)", proc.pid)
+        drainer.cancel()
     await proc.wait()
+    if state["stalled"]:
+        raise ChunkStalledError(f"ffmpeg made no progress for {STALL_SECONDS:.0f}s and was killed")
     if proc.returncode != 0:
         from render.runner import summarize_ffmpeg_error
         raise RuntimeError(f"ffmpeg exit {proc.returncode}: "
                            f"{summarize_ffmpeg_error(b''.join(tail).decode('utf-8', 'ignore'))}")
 
 
-def _script(graph: str, directory: Path, name: str) -> str:
-    path = directory / name
-    path.write_text(graph, encoding="utf-8")
-    return str(path)
+def _work_dir_hash(timeline: Timeline, canvas: Optional[Tuple[int, int]],
+                    target: Optional[Tuple[int, int]], video_flags: List[str]) -> str:
+    """A stable name for this render's work directory, so a restarted job finds
+    the same chunks it already rendered rather than starting over in a fresh
+    tempdir -- `tempfile.mkdtemp`'s random suffix used to make resume impossible."""
+    payload = {
+        "timeline": timeline.model_dump(mode="json"),
+        "canvas": list(canvas) if canvas else None,
+        "target": list(target) if target else None,
+        "video_flags": video_flags,
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha1(blob).hexdigest()[:12]
+
+
+def _cleanup_old_work_dirs(max_age_days: float = _WORK_DIR_MAX_AGE_DAYS) -> None:
+    """Sweep chunks_* work directories left behind by a job that never
+    finished (or whose output was never re-requested) and is unlikely to be
+    resumed any more."""
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        for entry in Path(TEMP_DIR).glob("chunks_*"):
+            try:
+                if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 async def render_chunked(
@@ -255,7 +457,8 @@ async def render_chunked(
     logger.info("Chunked render: %d chunks (%s s)", len(chunks),
                 ", ".join(f"{(b - a) / fps:.0f}" for a, b in chunks))
 
-    work = Path(tempfile.mkdtemp(prefix="chunks_", dir=str(TEMP_DIR)))
+    _cleanup_old_work_dirs()
+
     encoder = [f for f in get_encoder_flags(prefer_nvenc=prefer_nvenc)]
     # Video only per chunk; the audio flags and faststart belong to the final mux.
     video_flags: List[str] = []
@@ -268,6 +471,12 @@ async def render_chunked(
             skip = 1
             continue
         video_flags.append(flag)
+
+    # A deterministic directory name (rather than tempfile.mkdtemp's random
+    # suffix) so a job restarted after a crash or a Sentinel kill finds the
+    # chunks it already finished instead of re-rendering the whole programme.
+    work = Path(TEMP_DIR) / f"chunks_{_work_dir_hash(timeline, canvas, target, video_flags)}"
+    work.mkdir(parents=True, exist_ok=True)
 
     done_s: Dict[int, float] = {}
 
@@ -289,46 +498,94 @@ async def render_chunked(
         inputs, graph, (final_v,) = prune_inputs(inputs, graph, final_v)
         out = work / f"chunk_{index:03d}.mp4"
         frames = b - a
+
+        graph_path = work / f"graph_{index:03d}.txt"
+        done_marker = work / f"chunk_{index:03d}.done"
+        previous_graph = graph_path.read_text(encoding="utf-8") if graph_path.exists() else None
+        if done_marker.exists() and out.exists() and previous_graph == graph:
+            logger.info("Chunked render: chunk %d already rendered, resuming", index)
+            done_s[index] = frames / fps
+            report()
+            return out
+
+        graph_path.write_text(graph, encoding="utf-8")
+        part_out = work / f"chunk_{index:03d}.part.mp4"
         cmd = ["ffmpeg", "-y", "-hide_banner", *inputs,
-               "-filter_complex_script", _script(graph, work, f"graph_{index:03d}.txt"),
+               "-filter_complex_script", str(graph_path),
                "-map", final_v, *video_flags, "-an",
                "-r", f"{fps:.5f}", "-fps_mode", "cfr", "-frames:v", str(frames),
-               "-progress", "pipe:1", str(out)]
+               "-progress", "pipe:1", str(part_out)]
 
         def on_progress(sec: float) -> None:
             done_s[index] = min(sec, frames / fps)
             report()
 
-        await _run(cmd, on_progress)
+        await _run(cmd, on_progress, output_path=part_out)
+        os.replace(part_out, out)
+        done_marker.write_text("", encoding="utf-8")
         done_s[index] = frames / fps
         report()
         return out
 
     if workers is None:
         workers = parallel_chunks(canvas or FilterGraphCompiler(timeline)._canvas_size())
+    workers = max(1, workers)
     logger.info("Chunked render: %d at a time", workers)
-    gate = asyncio.Semaphore(max(1, workers))
+    gate = asyncio.Semaphore(workers)
 
     async def bounded(index: int, a: int, b: int) -> Path:
         async with gate:
-            return await render_one(index, a, b)
+            try:
+                return await render_one(index, a, b)
+            except (RuntimeError, ChunkStalledError) as e:
+                last_exc: Exception = e
+        # The first attempt ran alongside whatever else was in flight and
+        # failed (a bad exit or the stall watchdog). Retry alone: claim every
+        # permit so nothing else is competing for the same CPU/NVENC session
+        # while this one gets another try -- an 8.2 GB chunk thrashing memory
+        # next to three others is exactly how the 25eff765 incident's single
+        # overgrown chunk took 40 minutes in the first place.
+        for attempt in range(1, MAX_CHUNK_RETRIES + 1):
+            logger.warning("Chunked render: chunk %d failed (attempt %d/%d): %s; retrying alone",
+                           index, attempt, MAX_CHUNK_RETRIES + 1, last_exc)
+            held = 0
+            try:
+                for _ in range(workers):
+                    await gate.acquire()
+                    held += 1
+                return await render_one(index, a, b)
+            except (RuntimeError, ChunkStalledError) as e:
+                last_exc = e
+            finally:
+                for _ in range(held):
+                    gate.release()
+        raise last_exc
 
+    audio_task = asyncio.create_task(_render_audio(timeline, work))
     try:
-        audio_task = asyncio.create_task(_render_audio(timeline, work))
         parts = await asyncio.gather(*(bounded(i, a, b) for i, (a, b) in enumerate(chunks)))
         audio = await audio_task
+    except Exception:
+        audio_task.cancel()
+        logger.warning("Chunked render failed; keeping %s for a resume", work)
+        raise
 
-        listing = work / "chunks.txt"
-        listing.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8")
-        cmd = ["ffmpeg", "-y", "-hide_banner", "-f", "concat", "-safe", "0", "-i", str(listing)]
-        if audio:
-            cmd += ["-i", str(audio), "-map", "0:v", "-map", "1:a", "-c", "copy"]
-        else:
-            cmd += ["-map", "0:v", "-c", "copy"]
-        cmd += ["-movflags", "+faststart", "-progress", "pipe:1", output_path]
-        await _run(cmd)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    listing = work / "chunks.txt"
+    listing.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8")
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-f", "concat", "-safe", "0", "-i", str(listing)]
+    if audio:
+        cmd += ["-i", str(audio), "-map", "0:v", "-map", "1:a", "-c", "copy"]
+    else:
+        cmd += ["-map", "0:v", "-c", "copy"]
+    cmd += ["-movflags", "+faststart", "-progress", "pipe:1", output_path]
+    try:
+        await _run(cmd, output_path=Path(output_path))
+    except Exception:
+        logger.warning("Chunked render's final concat failed; keeping %s for a resume", work)
+        raise
+    # Only the join of already-finished chunks happened here, so there is
+    # nothing left worth resuming -- the work dir can go.
+    shutil.rmtree(work, ignore_errors=True)
     if progress_callback:
         progress_callback(100.0)
     logger.info("Chunked render complete: %s", output_path)
@@ -360,21 +617,36 @@ async def _render_audio(timeline: Timeline, work: Path) -> Optional[Path]:
     # audio graph reads a handful of them. Passing all ~370 overflowed the
     # Windows command line (WinError 206) on a 14-minute episode.
     inputs, sub, (final_a,) = prune_inputs(inputs, sub, final_a)
+
+    out = work / "audio.m4a"
+    done = work / "audio.done"
+    graph_path = work / "graph_audio.txt"
+    previous_graph = graph_path.read_text(encoding="utf-8") if graph_path.exists() else None
+    if done.exists() and out.exists() and previous_graph == sub:
+        logger.info("Chunked render: audio mix already rendered, resuming")
+        return out
+
+    graph_path.write_text(sub, encoding="utf-8")
     mix = work / "mix.wav"
+    mix_part = work / "mix.part.wav"
     await _run(["ffmpeg", "-y", "-hide_banner", *inputs,
-                "-filter_complex_script", _script(sub, work, "graph_audio.txt"),
+                "-filter_complex_script", str(graph_path),
                 "-map", final_a, "-vn", "-c:a", "pcm_f32le", "-ar", "48000",
-                "-progress", "pipe:1", str(mix)])
+                "-progress", "pipe:1", str(mix_part)], output_path=mix_part)
+    os.replace(mix_part, mix)
 
     chain: List[str] = []
     if wants_loudness:
         from render.audio import build_loudness_chain
         measured = await asyncio.to_thread(_measure_loudness, mix, master)
         chain = build_loudness_chain(master, measured)
-    out = work / "audio.m4a"
+    out_part = work / "audio.part.m4a"
     await _run(["ffmpeg", "-y", "-hide_banner", "-i", str(mix),
                 *(["-af", ",".join(chain)] if chain else []),
-                "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-progress", "pipe:1", str(out)])
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-progress", "pipe:1", str(out_part)],
+               output_path=out_part)
+    os.replace(out_part, out)
+    done.write_text("", encoding="utf-8")
     return out
 
 

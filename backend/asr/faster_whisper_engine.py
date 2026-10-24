@@ -23,6 +23,31 @@ def _forced_alignment_enabled() -> bool:
         return True
 
 
+#: Batched decoding (`BatchedInferencePipeline`): the 30-second windows of a
+#: take are decoded `ASR_BATCH_SIZE` at a time instead of one after another,
+#: measured about 3x faster on this card with the same model. Off until
+#: `tools/whisper_batched_check.py` has compared it with the sequential pass on
+#: a real take and set the `asr_batched` app setting (2026-10-21: a 42-minute
+#: take spent 24 min in Whisper of a 3.5-hour production budget).
+ASR_BATCH_SIZE = 8
+
+
+def _frange(start: float, stop: float, step: float):
+    """0, step, 2*step ... below `stop` (window starts over a take)."""
+    value = start
+    while value < stop:
+        yield value
+        value += step
+
+
+def _batched_enabled() -> bool:
+    try:
+        from store.app_settings import AppSettings
+        return bool(AppSettings().get("asr_batched"))
+    except Exception:
+        return False
+
+
 def _gap_recovery_enabled() -> bool:
     """Whether to decode again the speech the main pass left without words (see
     gap_recovery.py). On by default; the `gap_recovery` app setting turns it off."""
@@ -291,16 +316,28 @@ class FasterWhisperEngine:
         # one at temperature 0 with the same word count. The full 13:50 take
         # went from 20 minutes to about 2.5.
         prompt = _build_initial_prompt(vocabulary)
-        segments, info = model.transcribe(
-            audio_path,
-            language=language,
-            task=task,
-            word_timestamps=True,
-            vad_filter=False,
-            condition_on_previous_text=False,
-            initial_prompt=prompt,
-            temperature=0.0,
-        )
+        options = dict(language=language, task=task, word_timestamps=True, vad_filter=False,
+                       condition_on_previous_text=False, initial_prompt=prompt, temperature=0.0)
+        if _batched_enabled():
+            # The same decoding options, 30-second windows ASR_BATCH_SIZE at a
+            # time (no VAD chunking: `vad_filter=False` keeps fixed windows, so
+            # nothing is trimmed before the engine's own alignment and gap pass).
+            from faster_whisper import BatchedInferencePipeline
+            from faster_whisper.audio import decode_audio
+            # faster-whisper 1.2 refuses `vad_filter=False` without clip
+            # timestamps ("No clip timestamps found", 2026-10-22), takes the
+            # clips in SECONDS, and transcribes only the first 30 s of a
+            # longer clip. So "no trimming" is spelled out: fixed 30 s
+            # windows over the whole take.
+            audio = decode_audio(audio_path, sampling_rate=16000)
+            duration = float(audio.shape[0]) / 16000.0
+            window = 30.0
+            clips = [{"start": float(s), "end": float(min(s + window, duration))}
+                     for s in _frange(0.0, duration, window)]
+            segments, info = BatchedInferencePipeline(model).transcribe(
+                audio, batch_size=ASR_BATCH_SIZE, clip_timestamps=clips, **options)
+        else:
+            segments, info = model.transcribe(audio_path, **options)
         segments = _retry_broken_segments(model, audio_path, list(segments), language, task, prompt)
         detected = getattr(info, "language", language) or "en"
         # Only romanize the transcribe pass. The translate pass already emits

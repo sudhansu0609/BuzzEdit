@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import logging
 from pathlib import Path
@@ -34,6 +35,8 @@ from contextlib import asynccontextmanager
 #: only one that knows which ComfyUI belongs to this backend), and we must never
 #: delete somebody else's record on the way out. `_serve()` sets this.
 _owns_ledger_entry = False
+#: The uvicorn.Server, so runtime.code_reload can ask it to stop.
+_server = None
 
 
 def _withdraw_ledger_entry() -> None:
@@ -80,9 +83,18 @@ async def lifespan(app: FastAPI):
     # Imported locally: the routes package is imported further down this module.
     from routes.scheduler import scheduler_instance
     scheduler_instance.start()
+    # A changed backend restarts itself onto the new code once idle (the
+    # supervisor brings it back), so a fix never waits for a manual restart.
+    from runtime import code_reload
+
+    def _request_exit() -> None:
+        if _server is not None:
+            _server.should_exit = True
+    reload_task = asyncio.create_task(code_reload.watch(_request_exit))
     try:
         yield
     finally:
+        reload_task.cancel()
         # Out of the ledger *here*, not only at `atexit`. On Windows a console
         # control event - Ctrl+Break, closing the console window, the machine
         # shutting down - ends the process from the CRT's default handler as
@@ -102,6 +114,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+from runtime.code_reload import InflightMiddleware  # noqa: E402
+
+app.add_middleware(InflightMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -139,6 +154,7 @@ from routes import (
     eyecontact,
     audio,
     sfx,
+    reels,
 )
 
 app.include_router(health.router, prefix="/api", tags=["health"])
@@ -160,6 +176,7 @@ app.include_router(style.router, prefix="/api/style", tags=["style"])
 app.include_router(presentation.router, prefix="/api/presentation", tags=["presentation"])
 app.include_router(music.router, prefix="/api/music", tags=["music"])
 app.include_router(sfx.router, prefix="/api/sfx", tags=["sfx"])
+app.include_router(reels.router, prefix="/api/reels", tags=["reels"])
 app.include_router(script.router, prefix="/api/projects", tags=["script"])
 app.include_router(glossary.router, prefix="/api/glossary", tags=["glossary"])
 app.include_router(kept_words.router, prefix="/api/projects", tags=["projects"])
@@ -176,6 +193,15 @@ app.include_router(audio_voice.router, prefix="/api/audio", tags=["audio"])
 # BuzzEdit -> BuzzAnimate (BuzzAnimate docs/ECOSYSTEM_BRIDGE_PLAN.md step E4).
 from routes import buzzanimate
 app.include_router(buzzanimate.router, prefix="/api/buzzanimate", tags=["buzzanimate"])
+# Narration: local TTS in a voice (BuzzcafStudio AUTO_STORY_PLAN.md brief N1).
+from routes import narration
+app.include_router(narration.router, prefix="/api/narration", tags=["narration"])
+# Master pause/resume mirror (BuzzcafStudio docs/STUDIO_DIRECTOR_PLAN.md Part 1).
+from routes import master
+app.include_router(master.router, prefix="/api/master", tags=["master"])
+# Re-parenting the headless Electron watchdog (STUDIO_DIRECTOR_PLAN.md enhancement 4).
+from routes import supervisor
+app.include_router(supervisor.router, prefix="/api/supervisor", tags=["supervisor"])
 # The live audio socket (AUDIO_SUITE_PLAN.md brief L) shares the prefix; the
 # app still starts while that module is not there yet.
 try:
@@ -253,6 +279,8 @@ def _serve() -> None:
     # directly. `uvicorn.Server` rather than `uvicorn.run` because publishing
     # has to wait for `server.started`.
     server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=port, reload=False))
+    global _server
+    _server = server
 
     if not launcher_chose:
         def _publish_when_serving() -> None:

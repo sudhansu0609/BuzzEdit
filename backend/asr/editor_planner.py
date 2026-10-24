@@ -40,13 +40,32 @@ import asyncio
 import concurrent.futures as cf
 import logging
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("editor_planner")
 
 AGREEMENT_RUNS = 3
 MIN_RUNS = 2                 # fewer reads than this answering is no agreement at all
 REVIEW_CONTEXT = 2           # utterances either side stored with a review item
+
+
+#: Where the plan is, in words for the person waiting ("AI editor: retake sweep").
+#: The transcription route points this at its job's stage record; the Studio
+#: shows that stage. Without it a 36-minute cut read "transcribe" throughout.
+_progress_cb: Optional[Callable[[str], None]] = None
+
+
+def set_progress(callback: Optional[Callable[[str], None]]) -> None:
+    global _progress_cb
+    _progress_cb = callback
+
+
+def _progress(text: str) -> None:
+    if _progress_cb is not None:
+        try:
+            _progress_cb(text)
+        except Exception:  # noqa: BLE001 - a status line must never fail the cut
+            pass
 
 
 class EditorUnavailable(RuntimeError):
@@ -149,7 +168,11 @@ def _run_reads(utterances, words, client, style: str, runs: int, speaker_style: 
     def one(_):
         return editor.edit(utterances, words, client, style, speaker_style=speaker_style)
 
-    with cf.ThreadPoolExecutor(max_workers=runs) as pool:
+    # The proxy takes the reads together; a local model gets them one at a time:
+    # three 32k-token slots at once is more KV cache than the 16 GB card has, and
+    # LM Studio answered every read with an engine error (674aefab, 2026-10-21).
+    workers = runs if getattr(client, "backend", "proxy") == "proxy" else 1
+    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(one, n) for n in range(runs)]
         for f in futures:
             try:
@@ -178,12 +201,17 @@ def plan_with_editor_sync(words: List[Dict[str, Any]], audio_path: Optional[str]
     settings = settings or {}
     started = time.time()
     if client is None:
-        proxy = proxy_config(settings)
-        if not proxy["api_key"]:
-            raise EditorUnavailable("no key for the Claude proxy (set the auto_cut_editor app "
-                                    "setting or CLAUDE_API_KEY)")
-        client = EditorClient(base_url=proxy["base_url"], api_key=proxy["api_key"],
-                              model=proxy["model"], effort=proxy["effort"])
+        # The default editor first (local, unless set to Claude), the other one when it
+        # cannot answer -- Claude at its usage limit, LM Studio down -- so the cut is
+        # always an editor's, never the classic planner's while a model can be had.
+        from .editor import editor_clients
+        clients = editor_clients(settings)
+        skipped = [] if proxy_config(settings)["api_key"] else [
+            "claude: no key for the Claude proxy (set the auto_cut_editor app setting or CLAUDE_API_KEY)"]
+        if not clients:
+            raise EditorUnavailable("; ".join(skipped) or "no editor model")
+    else:
+        clients, skipped = [("given", client)], []
     if not audio_path:
         raise EditorUnavailable("no audio to read the recording from")
 
@@ -209,10 +237,30 @@ def plan_with_editor_sync(words: List[Dict[str, Any]], audio_path: Optional[str]
 
     style = _style_for(settings, exclude_source)
     speaker_style = str(settings.get("speaker_style") or "")[:1500]
-    passes, answers, metas, errors = _run_reads(utterances, view, client, style, runs,
-                                                speaker_style=speaker_style)
-    if len(passes) < min(MIN_RUNS, runs):
-        raise EditorUnavailable("; ".join(dict.fromkeys(errors)) or "the editor did not answer")
+    failures: List[str] = list(skipped)
+    for name, candidate in clients:
+        try:
+            prepare = getattr(candidate, "prepare", None)   # a local editor loads its model here
+            if prepare:
+                prepare()
+        except Exception as e:  # noqa: BLE001 - the model could not be had; try the next editor
+            failures.append(f"{name}: {e}")
+            logger.warning("Editor %s unavailable (%s)", name, e)
+            continue
+        _progress(f"AI editor ({name}: {getattr(candidate, 'model', '?')}): {runs} reads of "
+                  f"{len(utterances)} lines")
+        passes, answers, metas, errors = _run_reads(utterances, view, candidate, style, runs,
+                                                    speaker_style=speaker_style)
+        if len(passes) >= min(MIN_RUNS, runs):
+            client = candidate
+            if failures:
+                logger.warning("Editor: cutting on %s (%s) after: %s", name, candidate.model, "; ".join(failures))
+            break
+        failures.extend(f"{name}: {e}" for e in dict.fromkeys(errors))
+        logger.warning("Editor %s did not answer enough reads (%d of %d); trying the next editor",
+                       name, len(passes), runs)
+    else:
+        raise EditorUnavailable("; ".join(dict.fromkeys(failures)) or "the editor did not answer")
 
     removed, trims, minority = _agree(passes, utterances)
     why = _reasons(answers)
@@ -242,7 +290,10 @@ def plan_with_editor_sync(words: List[Dict[str, Any]], audio_path: Optional[str]
     swept: Dict[str, int] = {}
     try:
         from .retake_sweep import sweep
-        groups, swept = sweep(utterances, client)
+        _progress("AI editor: retake sweep")
+        # Parallel chunks share one KV cache in LM Studio and overflow it (21:23, 2026-10-21).
+        groups, swept = sweep(utterances, client,
+                              workers=3 if getattr(client, 'backend', 'proxy') == 'proxy' else 1)
         if swept.get("failed"):
             steps_failed.append("sweep")
         for group in groups:
@@ -257,6 +308,7 @@ def plan_with_editor_sync(words: List[Dict[str, Any]], audio_path: Optional[str]
     verdicts: Dict[str, Dict[str, Any]] = {}
     if candidates:
         try:
+            _progress(f"AI editor: verifying {len(candidates)} disputed cut(s)")
             verdicts = verify_candidates(utterances, candidates, removed, client, report=calls)
         except Exception as e:                 # unverified, every candidate stays, as before
             logger.warning("Verifying %d candidates failed (%s: %s); all kept.", len(candidates),
@@ -365,6 +417,7 @@ def plan_with_editor_sync(words: List[Dict[str, Any]], audio_path: Optional[str]
     read: Dict[str, Any] = {"remove": {}, "trims": {}, "restore": set(), "calls": 0, "tokens_in": 0,
                             "tokens_out": 0, "failed": 0}
     try:
+        _progress("AI editor: final read of the cut")
         read = final_read_chunked(utterances, removed, view, client, protected=set(restarted))
         if read.get("failed"):
             steps_failed.append("final_read")

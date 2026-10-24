@@ -182,6 +182,11 @@ def correct_eye_contact(src: str, dst: Optional[str] = None, settings: Settings 
         "median_shift_px_per_eye": {k: round(float(np.median(np.abs(plan["corr_e"][k][moved]))) * w, 2)
                                     for k in plan.get("corr_e", {})} if moved.any() else {},
         "lens_per_eye": {k: round(v, 3) for k, v in (plan.get("lens_e") or {}).items()},
+        # The measured mode: whether the take held enough looks into the lens to measure
+        # the target from them, and how far the reading gaze was moved to reach it.
+        "mode": plan.get("mode", settings.mode),
+        "auto_measured": bool(plan.get("auto_measured")),
+        "measured_shift_deg": round(float(plan.get("measured_shift_deg", 0.0)), 1),
         "settings": asdict(settings),
         "quality": quality,
         "seconds": round(time.time() - t0, 1),

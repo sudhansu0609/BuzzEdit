@@ -118,6 +118,7 @@ class GenerateRequest(BaseModel):
     instruments: List[str] = []
     moods: List[str] = []
     bpm: Optional[int] = None
+    raga: Optional[str] = None
     variations: int = 2
     seconds: float = music_gen.DEFAULT_SECONDS
     extra_tags: str = ""
@@ -126,6 +127,12 @@ class GenerateRequest(BaseModel):
 
 @router.get("/styles")
 def styles():
+    ragas_by_time: Dict[str, List[Dict[str, Any]]] = {"morning": [], "evening": []}
+    for name, spec in music_gen.RAGAS.items():
+        ragas_by_time.setdefault(spec["time"], []).append({
+            "name": name, "label": spec["label"], "time": spec["time"],
+            "description": spec["description"], "keyscale": spec["keyscale"], "bpm": spec["bpm"],
+        })
     return {
         "styles": [{"name": k, "label": v["label"], "tags": v["tags"],
                     "genres": v["genres"], "moods": v["moods"]}
@@ -137,7 +144,7 @@ def styles():
         "engines": [{"name": k, "label": v["label"], "model": v["model"],
                      "license": v["model_license"], "note": v["note"],
                      "max_seconds": v["max_seconds"],
-                     "ready": workflows.resolve(v["role"]) is not None}
+                     "ready": music_gen.engine_ready(k)}
                     for k, v in music_gen.ENGINES.items()],
         "music_genres": music_gen.MUSIC_GENRES,
         "instruments": music_gen.INSTRUMENTS,
@@ -145,6 +152,7 @@ def styles():
         "bpm_range": [music_gen.MIN_BPM, music_gen.MAX_BPM],
         # The video genres a track can be filed for (the edit's library folders).
         "video_genres": sorted(music_gen.DEFAULT_STYLE_FOR_GENRE),
+        "ragas": ragas_by_time,
     }
 
 
@@ -163,11 +171,12 @@ async def _run(job_id: str, req: GenerateRequest) -> None:
                 req.style, count=req.variations, seconds=req.seconds,
                 extra_tags=req.extra_tags, genre=req.genre, engine=req.engine,
                 music_genres=req.music_genres, instruments=req.instruments,
-                moods=req.moods, bpm=req.bpm,
+                moods=req.moods, bpm=req.bpm, raga=req.raga,
                 on_stage=lambda key, fraction=None: _advance(job, key, fraction))
             ok = bool(result["made"])
             _finish(job, ok)
-            job.update(state="done" if ok else "failed", made=result["made"], errors=result["errors"])
+            job.update(state="done" if ok else "failed", made=result["made"], errors=result["errors"],
+                      engine=result.get("engine", req.engine), notes=result.get("notes", []))
         except Exception as e:
             logger.exception("Music job %s failed", job_id)
             _finish(job, False)
@@ -178,21 +187,27 @@ async def _run(job_id: str, req: GenerateRequest) -> None:
 async def generate(req: GenerateRequest):
     if req.style and req.style not in music_gen.MUSIC_STYLES:
         raise HTTPException(status_code=400, detail=f"Unknown style {req.style!r}")
+    if req.raga and req.raga not in music_gen.RAGAS:
+        raise HTTPException(status_code=400, detail=f"Unknown raga {req.raga!r}")
     engine = music_gen.ENGINES.get(req.engine)
     if engine is None:
         raise HTTPException(status_code=400, detail=f"Unknown engine {req.engine!r}")
-    if not (req.style or req.music_genres or req.instruments or req.moods or req.extra_tags.strip()):
+    if not (req.style or req.music_genres or req.instruments or req.moods or req.raga
+            or req.extra_tags.strip()):
         raise HTTPException(status_code=400,
-                            detail="Pick a style, or at least one genre, instrument or mood.")
+                            detail="Pick a style, a raga, or at least one genre, instrument or mood.")
     if workflows.resolve(engine["role"]) is None:
         raise HTTPException(status_code=503,
                             detail=f"No workflow configured for {engine['label']}.")
     job_id = uuid.uuid4().hex[:12]
     variations = max(1, min(music_gen.MAX_VARIATIONS, int(req.variations)))
+    resolved_engine, _ = music_gen.resolve_engine(
+        req.engine, music_gen._needs_tempo(req.style, req.bpm, req.moods, req.raga))
     prompt = music_gen.compose_prompt(req.style, req.music_genres, req.instruments,
-                                      req.moods, req.bpm, req.extra_tags)
-    _jobs[job_id] = {"job_id": job_id, "state": "queued", "style": req.style or "custom",
-                     "engine": req.engine, "variations": variations, "tags": prompt["tags"],
+                                      req.moods, req.bpm, req.extra_tags, raga=req.raga,
+                                      engine=resolved_engine)
+    _jobs[job_id] = {"job_id": job_id, "state": "queued", "style": req.style or req.raga or "custom",
+                     "engine": resolved_engine, "variations": variations, "tags": prompt["tags"],
                      "made": [], "errors": [], "started_at": time.time(), "ended_at": None,
                      "stages": _stage_plan(variations)}
     asyncio.create_task(_run(job_id, req))
@@ -203,8 +218,19 @@ async def generate(req: GenerateRequest):
 def preview(req: GenerateRequest):
     if req.style and req.style not in music_gen.MUSIC_STYLES:
         raise HTTPException(status_code=400, detail=f"Unknown style {req.style!r}")
-    return music_gen.compose_prompt(req.style, req.music_genres, req.instruments,
-                                    req.moods, req.bpm, req.extra_tags)
+    if req.raga and req.raga not in music_gen.RAGAS:
+        raise HTTPException(status_code=400, detail=f"Unknown raga {req.raga!r}")
+    engine = req.engine if req.engine in music_gen.ENGINES else music_gen.DEFAULT_ENGINE
+    resolved_engine, _ = music_gen.resolve_engine(
+        engine, music_gen._needs_tempo(req.style, req.bpm, req.moods, req.raga))
+    raga_spec = music_gen.RAGAS.get(req.raga) if req.raga else None
+    effective_bpm = req.bpm or (raga_spec["bpm"] if raga_spec else None)
+    prompt = music_gen.compose_prompt(req.style, req.music_genres, req.instruments,
+                                      req.moods, effective_bpm, req.extra_tags, raga=req.raga,
+                                      engine=resolved_engine)
+    return {"tags": prompt["tags"], "dropped": prompt["dropped"], "bpm": effective_bpm,
+            "keyscale": raga_spec["keyscale"] if raga_spec else None, "engine": resolved_engine,
+            "caption": prompt.get("caption")}
 
 
 @router.get("/jobs/{job_id}")

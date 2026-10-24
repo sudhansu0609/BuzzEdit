@@ -66,10 +66,11 @@ export function NumberParam({ def, value, onChange, label, disabled }: {
   return (
     <Row label={label ?? def.label} hint={liveHint(def)}>
       <input type="range" min={log ? 0 : min} max={log ? LOG_STEPS : max} step="any" value={pos}
-        disabled={disabled}
+        disabled={disabled} aria-label={label ?? def.label}
         onChange={(e) => onChange(fromPos(parseFloat(e.target.value)))}
         onDoubleClick={() => onChange(fallback)} />
       <input type="number" className="audio-num" step="any" min={min} max={max} disabled={disabled}
+        aria-label={label ?? def.label}
         value={text ?? v.toFixed(places)}
         onChange={(e) => {
           setText(e.target.value);
@@ -93,7 +94,7 @@ export function ChoiceParam({ def, value, onChange, label, disabled }: {
   const current = String(value ?? def.default ?? '');
   return (
     <Row label={label ?? def.label} hint={liveHint(def)}>
-      <select value={current} disabled={disabled}
+      <select value={current} disabled={disabled} aria-label={label ?? def.label}
         onChange={(e) => {
           // choices may be numbers (FFT size): hand back the catalogue's own value
           const hit = choices.find((c) => String(c) === e.target.value);
@@ -113,7 +114,8 @@ export function BoolParam({ def, value, onChange, label, disabled }: {
   const on = typeof value === 'boolean' ? value : !!def.default;
   return (
     <Row label={label ?? def.label} hint={liveHint(def)}>
-      <input type="checkbox" checked={on} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
+      <input type="checkbox" checked={on} disabled={disabled} aria-label={label ?? def.label}
+        onChange={(e) => onChange(e.target.checked)} />
     </Row>
   );
 }
@@ -287,7 +289,7 @@ export default function ParamEditor({ def, values, onChange, disabled }: {
           return (
             <div key={`group:${block.head.key}`} className={`audio-param-group${on ? '' : ' off'}`}>
               <label className="audio-group-head" title={liveHint(block.head)}>
-                <input type="checkbox" checked={on} disabled={disabled}
+                <input type="checkbox" checked={on} disabled={disabled} aria-label={block.head.label}
                   onChange={(e) => onChange(block.head.key, e.target.checked)} />
                 {block.head.label}
               </label>

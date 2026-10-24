@@ -175,6 +175,21 @@ def test_the_density_budget_caps_how_much_of_the_video_is_covered():
     assert dropped
 
 
+def test_a_face_first_opening_gets_no_planner_cutaways():
+    """BuzzcafStudio's face-first layout: the speaker alone for the opening.
+    The planner's own beats inside it are dropped; a script shot is not."""
+    from presentation.shotplan import budget_beats
+    program = _program(count=200)
+    beats = [_beat(start_s=float(i * 6), end_s=float(i * 6 + 5), topic=f"topic {i}") for i in range(12)]
+    settings = PresentationSettings(face_intro_s=30.0, target_coverage=1.0)
+    kept, dropped = budget_beats(beats, program, settings)
+    assert kept and all(b.start_s >= 30.0 for b in kept)
+    assert sum(1 for d in dropped if d["reason"] == "inside the face-first opening") == 5
+    script = _beat(start_s=6.0, end_s=11.0, topic="asked for here").model_copy(update={"origin": "script"})
+    kept, _ = budget_beats([script], program, settings)
+    assert [b.topic for b in kept] == ["asked for here"]
+
+
 async def test_a_long_topic_becomes_many_short_shots_near_the_target():
     """A long story must fill its coverage budget with many distinct short images,
     not one long still. The slices tile into image+gap cells so placement keeps
@@ -395,7 +410,9 @@ def test_no_video_promotion_when_video_is_off():
     assert all(b.kind == "broll_image" for b in out)
 
 
-def test_video_generation_size_is_capped_but_keeps_the_aspect():
+def test_video_generation_size_is_capped_but_keeps_the_aspect(monkeypatch):
+    # The classic size; the machine's own Classic/HQ setting must not decide it.
+    monkeypatch.setattr(workflows, "_settings_value", lambda key: None)
     from presentation.assets import _video_canvas_default
     w, h = _video_canvas_default((1920, 1080))
     assert w * h <= 832 * 480 * 1.1, "a 1080p canvas must not generate at 1080p"
@@ -502,10 +519,11 @@ def test_the_bundled_video_workflow_is_recognised_and_configured():
     assert built["z_unet"]["inputs"]["unet_name"] == "z_image_turbo_bf16.safetensors"
 
 
-def test_the_upgraded_video_workflow_doubles_frames_and_falls_back_to_the_old_one():
+def test_the_upgraded_video_workflow_doubles_frames_and_falls_back_to_the_old_one(monkeypatch):
     """The 2026-10 HQ graph (Q5_K_M, 1022 LoRAs, hi-res first frame, ESRGAN,
     RIFE x2) is not the active one, but stays selectable with the original as
     its fallback. RIFE doubles the frames, so the clip is saved at 2x the fps."""
+    monkeypatch.setattr(workflows, "_settings_value", lambda key: None)  # not this PC's setting
     assert workflows.resolve("broll_video").file == "zimage_wan22_i2v.json", "the old graph is active"
     manifest = dict(workflows.load_manifest()["roles"]["broll_video"],
                     fallback_file="zimage_wan22_i2v.json")
@@ -784,19 +802,27 @@ async def test_failures_on_a_live_comfyui_get_twice_the_limit_before_aborting(tm
 
 @pytest.mark.asyncio
 async def test_an_offline_comfyui_ends_the_night_at_the_limit(tmp_path, monkeypatch):
+    """ComfyUI going offline mid-run is waited out (2026-10-20: it now
+    restarts and repairs itself) rather than aborted on the spot; with the
+    wait budget spent and no cached picture to fall back on, the pass raises
+    ComfyUIUnavailableError instead of quietly delivering fewer pictures."""
+    from comfyui_bridge.errors import ComfyUIUnavailableError
+
     queue = _FakeComfyQueue(script=["boom"])
     # Up for the pre-flight check, gone once the failures start.
     answers = iter([True])
     queue.is_connected = lambda timeout=10.0: next(answers, False)
     assets_stage = _wire_assets(monkeypatch, tmp_path, queue)
+    monkeypatch.setattr(assets_stage, "COMFY_OFFLINE_POLL_S", 0.01)
+    monkeypatch.setattr(assets_stage, "_setting",
+                        lambda key, default: 0.0005 if key == "comfy_offline_wait_minutes" else default)
     beats = [_beat(id=f"b{i:02d}", topic=f"topic {i}",
                    start_s=5.0 + 8 * i, end_s=11.0 + 8 * i) for i in range(6)]
 
-    generated, failures = await assets_stage.generate_assets(
-        beats, tmp_path, PresentationSettings())
+    with pytest.raises(ComfyUIUnavailableError):
+        await assets_stage.generate_assets(beats, tmp_path, PresentationSettings())
 
     assert queue.submissions == assets_stage.MAX_CONSECUTIVE_FAILURES
-    assert sum("ComfyUI offline" in f["reason"] for f in failures) == 3
 
 
 @pytest.mark.asyncio
@@ -1479,3 +1505,28 @@ async def test_a_still_promoted_by_the_live_share_is_planned_five_seconds_and_ke
     assert ("broll_video", 5.0) in seen, "the promoted clip is planned 5 s"
     assert [(a.beat_id, a.kind) for a in generated] == [("b00", "video")]
     assert generated[0].still_path and generated[0].still_path.endswith(".png")
+
+
+# --- the recreation look carries no text (2026-10-21) ------------------------
+
+def test_recreations_grade_the_generated_cutaways_without_a_dramatization_super(tmp_path):
+    from presentation.director import RECREATION_ORIGIN, _apply_recreations
+    from presentation.placement import place_broll
+
+    timeline = _timeline(count=200)
+    program = build_program(timeline)
+    generated = tmp_path / "assets" / "generated"
+    generated.mkdir(parents=True)
+    beats = [_beat(start_s=10.0, end_s=16.0)]
+    beats[0].id = "b00"
+    path = generated / "b00.png"
+    path.write_bytes(b"not really a png")
+    asset = Asset(beat_id="b00", kind="image", path=str(path), width=1920, height=1080, duration_s=0.0)
+    assert place_broll(timeline, beats, [asset], program, PresentationSettings()) == 1
+
+    graded = _apply_recreations(timeline, PresentationSettings(), "horror")
+    assert graded == 1
+    layers = [i for i in timeline.items if i.origin == RECREATION_ORIGIN]
+    assert layers and all(i.kind != "text" for i in layers), "a story channel carries no text over its pictures"
+    assert not any("DRAMATIZATION" in str(getattr(i, "text", "") or "") for i in timeline.items)
+    assert _apply_recreations(timeline, PresentationSettings(), "education") == 0

@@ -168,3 +168,33 @@ experts with the 1022 LoRAs + RIFE (smaller weights), try 960×544, or set
 - Video upscaling in ComfyUI (SeedVR2, FlashVSR, RIFE) — https://artokun.mintlify.app/blog/video-upscale-comfyui
 - FlashVSR node — https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast
 - triton-windows compatibility — https://github.com/woct0rdho/triton-windows
+
+## 2026-10-21: the 3.5-hour budget
+
+The HQ graph in production: 440 s a clip (20 s text encode and setup, 4 x
+73-80 s sampling with half of each Q5 expert streamed from RAM, 17 s VAE,
+~80 s RealESRGAN over 81 frames), 38 clips = 4 h 42 min of a 7.5-hour video.
+The creator's budget is 3.5 hours for the whole video, final at Full HD,
+"upscale at the end". So:
+
+- `zimage_wan22_i2v_fast16.json` is the hq mode now: the same Q5_K_M experts,
+  1022 LoRAs and 2+2 steps, at 832x480x81, both experts patched with
+  SageAttention (`PathchSageAttentionKJ` from comfyui-kjnodes; the wheel is
+  `sageattention-2.2.0+cu128torch2.10.0andhigher.post6` plus triton-windows
+  3.6 in ComfyUI's venv, sm120 kernels bundled), decoded frames scaled once
+  with Lanczos to 1920x1080. No per-frame ESRGAN. Fallback
+  `zimage_wan22_i2v_lite16.json` is the same graph without the patch.
+- Stills: `zimage1_fast.json` = Z-Image at 1024x576 (`MAX_IMAGE_GEN_PIXELS`)
+  with RealESRGAN x2 inside the graph (2048x1152 for the Ken Burns push) and
+  the SageAttention patch; fallback `zimage1_esrgan.json` without the patch.
+- `backend/tools/clip_speed_check.py --adopt` runs each pair on the live
+  ComfyUI with one seed, compares a frame of the plain and the SageAttention
+  output and times them; on a blank or badly different picture it points the
+  settings at the plain graphs. The production chain runs it before the
+  queue resumes.
+- Whisper: `asr_batched` (BatchedInferencePipeline, batch 8, same options)
+  is turned on by `backend/tools/whisper_batched_check.py --adopt` when a
+  10-minute A/B agrees on >= 96% of the words.
+
+Expected for the same video: stills ~40 min, clips ~2.5-3 min each, Whisper
+~8 min, about 3.3 hours in all. To be re-measured on the next long video.

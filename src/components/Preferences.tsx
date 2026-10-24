@@ -53,7 +53,7 @@ export default function Preferences({ isOpen, onClose, initialTab = 'general' }:
       <div className="pref-modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="pref-header">
           <h3>Preferences</h3>
-          <button className="btn btn-sm" onClick={onClose}>✕</button>
+          <button className="btn btn-sm" onClick={onClose} aria-label="Close">✕</button>
         </div>
         <div className="pref-body">
           <nav className="pref-tabs">
@@ -107,6 +107,7 @@ function GeneralTab() {
 
       <Field label="Default output resolution">
         <select className="pref-input" value={settings.default_resolution ?? '1920x1080'}
+          aria-label="Default output resolution"
           onChange={(e) => save({ default_resolution: e.target.value })}>
           {RESOLUTIONS.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
         </select>
@@ -114,6 +115,7 @@ function GeneralTab() {
 
       <Field label="Default output format">
         <select className="pref-input" value={settings.default_format ?? 'mp4'}
+          aria-label="Default output format"
           onChange={(e) => save({ default_format: e.target.value })}>
           {FORMATS.map((f) => <option key={f} value={f}>{f.toUpperCase()}</option>)}
         </select>
@@ -122,23 +124,27 @@ function GeneralTab() {
       <Field label={`Fumble aggressiveness — ${Math.round(num('default_fumble_aggressiveness', 0.5) * 100)}%`}>
         <input type="range" min={0} max={1} step={0.05}
           value={num('default_fumble_aggressiveness', 0.5)}
+          aria-label="Fumble aggressiveness"
           onChange={(e) => save({ default_fumble_aggressiveness: parseFloat(e.target.value) })} />
       </Field>
 
       <Field label={`Max pause kept — ${num('default_max_pause_seconds', 0.4).toFixed(2)}s`}>
         <input type="range" min={0.15} max={1.2} step={0.05}
           value={num('default_max_pause_seconds', 0.4)}
+          aria-label="Max pause kept"
           onChange={(e) => save({ default_max_pause_seconds: parseFloat(e.target.value) })} />
       </Field>
 
       <h4 style={{ marginTop: 20 }}>Autosave</h4>
       <Field label="Autosave enabled">
         <input type="checkbox" checked={settings.auto_save_enabled ?? true}
+          aria-label="Autosave enabled"
           onChange={(e) => save({ auto_save_enabled: e.target.checked })} />
       </Field>
       <Field label={`Interval — ${num('auto_save_interval_seconds', 30)}s`}>
         <input type="range" min={10} max={120} step={5}
           value={num('auto_save_interval_seconds', 30)}
+          aria-label="Interval"
           onChange={(e) => save({ auto_save_interval_seconds: parseInt(e.target.value, 10) })} />
       </Field>
     </div>
@@ -215,6 +221,7 @@ function ModelsTab() {
 
       <Field label="Model used for AI edits">
         <select className="pref-input" value={models?.selected ?? 'auto'}
+          aria-label="Model used for AI edits"
           onChange={(e) => chooseModel(e.target.value)}>
           <option value="auto">Local model (auto-detect)</option>
           {/* Keep a pinned model selectable even if the server is down / it's not listed. */}
@@ -246,6 +253,7 @@ function ModelsTab() {
         return (
           <Field key={role} label={role.replace('_', ' ')}>
             <select className="pref-input" value={wf.selected[role] ?? ''}
+              aria-label={role.replace('_', ' ')}
               onChange={(e) => chooseWorkflow(role, e.target.value)}>
               <option value="">— none —</option>
               {/* Selected file always listed even if it can't serve the role, so it's visible. */}
@@ -274,6 +282,7 @@ function ModelsTab() {
       <Field label="Resolution">
         <select className="pref-input"
           value={sizeToStr(gen.gen_image_size) || '1920x1080'}
+          aria-label="Resolution"
           onChange={(e) => saveGen({ gen_image_size: strToSize(e.target.value) })}>
           {IMAGE_SIZES.map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
@@ -281,6 +290,7 @@ function ModelsTab() {
 
       <Field label="Upscale (Lanczos resize)">
         <select className="pref-input" value={String(gen.gen_upscale ?? 1)}
+          aria-label="Upscale"
           onChange={(e) => saveGen({ gen_upscale: parseFloat(e.target.value) })}>
           <option value="1">Off (1×)</option>
           <option value="1.5">1.5×</option>
@@ -293,17 +303,20 @@ function ModelsTab() {
       <Field label="Steps (blank = workflow default)">
         <input className="pref-input" type="number" min={1} max={100}
           value={gen.gen_steps ?? ''} placeholder="workflow default"
+          aria-label="Steps"
           onChange={(e) => saveGen({ gen_steps: e.target.value === '' ? null : parseInt(e.target.value, 10) })} />
       </Field>
 
       <Field label="CFG (blank = workflow default)">
         <input className="pref-input" type="number" min={0} max={30} step={0.5}
           value={gen.gen_cfg ?? ''} placeholder="workflow default"
+          aria-label="CFG"
           onChange={(e) => saveGen({ gen_cfg: e.target.value === '' ? null : parseFloat(e.target.value) })} />
       </Field>
 
       <Field label="B-roll model override">
         <select className="pref-input" value={gen.gen_broll_model ?? ''}
+          aria-label="B-roll model override"
           onChange={(e) => saveGen({ gen_broll_model: e.target.value || null })}>
           <option value="">— use the workflow’s own model —</option>
           {comfyModels && comfyModels.diffusion_models.length > 0 && (
@@ -519,6 +532,7 @@ function PresentationTab() {
 
       <LockableField label="Density" field="density" mode={mode} locked={locked} onToggleLock={toggleLock}>
         <select className="pref-input" value={values.density}
+          aria-label="Density"
           onChange={(e) => setValue('density', e.target.value)}>
           {DENSITY_OPTIONS.map((d) => <option key={d} value={d}>{d}</option>)}
         </select>
@@ -526,6 +540,7 @@ function PresentationTab() {
 
       <LockableField label="Genre" field="genre" mode={mode} locked={locked} onToggleLock={toggleLock}>
         <select className="pref-input" value={values.genre}
+          aria-label="Genre"
           onChange={(e) => setValue('genre', e.target.value)}>
           {GENRE_OPTIONS.map((g) => <option key={g} value={g}>{g}</option>)}
         </select>
@@ -533,6 +548,7 @@ function PresentationTab() {
 
       <LockableField label="Secondary genre" field="genre_secondary" mode={mode} locked={locked} onToggleLock={toggleLock}>
         <select className="pref-input" value={values.genre_secondary}
+          aria-label="Secondary genre"
           onChange={(e) => setValue('genre_secondary', e.target.value)}>
           <option value="">— none —</option>
           {GENRE_OPTIONS.map((g) => <option key={g} value={g}>{g}</option>)}
@@ -542,36 +558,42 @@ function PresentationTab() {
       <LockableField label={`Coverage — ${Math.round(values.target_coverage * 100)}%`}
         field="target_coverage" mode={mode} locked={locked} onToggleLock={toggleLock}>
         <input type="range" min={0} max={0.8} step={0.01} value={values.target_coverage}
+          aria-label="Coverage"
           onChange={(e) => setValue('target_coverage', parseFloat(e.target.value))} />
       </LockableField>
 
       <LockableField label={`Video share — ${Math.round(values.video_broll_share * 100)}%`}
         field="video_broll_share" mode={mode} locked={locked} onToggleLock={toggleLock}>
         <input type="range" min={0} max={1} step={0.01} value={values.video_broll_share}
+          aria-label="Video share"
           onChange={(e) => setValue('video_broll_share', parseFloat(e.target.value))} />
       </LockableField>
 
       <LockableField label={`Punch-ins / min — ${Number(values.punch_rate_per_minute).toFixed(1)}`}
         field="punch_rate_per_minute" mode={mode} locked={locked} onToggleLock={toggleLock}>
         <input type="range" min={0} max={5} step={0.1} value={values.punch_rate_per_minute}
+          aria-label="Punch-ins per minute"
           onChange={(e) => setValue('punch_rate_per_minute', parseFloat(e.target.value))} />
       </LockableField>
 
       <LockableField label={`Text FX / min — ${Number(values.text_fx_per_minute).toFixed(1)}`}
         field="text_fx_per_minute" mode={mode} locked={locked} onToggleLock={toggleLock}>
         <input type="range" min={0} max={6} step={0.1} value={values.text_fx_per_minute}
+          aria-label="Text FX per minute"
           onChange={(e) => setValue('text_fx_per_minute', parseFloat(e.target.value))} />
       </LockableField>
 
       <LockableField label={`Zoom depth — ${Number(values.zoom_depth).toFixed(2)}`}
         field="zoom_depth" mode={mode} locked={locked} onToggleLock={toggleLock}>
         <input type="range" min={0.04} max={0.3} step={0.01} value={values.zoom_depth}
+          aria-label="Zoom depth"
           onChange={(e) => setValue('zoom_depth', parseFloat(e.target.value))} />
       </LockableField>
 
       <LockableField label="Voice preset" field="voice_preset" mode={mode} locked={locked} onToggleLock={toggleLock}>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flex: 1 }}>
           <select className="pref-input" value={values.voice_preset}
+            aria-label="Voice preset"
             onChange={(e) => setValue('voice_preset', e.target.value)}>
             {VOICE_PRESET_OPTIONS.map((v) => <option key={v} value={v}>{v}</option>)}
           </select>
@@ -589,6 +611,7 @@ function PresentationTab() {
 
       <LockableField label="SFX source" field="sfx_source" mode={mode} locked={locked} onToggleLock={toggleLock}>
         <select className="pref-input" value={values.sfx_source}
+          aria-label="SFX source"
           onChange={(e) => setValue('sfx_source', e.target.value)}>
           {SOURCE_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
@@ -596,6 +619,7 @@ function PresentationTab() {
 
       <LockableField label="Music source" field="music_source" mode={mode} locked={locked} onToggleLock={toggleLock}>
         <select className="pref-input" value={values.music_source}
+          aria-label="Music source"
           onChange={(e) => setValue('music_source', e.target.value)}>
           {SOURCE_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
@@ -609,6 +633,7 @@ function PresentationTab() {
       </p>
       <Field label="Planner">
         <select className="pref-input" value={editorState?.planner ?? 'editor'} disabled={savingKeys}
+          aria-label="Planner"
           onChange={(e) => saveEditor({ planner: e.target.value as 'editor' | 'classic' })}>
           <option value="editor">AI editor (Claude)</option>
           <option value="classic">Classic (rules + local model)</option>
@@ -618,6 +643,7 @@ function PresentationTab() {
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flex: 1 }}>
           <input type="text" className="pref-input" value={editorUrlInput}
             placeholder={editorState?.base_url ?? 'http://127.0.0.1:8787/v1'}
+            aria-label="Claude proxy URL"
             onChange={(e) => setEditorUrlInput(e.target.value)} />
           <button className="btn btn-sm" disabled={!editorUrlInput || savingKeys}
             onClick={() => saveEditor({ base_url: editorUrlInput })}>
@@ -631,6 +657,7 @@ function PresentationTab() {
             placeholder={editorState?.key_configured
               ? (editorState.key_source === 'env' ? 'Set by CLAUDE_API_KEY' : 'Saved')
               : 'Not set: cuts use the classic planner'}
+            aria-label="Claude proxy key"
             onChange={(e) => setEditorKeyInput(e.target.value)} />
           <button className="btn btn-sm" disabled={!editorKeyInput || savingKeys}
             onClick={() => saveEditor({ api_key: editorKeyInput })}>
@@ -650,6 +677,7 @@ function PresentationTab() {
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flex: 1 }}>
           <input type="password" className="pref-input" value={pexelsInput}
             placeholder={stockKeys?.pexels_api_key_set ? `Saved: ${stockKeys.pexels_api_key}` : 'Not set'}
+            aria-label="Pexels API key"
             onChange={(e) => setPexelsInput(e.target.value)} />
           <button className="btn btn-sm" disabled={!pexelsInput || savingKeys}
             onClick={() => saveStockKey('pexels_api_key', pexelsInput)}>
@@ -662,6 +690,7 @@ function PresentationTab() {
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flex: 1 }}>
           <input type="password" className="pref-input" value={pixabayInput}
             placeholder={stockKeys?.pixabay_api_key_set ? `Saved: ${stockKeys.pixabay_api_key}` : 'Not set'}
+            aria-label="Pixabay API key"
             onChange={(e) => setPixabayInput(e.target.value)} />
           <button className="btn btn-sm" disabled={!pixabayInput || savingKeys}
             onClick={() => saveStockKey('pixabay_api_key', pixabayInput)}>
@@ -751,7 +780,7 @@ function ShortcutsTab() {
                 >
                   {capturing === cmd.id ? 'Press keys…' : chordLabel(chord) || 'Unassigned'}
                 </button>
-                <button className="shortcut-reset" title="Reset to default"
+                <button className="shortcut-reset" title="Reset to default" aria-label="Reset to default"
                   onClick={() => resetBinding(cmd.id)}>↺</button>
               </div>
             );
@@ -809,12 +838,12 @@ function AppearanceTab() {
             style={{ background: s.value }} onClick={() => set({ accent: s.value })} />
         ))}
         <label className="swatch-custom" title="Custom colour">
-          <input type="color" value={accent} onChange={(e) => set({ accent: e.target.value })} />
+          <input type="color" value={accent} aria-label="Custom colour" onChange={(e) => set({ accent: e.target.value })} />
         </label>
       </div>
       <label className="pref-inline-check"
         title="Each palette was drawn around its own accent — Dracula's violet, Nord's frost blue. Untick to keep one colour across every theme.">
-        <input type="checkbox" checked={accentFollowsTheme}
+        <input type="checkbox" checked={accentFollowsTheme} aria-label="Let the theme choose the accent"
           onChange={(e) => set({ accentFollowsTheme: e.target.checked })} />
         Let the theme choose the accent
       </label>

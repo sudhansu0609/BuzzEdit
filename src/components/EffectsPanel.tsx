@@ -142,12 +142,12 @@ export default function EffectsPanel() {
             <div className="insp-effect-head">
               <span className="insp-effect-name">{effect.type.replace(/_/g, ' ')}</span>
               <label className="text-xs text-muted" style={{ display: 'flex', gap: 4 }}>
-                <input type="checkbox" checked={effect.enabled}
+                <input type="checkbox" aria-label={`${effect.type.replace(/_/g, ' ')} on`} checked={effect.enabled}
                   onChange={(e) => run(() =>
                     updateEffect(projectId, index, { enabled: e.target.checked }, owner))} />
                 on
               </label>
-              <button className="btn btn-xs btn-danger" title="Remove" disabled={busy}
+              <button className="btn btn-xs btn-danger" title="Remove" aria-label="Remove" disabled={busy}
                 onClick={() => run(() => removeEffect(projectId, index, owner))}>✕</button>
             </div>
             <Slider label="Amount" value={effect.intensity} min={0} max={1}

@@ -14,8 +14,8 @@ function toBands(value: unknown): BandValue[] | null {
 const clamp = (n: number, field: ParamDef) =>
   Math.min(field.max ?? Infinity, Math.max(field.min ?? -Infinity, n));
 
-function NumberCell({ field, value, onChange, disabled }: {
-  field: ParamDef; value: unknown; onChange: (v: number) => void; disabled?: boolean;
+function NumberCell({ field, value, onChange, disabled, index }: {
+  field: ParamDef; value: unknown; onChange: (v: number) => void; disabled?: boolean; index: number;
 }) {
   const [text, setText] = useState<string | null>(null);
   const fallback = typeof field.default === 'number' ? field.default : 0;
@@ -30,6 +30,7 @@ function NumberCell({ field, value, onChange, disabled }: {
     <input type="number" className="audio-num" step="any" disabled={disabled}
       min={field.min ?? undefined} max={field.max ?? undefined}
       title={`${field.label}: ${field.min ?? ''}…${field.max ?? ''} ${field.unit}`}
+      aria-label={`${field.label} for band ${index + 1}`}
       value={text ?? String(v)}
       onChange={(e) => {
         setText(e.target.value);
@@ -44,17 +45,19 @@ function NumberCell({ field, value, onChange, disabled }: {
   );
 }
 
-function Cell({ field, value, onChange, disabled }: {
-  field: ParamDef; value: unknown; onChange: (v: number | string | boolean) => void; disabled?: boolean;
+function Cell({ field, value, onChange, disabled, index }: {
+  field: ParamDef; value: unknown; onChange: (v: number | string | boolean) => void; disabled?: boolean; index: number;
 }) {
   if (field.type === 'bool') {
     const on = typeof value === 'boolean' ? value : !!field.default;
-    return <input type="checkbox" checked={on} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />;
+    return <input type="checkbox" checked={on} disabled={disabled} aria-label={`${field.label} for band ${index + 1}`}
+      onChange={(e) => onChange(e.target.checked)} />;
   }
   if (field.type === 'choice') {
     const choices = field.choices ?? [];
     return (
       <select className="audio-select" value={String(value ?? field.default ?? '')} disabled={disabled}
+        aria-label={`${field.label} for band ${index + 1}`}
         onChange={(e) => {
           const hit = choices.find((c) => String(c) === e.target.value);
           onChange(hit ?? e.target.value);
@@ -63,7 +66,7 @@ function Cell({ field, value, onChange, disabled }: {
       </select>
     );
   }
-  return <NumberCell field={field} value={value} onChange={onChange} disabled={disabled} />;
+  return <NumberCell field={field} value={value} onChange={onChange} disabled={disabled} index={index} />;
 }
 
 export default function BandsEditor({ def, value, onChange, disabled }: {
@@ -97,7 +100,7 @@ export default function BandsEditor({ def, value, onChange, disabled }: {
               <td className="audio-band-index">{index + 1}</td>
               {fields.map((f) => (
                 <td key={f.key}>
-                  <Cell field={f} value={band[f.key]} disabled={disabled}
+                  <Cell field={f} value={band[f.key]} disabled={disabled} index={index}
                     onChange={(v) => set(index, f.key, v)} />
                 </td>
               ))}

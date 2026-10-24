@@ -183,7 +183,7 @@ export default function BatchTab({ projectId, voices, presets, defs }: {
               return (
                 <div key={m.id} className="voice-batch-item">
                   <label className="voice-batch-name" title={m.path}>
-                    <input type="checkbox" disabled={running} checked={selected.has(m.id)}
+                    <input type="checkbox" disabled={running} checked={selected.has(m.id)} aria-label={m.name}
                       onChange={(e) => toggle(m.id, e.target.checked)} />
                     <span className="audio-badge">{m.kind}</span>
                     <span className="voice-ellipsis">{m.name}</span>

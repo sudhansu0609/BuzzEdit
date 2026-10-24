@@ -236,3 +236,126 @@ def test_an_offset_animation_is_counted_from_the_offset_and_held_either_side():
     chain = _joined(build_canvas_transform(
         Transform(scale=1.0, scale_end=1.5), 1920, 1080, 100, 30, frame_offset=300))
     assert "clip((on-300)/99,0,1)" in chain
+
+
+# --- anim_total_frames / anim_offset_frames (chunked rendering) -----------
+#
+# These two Transform fields are only ever set by render/chunked.py's
+# sub_timeline() when a chunk boundary cuts through this item's own
+# animation. Left unset (every chain built before they existed, and every one
+# built today for an item a chunk boundary never touches) they must have no
+# effect at all -- the chains below are the exact strings build_canvas_transform
+# and build_overlay_transform produced before anim_total_frames/anim_offset_frames
+# were added, byte for byte.
+
+def test_unset_anim_fields_reproduce_the_pre_chunking_canvas_filter():
+    chain = _joined(build_canvas_transform(
+        Transform(scale=1.0, scale_end=1.5), 1920, 1080, 100, 30))
+    assert chain == (
+        "scale=5760:3240:force_original_aspect_ratio=decrease:flags=lanczos,"
+        "pad=5760:3240:(ow-iw)/2:(oh-ih)/2:color=black,"
+        "zoompan=z='1+(0.5)*(on/99)*(on/99)*(3-2*(on/99))':"
+        "x='(iw-iw/zoom)/2*(1+(0+(0)*(on/99)*(on/99)*(3-2*(on/99))))':"
+        "y='(ih-ih/zoom)/2*(1+(0+(0)*(on/99)*(on/99)*(3-2*(on/99))))':"
+        "d=1:s=1920x1080:fps=30,setsar=1"
+    )
+
+
+def test_unset_anim_fields_reproduce_the_pre_chunking_offset_canvas_filter():
+    chain = _joined(build_canvas_transform(
+        Transform(scale=1.0, scale_end=1.5), 1920, 1080, 100, 30, frame_offset=300))
+    assert chain == (
+        "scale=5760:3240:force_original_aspect_ratio=decrease:flags=lanczos,"
+        "pad=5760:3240:(ow-iw)/2:(oh-ih)/2:color=black,"
+        "zoompan=z='1+(0.5)*(clip((on-300)/99,0,1))*(clip((on-300)/99,0,1))*(3-2*(clip((on-300)/99,0,1)))':"
+        "x='(iw-iw/zoom)/2*(1+(0+(0)*(clip((on-300)/99,0,1))*(clip((on-300)/99,0,1))*(3-2*(clip((on-300)/99,0,1)))))':"
+        "y='(ih-ih/zoom)/2*(1+(0+(0)*(clip((on-300)/99,0,1))*(clip((on-300)/99,0,1))*(3-2*(clip((on-300)/99,0,1)))))':"
+        "d=1:s=1920x1080:fps=30,setsar=1"
+    )
+
+
+def test_unset_anim_fields_reproduce_the_pre_chunking_overlay_pan():
+    filters, x_expr, y_expr = build_overlay_transform(
+        Transform(pos_x=-0.5, pos_x_end=0.5), 1920, 1080, 60, 30, 2.0, 4.0)
+    assert filters == ["scale=1920:1080:force_original_aspect_ratio=decrease"]
+    assert x_expr == "(W-w)/2+(-0.5+(1)*clip((t-2)/2,0,1))*W/2"
+    assert y_expr == "(H-h)/2+(0+(0)*clip((t-2)/2,0,1))*H/2"
+
+
+def test_split_canvas_zoom_keeps_the_original_moves_speed_and_phase():
+    """A chunk boundary cuts this item's own stream in two: anim_total_frames
+    is the move's original length and anim_offset_frames is how many of its
+    frames already played, so the piece on either side of the cut picks up
+    exactly where the other left off instead of restarting its own 0..1."""
+    import re
+
+    def _raw_progress_expr(z_expr: str) -> str:
+        """The un-eased `on/span` or `clip(...)` progress term, found by
+        matching parens rather than assuming no `clip(...)` call nests one --
+        the smoothstep wrapper around it is not what needs to be linear."""
+        idx = z_expr.find("clip(")
+        if idx == -1:
+            return re.search(r"on/\d+", z_expr).group(0)
+        depth, start = 0, idx + len("clip")
+        for j in range(start, len(z_expr)):
+            if z_expr[j] == "(":
+                depth += 1
+            elif z_expr[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    return z_expr[idx:j + 1]
+        raise ValueError(f"unbalanced clip() in {z_expr!r}")
+
+    def _progress_at(chain, on_value):
+        z_expr = re.search(r"z='([^']*)'", next(f for f in chain if f.startswith("zoompan="))).group(1)
+        raw = _raw_progress_expr(z_expr)
+        return eval(raw, {"clip": lambda a, b, c: max(b, min(c, a)), "on": on_value})
+
+    whole = Transform(scale=1.0, scale_end=1.5)
+    first_piece = Transform(scale=1.0, scale_end=1.5, anim_total_frames=100, anim_offset_frames=0)
+    second_piece = Transform(scale=1.0, scale_end=1.5, anim_total_frames=100, anim_offset_frames=40)
+
+    unsplit_chain = build_canvas_transform(whole, 1920, 1080, 100, 30)
+    first_chain = build_canvas_transform(first_piece, 1920, 1080, 40, 30)
+    second_chain = build_canvas_transform(second_piece, 1920, 1080, 60, 30)
+
+    # The split piece that owns the move's first frames (anim_offset_frames=0)
+    # tracks the unsplit chain exactly, frame for frame.
+    for on in (0, 20, 39):
+        assert _progress_at(first_chain, on) == pytest.approx(_progress_at(unsplit_chain, on))
+    # The next piece's own frame 0 is the original move's frame 40 -- one
+    # frame further than the first piece's last frame, not a restart at 0.
+    last_of_first = _progress_at(first_chain, 39)
+    first_of_second = _progress_at(second_chain, 0)
+    assert first_of_second - last_of_first == pytest.approx(1 / 99)
+    assert first_of_second == pytest.approx(_progress_at(unsplit_chain, 40))
+
+
+def test_split_overlay_pan_keeps_the_original_moves_speed_and_phase():
+    """The position-only overlay path works in seconds (`t`), not frames, but
+    the same anim_total_frames/anim_offset_frames continuity has to hold once
+    converted: one piece's last moment and the next piece's first are exactly
+    one frame apart in the original move, never a restart."""
+    fps = 30.0
+    first_piece = Transform(pos_x=-0.5, pos_x_end=0.5,
+                            anim_total_frames=100, anim_offset_frames=0)
+    second_piece = Transform(pos_x=-0.5, pos_x_end=0.5,
+                             anim_total_frames=100, anim_offset_frames=40)
+
+    # Piece 1 is programme seconds [0, 40/30); piece 2 is [0, 60/30) on its own
+    # clock, both passed their own clip_start/clip_end (as the compiler does).
+    _f1, x1, _y1 = build_overlay_transform(first_piece, 1920, 1080, 40, fps, 0.0, 39 / fps)
+    _f2, x2, _y2 = build_overlay_transform(second_piece, 1920, 1080, 60, fps, 0.0, 60 / fps)
+
+    def _frac_at(x_expr: str, t_value: float) -> float:
+        expr = x_expr.split("+", 1)[1].rsplit(")*W/2", 1)[0] + ")"
+        return eval(expr, {"clip": lambda a, b, c: max(b, min(c, a)), "t": t_value})
+
+    last_of_first = _frac_at(x1, 39 / fps)
+    first_of_second = _frac_at(x2, 0.0)
+    # One frame of progress at this move's own total span (99 frames). The
+    # seconds-based path's expressions round to 4 decimal places (_f()), so
+    # the match is close rather than exact.
+    step = (0.5 - -0.5) / 99
+    assert first_of_second - last_of_first == pytest.approx(step, abs=1e-3)
+    assert first_of_second > last_of_first  # never a restart back toward 0

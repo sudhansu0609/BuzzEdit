@@ -22,6 +22,7 @@ for a model that is actually loaded.
 
 import os
 import asyncio
+import threading
 import shutil
 import logging
 import time
@@ -37,12 +38,21 @@ logger = logging.getLogger("lm_launcher")
 _AUTOSTART = os.environ.get("LM_STUDIO_AUTOSTART", "1") not in ("0", "false", "False")
 
 _lock = asyncio.Lock()
+#: Held by whoever ejects-and-loads in LM Studio -- this launcher and the cut
+#: editor's own loader (asr/editor.py). Two loaders at once each saw an
+#: empty server, and the second's `lms unload --all` killed the first's
+#: model one second after it loaded (2026-10-21, 20:58 and 21:06).
+LOAD_LOCK = threading.Lock()
 _ready_until = 0.0            # cache "ready" for a short window to avoid repeated CLI probes
 _READY_TTL = 30.0
 _resolved: Optional[str] = None   # the model id last confirmed to actually serve
 # Models that failed to load this run. A broken model takes a minute to fail, and
 # retrying it on every re-resolve would spend that minute over and over.
 _unusable: set = set()
+
+
+#: The context every BuzzEdit load asks LM Studio for (the editor reads ~24k-token parts).
+LOAD_CONTEXT = 32768
 
 
 def find_lms_cli() -> Optional[str]:
@@ -251,7 +261,11 @@ async def _try_load(base_url: str, model_id: str, load_timeout: float) -> bool:
     lms = find_lms_cli()
     if not lms:
         return False
-    rc, _out, err = await _run([lms, "load", model_id, "-y", "--gpu", "max"], timeout=load_timeout)
+    # Always at the context the whole pipeline needs: a load without `-c` takes
+    # LM Studio's default (16k), and the AI editor's whole-recording reads then
+    # overflow on it (674aefab, 2026-10-21).
+    rc, _out, err = await _run([lms, "load", model_id, "-y", "--gpu", "max", "-c", str(LOAD_CONTEXT)],
+                               timeout=load_timeout)
     if rc == 0:
         return True
     _unusable.add(model_id)
@@ -278,118 +292,129 @@ async def ensure_ready(base_url: str, model_name: str,
     async with _lock:
         if _resolved and time.monotonic() < _ready_until:
             return _resolved
+        await asyncio.to_thread(LOAD_LOCK.acquire)
+        try:
+            return await _ensure_ready_locked(base_url, model_name, load_timeout)
+        finally:
+            LOAD_LOCK.release()
 
-        # 1. Server up?
-        if not await is_server_up(base_url):
-            lms = find_lms_cli()
-            if not lms:
-                logger.warning("LM Studio not running and `lms` CLI not found; skipping auto-start. "
-                               "Run `lms bootstrap` once to enable it.")
-                return None
-            logger.info("LM Studio server not up — starting via `lms server start`...")
-            await _run([lms, "server", "start"], timeout=30)
-            for _ in range(25):
-                if await is_server_up(base_url):
-                    break
-                await asyncio.sleep(1.0)
-            else:
-                logger.warning("LM Studio server did not come up after start.")
-                return None
 
-        entries = await catalogue(base_url)
-        sizes = await model_sizes()
-        total_mb = _total_vram_mb()
+async def _ensure_ready_locked(base_url: str, model_name: str, load_timeout: float) -> Optional[str]:
+    """`ensure_ready` under both locks: the server check, the resident-model
+    check, and the eject-and-load."""
+    global _ready_until, _resolved
 
-        # 2. Preferred model already loaded? Only an actual match short-circuits
-        #    here. Accepting whatever happened to be resident used to look like a
-        #    free win, but model capability is not interchangeable for this work:
-        #    a 7.5B echoes the transcript back unchanged where a 26B removes a
-        #    hundred words of fumbles. Loading the right one is worth 15 seconds.
-        #
-        #    "Loaded" is still not "usable", though. A model bigger than the card
-        #    loads with part of itself offloaded and reports success, then dies
-        #    on the first real prompt — so a resident model that cannot fit in
-        #    TOTAL VRAM is rejected here and replaced below.
-        loaded = await _loaded_models(base_url)
-        if _model_matches(loaded, model_name):
-            resident = _resolved_from(loaded, model_name)
-            if total_mb is None or _fits(sizes.get(resident or ""), total_mb):
-                return _remember(resident)
-            logger.warning(
-                "Model %r is loaded but needs ~%.1fGB against a %.1fGB card; it "
-                "is running partly offloaded and will fail mid-request. "
-                "Replacing it with one that fits.",
-                resident, sizes.get(resident or "", 0.0) / 1024.0, total_mb / 1024.0)
-            _unusable.add(resident or "")
-
-        # 3. Load the preferred model. Eject anything else first so it has the
-        #    whole GPU — a different model left resident is wasted VRAM and can
-        #    tip the load into an out-of-memory failure. (The already-loaded case
-        #    returned at step 2, so nothing we want is being ejected here.)
-        wanted = _resolve_id(entries, model_name) or model_name
-        await _unload_all(base_url)
-
-        # 3a. Will it even fit? `lms load` reports success for a model that does
-        #     not fit — llama.cpp simply offloads part of it — and the failure
-        #     then arrives much later, as `{"error":"terminated"}` on a real
-        #     prompt, by which time the fluency windows have already been lost.
-        #     Measured: the configured qwen3.8-27b is 17.7GB of weights on a
-        #     16.3GB card, so every model pass on this machine was dying and the
-        #     shipped edit was the structural fallback. A model too big for the
-        #     GPU is not a preference to honour; it is a model that cannot serve.
-        # Let the ejection actually land before reading free VRAM. `lms unload`
-        # returns before the driver has reclaimed the memory, and measuring too
-        # early reports the GPU as still full — which would reject every model
-        # that fits and settle for the smallest one in the catalogue.
-        await asyncio.sleep(1.5)
-        free_mb = _free_vram_mb()
-        if free_mb is not None and not _fits(sizes.get(wanted), free_mb):
-            # The card may be held by the OTHER tenant: a warm ComfyUI keeps its
-            # generation models resident, and measuring against that reads every
-            # loadable language model as too big — which is how the second
-            # presentation pass of a night silently lost its planner. Ask it to
-            # let go (the mirror of the pass ejecting the LLM before ComfyUI
-            # runs), then measure again.
-            try:
-                from runtime.gpu_broker import gpu_broker
-                await gpu_broker.release_comfyui_vram()
-                await asyncio.sleep(1.5)
-                free_mb = _free_vram_mb()
-            except Exception:
-                pass
-        if free_mb is not None and not _fits(sizes.get(wanted), free_mb):
-            logger.warning(
-                "Preferred model %r needs ~%.1fGB of weights and only %.1fGB of "
-                "VRAM is free; it would load partially offloaded and then die "
-                "mid-request. Choosing the largest model that fits instead.",
-                wanted, sizes.get(wanted, 0.0) / 1024.0, free_mb / 1024.0)
-            wanted = None
+    # 1. Server up?
+    if not await is_server_up(base_url):
+        lms = find_lms_cli()
+        if not lms:
+            logger.warning("LM Studio not running and `lms` CLI not found; skipping auto-start. "
+                           "Run `lms bootstrap` once to enable it.")
+            return None
+        logger.info("LM Studio server not up — starting via `lms server start`...")
+        await _run([lms, "server", "start"], timeout=30)
+        for _ in range(25):
+            if await is_server_up(base_url):
+                break
+            await asyncio.sleep(1.0)
         else:
-            logger.info("Loading model %r into LM Studio (may take a while)...", wanted)
-            if await _try_load(base_url, wanted, load_timeout):
-                return _remember(wanted)
+            logger.warning("LM Studio server did not come up after start.")
+            return None
 
-        # 4. Try the rest of the catalogue (all ejected now, so each really is
-        #    loaded fresh rather than assumed resident). Largest first, because
-        #    capability on this task scales hard with size — a 7.5B echoes the
-        #    transcript back where a 12B removes real fumbles — but only among
-        #    the ones that actually fit.
-        alternatives = [entry.get("id") for entry in entries
-                        if entry.get("type") != "embeddings"
-                        and entry.get("id") != wanted]
-        alternatives = [a for a in alternatives if a
-                        and (free_mb is None or _fits(sizes.get(a), free_mb))]
-        alternatives.sort(key=lambda a: sizes.get(a, 0.0), reverse=True)
-        for alternative in alternatives[:3]:
-            if await _try_load(base_url, alternative, load_timeout):
-                logger.warning("Model %r is unusable; falling back to %r — expect a "
-                               "weaker edit if it is a much smaller model.",
-                               wanted, alternative)
-                return _remember(alternative)
+    entries = await catalogue(base_url)
+    sizes = await model_sizes()
+    total_mb = _total_vram_mb()
 
-        logger.warning("LM Studio is up but no model could be loaded; "
-                       "falling back to the deterministic edit.")
-        return None
+    # 2. Preferred model already loaded? Only an actual match short-circuits
+    #    here. Accepting whatever happened to be resident used to look like a
+    #    free win, but model capability is not interchangeable for this work:
+    #    a 7.5B echoes the transcript back unchanged where a 26B removes a
+    #    hundred words of fumbles. Loading the right one is worth 15 seconds.
+    #
+    #    "Loaded" is still not "usable", though. A model bigger than the card
+    #    loads with part of itself offloaded and reports success, then dies
+    #    on the first real prompt — so a resident model that cannot fit in
+    #    TOTAL VRAM is rejected here and replaced below.
+    loaded = await _loaded_models(base_url)
+    if _model_matches(loaded, model_name):
+        resident = _resolved_from(loaded, model_name)
+        if total_mb is None or _fits(sizes.get(resident or ""), total_mb):
+            return _remember(resident)
+        logger.warning(
+            "Model %r is loaded but needs ~%.1fGB against a %.1fGB card; it "
+            "is running partly offloaded and will fail mid-request. "
+            "Replacing it with one that fits.",
+            resident, sizes.get(resident or "", 0.0) / 1024.0, total_mb / 1024.0)
+        _unusable.add(resident or "")
+
+    # 3. Load the preferred model. Eject anything else first so it has the
+    #    whole GPU — a different model left resident is wasted VRAM and can
+    #    tip the load into an out-of-memory failure. (The already-loaded case
+    #    returned at step 2, so nothing we want is being ejected here.)
+    wanted = _resolve_id(entries, model_name) or model_name
+    await _unload_all(base_url)
+
+    # 3a. Will it even fit? `lms load` reports success for a model that does
+    #     not fit — llama.cpp simply offloads part of it — and the failure
+    #     then arrives much later, as `{"error":"terminated"}` on a real
+    #     prompt, by which time the fluency windows have already been lost.
+    #     Measured: the configured qwen3.8-27b is 17.7GB of weights on a
+    #     16.3GB card, so every model pass on this machine was dying and the
+    #     shipped edit was the structural fallback. A model too big for the
+    #     GPU is not a preference to honour; it is a model that cannot serve.
+    # Let the ejection actually land before reading free VRAM. `lms unload`
+    # returns before the driver has reclaimed the memory, and measuring too
+    # early reports the GPU as still full — which would reject every model
+    # that fits and settle for the smallest one in the catalogue.
+    await asyncio.sleep(1.5)
+    free_mb = _free_vram_mb()
+    if free_mb is not None and not _fits(sizes.get(wanted), free_mb):
+        # The card may be held by the OTHER tenant: a warm ComfyUI keeps its
+        # generation models resident, and measuring against that reads every
+        # loadable language model as too big — which is how the second
+        # presentation pass of a night silently lost its planner. Ask it to
+        # let go (the mirror of the pass ejecting the LLM before ComfyUI
+        # runs), then measure again.
+        try:
+            from runtime.gpu_broker import gpu_broker
+            await gpu_broker.release_comfyui_vram()
+            await asyncio.sleep(1.5)
+            free_mb = _free_vram_mb()
+        except Exception:
+            pass
+    if free_mb is not None and not _fits(sizes.get(wanted), free_mb):
+        logger.warning(
+            "Preferred model %r needs ~%.1fGB of weights and only %.1fGB of "
+            "VRAM is free; it would load partially offloaded and then die "
+            "mid-request. Choosing the largest model that fits instead.",
+            wanted, sizes.get(wanted, 0.0) / 1024.0, free_mb / 1024.0)
+        wanted = None
+    else:
+        logger.info("Loading model %r into LM Studio (may take a while)...", wanted)
+        if await _try_load(base_url, wanted, load_timeout):
+            return _remember(wanted)
+
+    # 4. Try the rest of the catalogue (all ejected now, so each really is
+    #    loaded fresh rather than assumed resident). Largest first, because
+    #    capability on this task scales hard with size — a 7.5B echoes the
+    #    transcript back where a 12B removes real fumbles — but only among
+    #    the ones that actually fit.
+    alternatives = [entry.get("id") for entry in entries
+                    if entry.get("type") != "embeddings"
+                    and entry.get("id") != wanted]
+    alternatives = [a for a in alternatives if a
+                    and (free_mb is None or _fits(sizes.get(a), free_mb))]
+    alternatives.sort(key=lambda a: sizes.get(a, 0.0), reverse=True)
+    for alternative in alternatives[:3]:
+        if await _try_load(base_url, alternative, load_timeout):
+            logger.warning("Model %r is unusable; falling back to %r — expect a "
+                           "weaker edit if it is a much smaller model.",
+                           wanted, alternative)
+            return _remember(alternative)
+
+    logger.warning("LM Studio is up but no model could be loaded; "
+                   "falling back to the deterministic edit.")
+    return None
 
 
 def _resolved_from(loaded: List[str], model_name: str) -> Optional[str]:

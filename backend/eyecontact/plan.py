@@ -22,7 +22,7 @@ right eye -> left eye), in eye widths: the eyes' symmetric resting offsets (and
 vergence) cancel in that mean, and "the subject's left" stays the same direction
 whether the video is mirrored or rotated.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -58,6 +58,11 @@ LENS_SEP_MIN_DEG = 3.0
 
 @dataclass
 class Settings:
+    mode: str = "manual"          # "auto": everything measured from the recording itself -- the frames
+                                  # where the speaker really looks into the lens say where each iris
+                                  # sits then, sideways and up/down, and every reading frame is moved
+                                  # there (see `measure_lens`). The prompter geometry below is only the
+                                  # fallback when a take has no such looks.
     prompter_side: str = "left"   # side of the lens the prompter is on, from the speaker's seat
                                   # ("left" / "right"), or "auto" to guess from eye symmetry
     angle_deg: float = 0.0        # how far (degrees) the prompter is from the lens; when > 0 it
@@ -243,10 +248,19 @@ def make_plan(pts, score, fps, s: Settings = Settings(), lens_e=None):
         return gauss_smooth(fill_gaps(b, np.isfinite(b)), fps * 0.5)
 
     nudge = s.aim_deg * EYE_WIDTHS_PER_DEGREE
+    auto = s.mode == "auto"
     # Which frames look into the camera is judged on the gaze held for a moment: a reading
     # sweep crosses toward the lens and back within a line, a look into the lens stays.
     gaze_hold = gauss_smooth(gaze_f, fps * 0.4)
-    if s.prompter_side in ("left", "right"):
+    # Each iris across the inter-ocular axis (+ = down), in eye widths: the vertical
+    # counterpart of s_e, for the measured mode.
+    t_e = {}
+    for k, e in EYES.items():
+        a, b = P(raw, e["outer"])[:, :2], P(raw, e["inner"])[:, :2]
+        w_k = np.linalg.norm(b - a, axis=1)
+        t_e[k] = ((P(raw, e["iris"])[:, :2] - (a + b) / 2) * ey).sum(1) / w_k
+    side = "auto" if auto else s.prompter_side
+    if side in ("left", "right"):
         # Reading looks toward the prompter; the lens is that angle back the other way. The
         # prompter direction is measured from reading frames only: a frame nearer the lens than
         # the prompter is the speaker looking into the camera, and a long stretch of that (an
@@ -274,7 +288,9 @@ def make_plan(pts, score, fps, s: Settings = Settings(), lens_e=None):
     else:
         reading = eye_ok
         base = baseline(eye_ok)
-        lens = np.full(n, nudge)          # "auto": the eyes' symmetric position is the lens
+        # "auto" side: the eyes' symmetric position is the lens. In the measured mode the
+        # aim nudge is not applied here: the real lens position is measured below.
+        lens = np.full(n, 0.0 if auto else nudge)
         lens_m = np.zeros(n)
     # The head's resting pitch while reading, and how far each frame has dropped from it.
     pitch_b = rolling_median(pitch, reading if reading.sum() >= 3 else eye_ok, half, stride)
@@ -285,16 +301,104 @@ def make_plan(pts, score, fps, s: Settings = Settings(), lens_e=None):
     # camera look. On the 2026-10-08 take the "camera looks" the plan trusted most were an
     # 18 s stretch between takes with the head 26 deg down and no face in the eye window.
     steady = pitch_dev < HEAD_PITCH_AWAY_DEG
+    corr_raw, w = reaim(base, lens, lens_m, gaze_f, gaze_hold, n_along, pitch_dev, valid, s)
+    corr = corr_raw * w
+
+    measured = None
+    if auto:
+        # The real target: where each iris sits when the speaker looks into the lens, from
+        # the frames the symmetric guess above left alone as camera looks (head steady).
+        # A short clip of a recording gets the whole recording's measurement (`lens_e`).
+        measured = measure_lens(lens_e, s_e, t_e, eye_ok & steady, w, gaze_f, lens_m, reading, fps, s,
+                                pitch=pitch, pitch_b=pitch_b, eye_open=eye_ok)
+        if measured:
+            lens = np.full(n, measured["lens"])
+            lens_m = lens.copy()
+            # Reading frames are judged against the measured lens now, and the prompter
+            # direction comes from them alone.
+            reading = eye_ok & (np.abs(gaze_hold - base) <= np.abs(gaze_hold - lens_m))
+            if reading.sum() >= 3:
+                base = baseline(reading)
+            # With the eyes sitting (almost) the same for reading and for the lens, "how far
+            # toward the lens" says nothing: the head says which is which instead.
+            sep = abs(float(measured["lens"] - measured["rest"]))
+            corr_raw, w = reaim(base, lens, lens_m, gaze_f, gaze_hold, n_along, pitch_dev, valid, s,
+                                gate_toward=sep >= MIN_MEASURED_SEP)
+            if measured.get("head_raise_deg", 0.0) > 0:
+                # A head up at the lens is a camera look: left alone, with a soft edge.
+                w = w * (1 - smoothstep(((pitch_b - pitch) - 0.5 * HEAD_UP_DEG) / HEAD_UP_DEG))
+            corr = corr_raw * w
+    max_shift = AUTO_MAX_SHIFT if (auto and measured) else s.max_shift
+    corr = np.clip(corr, -max_shift, max_shift)
+    corr[~valid] = 0.0
+    if auto and measured:
+        # Each eye lands on its own measured lens position, not past it.
+        limits_s = replace(s, past_lens_deg=AUTO_PAST_LENS_DEG)
+        corr_e, lens_e = per_eye_limits(corr, s_e, eye_ok & steady, w, gaze_f, lens_m, fps, limits_s, measured)
+        lens_e = dict(measured)
+        # Up/down: the measured difference between reading and the lens, same cap as the
+        # modelled version (the warp folds past ~11 deg).
+        t_cap = IRIS_SWING * np.sin(np.radians(MAX_PITCH_DEG))
+        # The irises' own vertical difference, plus the head's: a speaker who looks into
+        # the lens by lifting the head (eyes neutral in it) reads with the head bowed by
+        # `head_raise_deg`, and the eyes have to come up by that much to meet the lens.
+        head_raise = float(measured.get("head_raise_deg", 0.0))
+        t_delta = float(np.clip((measured["t_lens"] - measured["t_rest"])
+                                - IRIS_SWING * np.sin(np.radians(head_raise)), -t_cap, t_cap))
+        corr_t = t_delta * np.asarray(w, np.float64)
+        corr_t[~valid] = 0.0
+        vertical_deg = round(float(np.degrees(np.arcsin(np.clip(t_delta / IRIS_SWING, -1.0, 1.0)))), 1)
+    else:
+        corr_e, lens_e = per_eye_limits(corr, s_e, eye_ok & steady, w, gaze_f, lens_m, fps, s, lens_e)
+        corr_t, vertical_deg = vertical_shift(s, w, valid, pitch_b if s.auto_pitch else None)
+
+    return dict(pts=smooth, ex=ex, w_e=w_e, corr=corr, corr_e=corr_e, lens_e=lens_e, corr_t=corr_t,
+                gaze=gaze, gaze_f=gaze_f, base=base,
+                weight=w, eye_ok=eye_ok, valid=valid, lens_m=lens_m,
+                head_pitch_deg=float(np.median(pitch_b[eye_ok])) if eye_ok.any() else 0.0,
+                vertical_deg=vertical_deg,
+                mode=s.mode, auto_measured=bool(auto and measured),
+                measured_shift_deg=(float((measured["lens"] - measured["rest"]) / EYE_WIDTHS_PER_DEGREE)
+                                    if measured else 0.0),
+                camera_pct=float(100.0 * np.mean((w < 0.5)[valid])) if valid.any() else 0.0,
+                lens_sep_deg=float(np.median(np.abs(lens_m - base)[eye_ok]) / EYE_WIDTHS_PER_DEGREE) if eye_ok.any() else 0.0,
+                offset_deg=float(np.median((base - lens)[eye_ok]) / EYE_WIDTHS_PER_DEGREE) if eye_ok.any() else 0.0,
+                symmetry_offset_deg=float(np.median(base[eye_ok]) / EYE_WIDTHS_PER_DEGREE) if eye_ok.any() else 0.0,
+                sweep_deg=float(np.std((gaze_f - base)[eye_ok]) / EYE_WIDTHS_PER_DEGREE) if eye_ok.any() else 0.0)
+
+
+#: The measured mode may move an iris further than the modelled one (the measurement is
+#: the truth, not a guess), but never into the corner.
+AUTO_MAX_SHIFT = 0.22
+#: ...and each eye stops at its own measured lens position (plus a hair, so the shared
+#: push is not undone by the per-eye balance).
+AUTO_PAST_LENS_DEG = 1.0
+MEASURED_KEYS = ("R", "L", "rest_R", "rest_L", "t_lens", "t_rest", "lens", "rest", "head_raise_deg")
+#: A head this much above its reading pitch is up at the lens (a prompter below the lens
+#: is read with the head bowed; the look into the camera lifts it).
+HEAD_UP_DEG = 3.0
+
+
+#: Below this sideways separation (eye widths) between the measured reading and lens
+#: positions, the eyes alone cannot tell reading from a camera look.
+MIN_MEASURED_SEP = 0.01
+
+
+def reaim(base, lens, lens_m, gaze_f, gaze_hold, n_along, pitch_dev, valid, s: Settings, gate_toward=True):
+    """The shared correction (eye widths, before the weight) and its weight: only reading
+    gets re-aimed. Looking into the lens already (or past it), glancing elsewhere, big head
+    turns and lost faces are left alone, all with soft edges. The caller multiplies."""
     corr = lens - base - s.steadiness * (gaze_f - base)
-    # Only reading gets re-aimed. Looking into the lens already (or past it), glancing
-    # elsewhere, big head turns and lost faces are left alone, all with soft edges.
-    span = lens_m - base
-    span = np.where(np.abs(span) < 1e-6, 1e-6, span)
-    toward_lens = (gaze_hold - base) / span                # 0 at the prompter, 1 at the lens
-    # Full push only in the prompter's half; none from 60% of the way to the lens. Measured
-    # camera looks sat at 0.5-0.75 of the way (a centred stare reads a degree or two short of
-    # the lens) and got most of the push from a fade that started at 0.45 -- the overshoot.
-    w = 1 - smoothstep((toward_lens - 0.3) / 0.3)
+    if gate_toward:
+        span = lens_m - base
+        span = np.where(np.abs(span) < 1e-6, 1e-6, span)
+        toward_lens = (gaze_hold - base) / span            # 0 at the prompter, 1 at the lens
+        # Full push only in the prompter's half; none from 60% of the way to the lens. Measured
+        # camera looks sat at 0.5-0.75 of the way (a centred stare reads a degree or two short of
+        # the lens) and got most of the push from a fade that started at 0.45 -- the overshoot.
+        w = 1 - smoothstep((toward_lens - 0.3) / 0.3)
+    else:
+        w = np.ones(len(gaze_f))
     dev_p = np.abs(gaze_f - base)
     dev_l = np.abs(gaze_f - lens_m)
     w *= 1 - smoothstep((np.minimum(dev_p, dev_l) - s.away_lo) / (s.away_hi - s.away_lo))
@@ -302,21 +406,44 @@ def make_plan(pts, score, fps, s: Settings = Settings(), lens_e=None):
     w *= 1 - smoothstep((pitch_dev - HEAD_PITCH_AWAY_DEG) / HEAD_PITCH_AWAY_DEG)
     w *= 1 - np.clip(gauss_smooth((~valid).astype(float), 3.0) * 3, 0, 1)
     w = gauss_smooth(w, 1.0)
-    corr = np.clip(corr * w, -s.max_shift, s.max_shift)
-    corr[~valid] = 0.0
-    corr_e, lens_e = per_eye_limits(corr, s_e, eye_ok & steady, w, gaze_f, lens_m, fps, s, lens_e)
-    corr_t, vertical_deg = vertical_shift(s, w, valid, pitch_b if s.auto_pitch else None)
+    return corr, w
 
-    return dict(pts=smooth, ex=ex, w_e=w_e, corr=corr, corr_e=corr_e, lens_e=lens_e, corr_t=corr_t,
-                gaze=gaze, gaze_f=gaze_f, base=base,
-                weight=w, eye_ok=eye_ok, valid=valid, lens_m=lens_m,
-                head_pitch_deg=float(np.median(pitch_b[eye_ok])) if eye_ok.any() else 0.0,
-                vertical_deg=vertical_deg,
-                camera_pct=float(100.0 * np.mean((w < 0.5)[valid])) if valid.any() else 0.0,
-                lens_sep_deg=float(np.median(np.abs(lens_m - base)[eye_ok]) / EYE_WIDTHS_PER_DEGREE) if eye_ok.any() else 0.0,
-                offset_deg=float(np.median((base - lens)[eye_ok]) / EYE_WIDTHS_PER_DEGREE) if eye_ok.any() else 0.0,
-                symmetry_offset_deg=float(np.median(base[eye_ok]) / EYE_WIDTHS_PER_DEGREE) if eye_ok.any() else 0.0,
-                sweep_deg=float(np.std((gaze_f - base)[eye_ok]) / EYE_WIDTHS_PER_DEGREE) if eye_ok.any() else 0.0)
+
+def measure_lens(known, s_e, t_e, eye_ok, weight, gaze_f, lens_m, reading, fps, s: Settings,
+                 pitch=None, pitch_b=None, eye_open=None):
+    """Where the irises sit when the speaker looks into the lens, measured from the take.
+
+    A look into the lens is either the eyes swinging to it with the head steady (the
+    symmetric guess's own camera looks) or the head lifting to it from its reading bow
+    (`pitch` HEAD_UP_DEG above `pitch_b`, eyes open): a prompter below the lens is read
+    with the head bowed, and that speaker's eyes never move at all.
+
+    Returns {"R", "L": each eye's sideways lens position; "rest_R", "rest_L": each eye's
+    reading position; "lens", "rest": their means; "t_lens", "t_rest": the vertical
+    positions (+ = down); "head_raise_deg": how far the head comes up for the lens} in eye
+    widths, or None when the take holds fewer than LENS_LOOK_MIN_S seconds of camera looks.
+    `known` (the same dict from the whole recording) is used as is for a short clip of it."""
+    if known and all(k in known for k in MEASURED_KEYS):
+        return {k: float(known[k]) for k in MEASURED_KEYS}
+    cam = eye_ok & (weight < 0.2) & (np.abs(gaze_f - lens_m) < s.away_lo)
+    head_up = np.zeros(len(cam), bool)
+    if pitch is not None and pitch_b is not None:
+        head_up = (eye_open if eye_open is not None else eye_ok) & ((pitch_b - pitch) > HEAD_UP_DEG)
+        cam = cam | head_up
+    rest_frames = eye_ok & reading & ~cam
+    if cam.sum() < fps * LENS_LOOK_MIN_S or rest_frames.sum() < 3:
+        return None
+    out = {"head_raise_deg": 0.0}
+    if head_up.sum() >= fps * LENS_LOOK_MIN_S and pitch is not None:
+        out["head_raise_deg"] = float(max(0.0, np.median(pitch_b[rest_frames]) - np.median(pitch[head_up])))
+    for k in EYES:
+        out[k] = float(np.median(s_e[k][cam]))
+        out["rest_" + k] = float(np.median(s_e[k][rest_frames]))
+    out["lens"] = float(np.mean([out["R"], out["L"]]))
+    out["rest"] = float(np.mean([out["rest_R"], out["rest_L"]]))
+    out["t_lens"] = float(np.mean([np.median(t_e[k][cam]) for k in EYES]))
+    out["t_rest"] = float(np.mean([np.median(t_e[k][rest_frames]) for k in EYES]))
+    return out
 
 
 MAX_PITCH_DEG = 10.0       # the vertical field folds past ~11 deg (warp clamps it there anyway)
@@ -410,4 +537,5 @@ def _empty_plan(pts, valid):
     return dict(pts=np.nan_to_num(pts.astype(np.float64)), ex=np.tile([1.0, 0.0], (n, 1)),
                 w_e={"R": z + 1, "L": z + 1}, corr=z, corr_e={"R": z, "L": z}, lens_e={}, corr_t=z, gaze=z, gaze_f=z, base=z, weight=z,
                 eye_ok=np.zeros(n, bool), valid=valid, lens_m=z, camera_pct=0.0, lens_sep_deg=0.0, offset_deg=0.0, symmetry_offset_deg=0.0, sweep_deg=0.0,
-                head_pitch_deg=0.0, vertical_deg=0.0)
+                head_pitch_deg=0.0, vertical_deg=0.0, mode="manual", auto_measured=False,
+                measured_shift_deg=0.0)

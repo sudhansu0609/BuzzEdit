@@ -121,8 +121,15 @@ def _content(beat: Beat) -> str:
     return text
 
 
-def _style_for(kind: str, genre: str) -> Dict[str, object]:
-    return dict(GENRE_STYLES.get(genre, {}).get(kind, {}))
+def _style_for(kind: str, genre: str, art_style: str = "real") -> Dict[str, object]:
+    """The genre's restyling of a kind, then the art style's on top: an
+    explainer's cards are clean sans, a stick-figure video's hand-written,
+    a cartoon's loud -- whatever the genre."""
+    from . import art_style as art_mod
+    style = dict(GENRE_STYLES.get(genre, {}).get(kind, {}))
+    if not art_mod.is_real(art_style):
+        style.update(art_mod.card_style(art_style))
+    return style
 
 
 def _affinity_boost(kind: str, genre: str, genre_secondary: Optional[str]) -> float:
@@ -200,7 +207,8 @@ def place_cards(timeline: Timeline, beats: Sequence[Beat], program: Program,
             continue
         end = start + duration
         pos_y = (_dodge_face(face_anchors, program, start) if beat.kind in FACE_AVOID_KINDS else None)
-        _create(timeline, beat, start, duration, genre, fps_num, fps_den, pos_y_override=pos_y)
+        _create(timeline, beat, start, duration, genre, fps_num, fps_den, pos_y_override=pos_y,
+                art_style=settings.art_style)
         placed[zone].append((start, end))
         counts[beat.kind] = counts.get(beat.kind, 0) + 1
         logger.info("Card %s %r at %.1fs", beat.kind, (beat.text or "")[:30], start)
@@ -224,10 +232,10 @@ def _slot(wanted: float, duration: float, busy: List[Tuple[float, float]],
 
 def _create(timeline: Timeline, beat: Beat, start_s: float, duration_s: float,
             genre: str, fps_num: int, fps_den: int,
-            pos_y_override: Optional[float] = None) -> None:
+            pos_y_override: Optional[float] = None, art_style: str = "real") -> None:
     start_frame = time_to_frame(start_s, fps_num, fps_den)
     frames = max(1, time_to_frame(duration_s, fps_num, fps_den))
-    style = _style_for(beat.kind, genre)
+    style = _style_for(beat.kind, genre, art_style)
     if pos_y_override is not None:
         style["pos_y"] = pos_y_override
 
@@ -243,7 +251,7 @@ def _create(timeline: Timeline, beat: Beat, start_s: float, duration_s: float,
             "seconds": min(1.4, max(0.6, duration_s * 0.4)),
         }
         if beat.subtext:
-            label_style = _style_for("stat_label", genre)
+            label_style = _style_for("stat_label", genre, art_style)
             if pos_y_override is not None:
                 # Keep the label's usual offset below the value rather than
                 # collapsing both onto the same line (presets:

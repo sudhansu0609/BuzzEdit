@@ -355,7 +355,7 @@ export default function AgentPanel() {
       <div style={{ background: '#181825', padding: '14px', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <h4 style={{ margin: 0, color: '#a6adc8' }}>Generation Workflows</h4>
-          <button className="btn btn-sm" onClick={loadWorkflows} title="Rescan the workflows folder">↻</button>
+          <button className="btn btn-sm" onClick={loadWorkflows} title="Rescan the workflows folder" aria-label="Rescan the workflows folder">↻</button>
         </div>
         {workflows.length === 0 ? (
           <span style={{ fontSize: '12px', color: '#a6adc8' }}>
@@ -371,6 +371,7 @@ export default function AgentPanel() {
               <select
                 value={selected[role] || ''}
                 onChange={(e) => pickWorkflow(role, e.target.value)}
+                aria-label={label}
                 style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}
               >
                 <option value="">— none —</option>
@@ -398,25 +399,26 @@ export default function AgentPanel() {
       <div style={{ background: '#181825', padding: '14px', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
         <h4 style={{ margin: 0, color: '#a6adc8' }}>AI Agent Settings</h4>
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-          <input type="checkbox" checked={genBroll} onChange={(e) => setGenBroll(e.target.checked)} />
+          <input type="checkbox" checked={genBroll} aria-label="Generate AI B-Roll Overlays" onChange={(e) => setGenBroll(e.target.checked)} />
           Generate AI B-Roll Overlays (on V3, above the video)
         </label>
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-          <input type="checkbox" checked={genZoom} onChange={(e) => setGenZoom(e.target.checked)} />
+          <input type="checkbox" checked={genZoom} aria-label="Auto Zoom / Punch-ins" onChange={(e) => setGenZoom(e.target.checked)} />
           Auto Zoom / Punch-ins (Ken Burns on the speaker)
         </label>
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-          <input type="checkbox" checked={genThumb} onChange={(e) => setGenThumb(e.target.checked)} />
+          <input type="checkbox" checked={genThumb} aria-label="Generate YouTube Thumbnail" onChange={(e) => setGenThumb(e.target.checked)} />
           Generate YouTube Thumbnail
         </label>
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
-          <input type="checkbox" checked={burnCaps} onChange={(e) => setBurnCaps(e.target.checked)} />
+          <input type="checkbox" checked={burnCaps} aria-label="Burn-in Styled Captions" onChange={(e) => setBurnCaps(e.target.checked)} />
           Burn-in Styled Captions
         </label>
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 12 }}
           title="Styles every generated image and the thumbnail to the kind of video this is — a horror video gets horror imagery. Auto-detect reads it from the transcript.">
           <span style={{ minWidth: 100, color: '#bac2de' }}>Video genre</span>
           <select value={genre} onChange={(e) => setGenre(e.target.value)}
+            aria-label="Video genre"
             style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
             {GENRE_OPTIONS.map(([value, label]) => (
               <option key={value} value={value}>{label}</option>
@@ -427,6 +429,7 @@ export default function AgentPanel() {
           title="How much of the video is covered by generated B-roll. Gaps and budgets are derived from this one number.">
           <span style={{ minWidth: 100, color: '#bac2de' }}>B-roll coverage</span>
           <input type="range" min={0} max={80} step={5} value={coverage}
+            aria-label="B-roll coverage"
             onChange={(e) => setCoverage(Number(e.target.value))} style={{ flex: 1 }} />
           <span style={{ minWidth: 34, textAlign: 'right' }}>{coverage}%</span>
         </label>
@@ -434,6 +437,7 @@ export default function AgentPanel() {
           title="How far the punch-ins push toward the speaker.">
           <span style={{ minWidth: 100, color: '#bac2de' }}>Zoom depth</span>
           <input type="range" min={4} max={40} step={2} value={zoomDepth}
+            aria-label="Zoom depth"
             onChange={(e) => setZoomDepth(Number(e.target.value))} style={{ flex: 1 }} />
           <span style={{ minWidth: 34, textAlign: 'right' }}>{zoomDepth}%</span>
         </label>
@@ -443,6 +447,7 @@ export default function AgentPanel() {
             <label key={key} title={hint}
               style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: 12 }}>
               <input type="checkbox" checked={dressing[key]}
+                aria-label={label}
                 onChange={(e) => setDressing({ ...dressing, [key]: e.target.checked })} />
               {label}
             </label>
@@ -451,6 +456,7 @@ export default function AgentPanel() {
             title="Denoise, de-ess and compress the voice, then normalise the mix to -14 LUFS (YouTube's level).">
             <span style={{ minWidth: 100, color: '#bac2de' }}>Voice</span>
             <select value={voicePreset} onChange={(e) => setVoicePreset(e.target.value)}
+              aria-label="Voice"
               style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
               <option value="clean">Clean (denoise + light compression)</option>
               <option value="podcast">Podcast (fuller compression)</option>
@@ -463,6 +469,7 @@ export default function AgentPanel() {
             title="The speaker in the top-right corner over cutaways longer than 4 s. Auto: explainer genres only (horror keeps its pictures alone).">
             <span style={{ minWidth: 100, color: '#bac2de' }}>Speaker corner</span>
             <select value={pip} onChange={(e) => setPip(e.target.value)}
+              aria-label="Speaker corner"
               style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
               <option value="auto">Auto (explainers)</option>
               <option value="on">Always</option>
@@ -473,6 +480,7 @@ export default function AgentPanel() {
             title="A smaller English line under each caption. Auto: Hindi and other Indic projects when a model can translate.">
             <span style={{ minWidth: 100, color: '#bac2de' }}>English line</span>
             <select value={bilingual} onChange={(e) => setBilingual(e.target.value)}
+              aria-label="English line"
               style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
               <option value="auto">Auto (Indic projects)</option>
               <option value="on">Always</option>
@@ -483,6 +491,7 @@ export default function AgentPanel() {
             title="Edit like this channel: a reference video analysed in the Style panel. Its look and transitions win over the genre's; its motion only when auto zoom is off.">
             <span style={{ minWidth: 100, color: '#bac2de' }}>Style profile</span>
             <select value={styleProfile} onChange={(e) => setStyleProfile(e.target.value)}
+              aria-label="Style profile"
               style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
               <option value="">None (genre look)</option>
               {styleProfiles.map((p) => (
@@ -503,6 +512,7 @@ export default function AgentPanel() {
           </label>
           <textarea value={scriptText} onChange={(e) => setScriptText(e.target.value)}
             placeholder={'# The Haveli\nRaat ke do baje the... [map: Jaipur]\n\nAchanak darwaza khula. [sfx: thunder]'}
+            aria-label="Script"
             rows={5}
             style={{ width: '100%', padding: '8px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px', fontFamily: 'inherit', fontSize: 12, resize: 'vertical' }} />
           <button className="btn btn-sm" onClick={handleAlignScript} disabled={scriptBusy || !scriptText.trim()}
@@ -515,6 +525,7 @@ export default function AgentPanel() {
               title="BuzzcafAI's agents plan B-roll, cards, maps and chapter beats from this project's script or transcript, styled to this brand's genre, and hand back a directive-annotated script.">
               <span style={{ minWidth: 100, color: '#bac2de' }}>BuzzcafAI brand</span>
               <select value={buzzcafBrand} onChange={(e) => setBuzzcafBrand(e.target.value)}
+                aria-label="BuzzcafAI brand"
                 style={{ flex: 1, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
                 {BUZZCAF_BRAND_OPTIONS.map((b) => (
                   <option key={b} value={b}>{b}</option>
@@ -536,6 +547,7 @@ export default function AgentPanel() {
             placeholder="e.g. EPIC VIDEO EDIT!"
             value={customTitle}
             onChange={(e) => setCustomTitle(e.target.value)}
+            aria-label="Thumbnail Custom Title"
             style={{ width: '100%', padding: '8px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}
           />
         </div>
@@ -573,7 +585,7 @@ export default function AgentPanel() {
           🖼️ {showPrompts ? 'Hide' : 'Prompts used'}
         </button>
         {showPrompts && (
-          <button className="btn btn-sm" onClick={loadPrompts} title="Reload the prompts from the last run">↻</button>
+          <button className="btn btn-sm" onClick={loadPrompts} title="Reload the prompts from the last run" aria-label="Reload the prompts from the last run">↻</button>
         )}
         {showPrompts && prompts && !promptsError && (
           <span style={{ fontSize: 12, color: '#a6adc8' }}>{prompts.length} shot{prompts.length === 1 ? '' : 's'}</span>

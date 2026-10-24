@@ -694,14 +694,17 @@ def test_chosen_tracks_in_sequence_play_in_turn_and_loop_the_list(monkeypatch, t
     assert cues[1].gain == pytest.approx(10 ** (-14 / 20))
 
 
-def test_picked_tracks_that_cannot_be_used_leave_silence_not_a_guess(monkeypatch, tmp_path):
+def test_picked_tracks_that_cannot_be_used_fall_back_to_licensed_automatic_music(monkeypatch, tmp_path):
+    # The unusable pick is never played; the episode still gets the automatic
+    # (generated or licensed) bed instead of silence (674aefab, 2026-10-21).
     lib = _chosen_library(tmp_path)
     monkeypatch.setattr(sound, "MUSIC_DIR", lib)
     timeline = _timeline()
     settings = PresentationSettings(sfx=False, ambience=False,
                                     music_tracks=[{"file": "uploads/ripped.mp3", "volume_db": -20}])
     plan = sound.plan_sound(timeline, build_program(timeline), settings, "horror", 1)
-    assert plan.music == [] and "music_missing" in plan.notes
+    assert plan.music and "chosen_music_missing" in plan.notes
+    assert all("ripped" not in cue.path for cue in plan.music)
 
 
 # --- scene sounds ---------------------------------------------------------------

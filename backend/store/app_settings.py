@@ -26,6 +26,23 @@ class AppSettings:
         self.settings_dir.mkdir(parents=True, exist_ok=True)
         self.settings_file = self.settings_dir / "app_settings.json"
         self._cache: Dict[str, Any] = self._load()
+        self._loaded_mtime = self._mtime()
+
+    def _mtime(self) -> float:
+        try:
+            return self.settings_file.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def _refresh(self) -> None:
+        """Pick up a file written by someone else (a tool, a hand edit, another
+        process): before 2026-10-21 the cache was read once at start and every
+        save wrote the whole cache back, so a setting changed on disk was both
+        invisible to the running backend and erased by its next save."""
+        mtime = self._mtime()
+        if mtime != getattr(self, "_loaded_mtime", None):
+            self._cache = self._load()
+            self._loaded_mtime = mtime
 
     def _load(self) -> Dict[str, Any]:
         if self.settings_file.exists():
@@ -47,22 +64,27 @@ class AppSettings:
             with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
                 json.dump(self._cache, f, indent=2, ensure_ascii=False)
             os.replace(temp_path, self.settings_file)
+            self._loaded_mtime = self._mtime()
         except Exception:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
             raise
 
     def get(self, key: str, default: Any = None) -> Any:
+        self._refresh()
         return self._cache.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
+        self._refresh()
         self._cache[key] = value
         self._save()
 
     def get_all(self) -> Dict[str, Any]:
+        self._refresh()
         return dict(self._cache)
 
     def update(self, updates: Dict[str, Any]) -> None:
+        self._refresh()
         self._cache.update(updates)
         self._save()
 

@@ -1,0 +1,15 @@
+{
+  "take": "raat3baje_ep2",
+  "utterances": 516,
+  "windows": 14,
+  "removed": 128,
+  "trim": 53,
+  "kept": 335,
+  "groups": 66,
+  "drops": 49,
+  "trims": 53,
+  "removed_s_in_key": 1044.4,
+  "removed_s_as_utterances": 289.7,
+  "editorial_spans": 0,
+  "made_at": "2026-10-23T00:02:44"
+}

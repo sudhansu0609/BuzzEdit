@@ -487,24 +487,38 @@ def build_canvas_transform(
     # instead of shake. Lanczos on the upscale keeps the picture sharp.
     base = min(scale_start, scale_end, 1.0)
     base = max(0.05, base)
+    # The move's real length in frames: normally this chain's own
+    # duration_frames, but a chunk boundary may have cut this item's stream
+    # short of the animation it belongs to -- `anim_total_frames` (set by
+    # render/chunked.py:sub_timeline) is the *original* length, so both the
+    # supersampling choice and the progress expression below keep judging the
+    # move at its true speed rather than the piece's own, shorter one.
+    anim_total = t.anim_total_frames if t.anim_total_frames else duration_frames
+    span = max(1, anim_total - 1)
     # Average travel of the crop window's edge per output frame: the zoom's
     # change of window width plus the pan's slide, both in output pixels.
-    frames = max(1, duration_frames - 1)
     zoom_travel = canvas_w * abs(1.0 / max(1e-3, scale_start / base)
                                  - 1.0 / max(1e-3, scale_end / base)) / 2.0
     pan_travel = max(abs(pan_x_end - pan_x_start) * canvas_w,
                      abs(pan_y_end - pan_y_start) * canvas_h) / 2.0 * (1.0 - base / max(scale_start, scale_end, base))
     ss = _zoom_ss(canvas_w, canvas_h, base,
-                  travel_px_per_frame=(zoom_travel + pan_travel) / frames)
+                  travel_px_per_frame=(zoom_travel + pan_travel) / span)
     pre_w, pre_h = _even(canvas_w * base * ss), _even(canvas_h * base * ss)
     filters.append(f"scale={pre_w}:{pre_h}:force_original_aspect_ratio=decrease:flags=lanczos")
     filters.append(f"pad={canvas_w * ss}:{canvas_h * ss}:(ow-iw)/2:(oh-ih)/2:color=black")
 
     zoom_from, zoom_to = scale_start / base, scale_end / base
-    span = max(1, duration_frames - 1)
-    # Clamped only when offset: the plain form is what a clip that owns its whole
-    # stream needs, and `on/span` reads better in the graph.
-    raw = f"on/{span}" if frame_offset <= 0 else f"clip((on-{frame_offset})/{span},0,1)"
+    if t.anim_total_frames:
+        # A split piece: `on` restarts at 0 for this piece's own stream, so it
+        # is re-anchored onto the original move's frame count before the ratio
+        # is taken, the same way `frame_offset` re-anchors an untouched one.
+        offset = t.anim_offset_frames - frame_offset
+        on_expr = "on" if offset == 0 else f"(on{'+' if offset >= 0 else '-'}{abs(offset)})"
+        raw = f"clip({on_expr}/{span},0,1)"
+    else:
+        # Clamped only when offset: the plain form is what a clip that owns its
+        # whole stream needs, and `on/span` reads better in the graph.
+        raw = f"on/{span}" if frame_offset <= 0 else f"clip((on-{frame_offset})/{span},0,1)"
     # Smoothstep easing: a linear ramp starts and stops with a visible jolt,
     # which reads as part of the same shakiness. p*p*(3-2p) eases both ends.
     progress = f"({raw})*({raw})*(3-2*({raw}))"
@@ -567,7 +581,17 @@ def build_overlay_transform(
     pan_y_start, pan_y_end = _anim_pair(t.pos_y, t.pos_y_end)
     animated_pos = (pan_x_start != pan_x_end or pan_y_start != pan_y_end)
 
-    if animated_pos and clip_end_sec > clip_start_sec:
+    if animated_pos and t.anim_total_frames:
+        # A split piece: the pan's own span is the *original* move's length
+        # (render/chunked.py:sub_timeline), not this piece's shorter window,
+        # and `anim_offset_frames` seconds of it already played before
+        # `clip_start_sec` on this piece's own clock.
+        total_sec = max(1.0 / fps, (t.anim_total_frames - 1) / fps)
+        offset_sec = t.anim_offset_frames / fps
+        progress = f"clip((t-{_f(clip_start_sec)}+{_f(offset_sec)})/{_f(total_sec)},0,1)"
+        x_frac = f"({_f(pan_x_start)}+({_f(pan_x_end - pan_x_start)})*{progress})"
+        y_frac = f"({_f(pan_y_start)}+({_f(pan_y_end - pan_y_start)})*{progress})"
+    elif animated_pos and clip_end_sec > clip_start_sec:
         span = clip_end_sec - clip_start_sec
         progress = f"clip((t-{_f(clip_start_sec)})/{_f(span)},0,1)"
         x_frac = f"({_f(pan_x_start)}+({_f(pan_x_end - pan_x_start)})*{progress})"

@@ -113,6 +113,10 @@ async def plan_auto_edit(
             fallback = f"{type(e).__name__}: {e}"
         if fallback:
             logger.warning("Auto-edit: AI editor unavailable (%s); classic planner instead.", fallback)
+            # The editor never cuts "filler sounds" (the detector labels pauses and missed
+            # speech as fillers: 1,208 of 674aefab's pauses, 512 s, on 2026-10-21). A fallback
+            # to the classic planner must not switch that back on behind the creator's back.
+            detect_fillers = False
     if refined is None:
         refined = await refine_disfluencies(
             words,

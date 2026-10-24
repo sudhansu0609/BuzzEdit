@@ -22,7 +22,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
 
 const VITE_PREFERRED = Number.parseInt(process.env.BUZZEDIT_VITE_PORT || '', 10) || 5173;
-const BACKEND_PREFERRED = Number.parseInt(process.env.BUZZEDIT_PORT || '', 10) || 8099;
+const BACKEND_PREFERRED = Number.parseInt(process.env.BUZZEDIT_PORT || '', 10) || 8100;
 const SPAN = 20;
 
 const vitePort = await pickPort(VITE_PREFERRED, SPAN);

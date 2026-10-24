@@ -300,6 +300,7 @@ export default function RegionsTab({ projectId, voices, presets, defs, reloadEpo
                     <td className="voice-time">{formatSeconds(r.end_s)}</td>
                     <td>
                       <select className="audio-select" disabled={locked} value={r.voice || ''}
+                        aria-label={`Voice for region ${i + 1}`}
                         onChange={(e) => {
                           const voice = e.target.value;
                           edit(r.id, (x) => ({ ...x, voice }));
@@ -313,6 +314,7 @@ export default function RegionsTab({ projectId, voices, presets, defs, reloadEpo
                     </td>
                     <td>
                       <select className="audio-select" disabled={locked} value={r.preset || ''}
+                        aria-label={`Preset for region ${i + 1}`}
                         onChange={(e) => {
                           const name = e.target.value;
                           edit(r.id, (x) => withPreset(x, name));
@@ -324,6 +326,7 @@ export default function RegionsTab({ projectId, voices, presets, defs, reloadEpo
                     </td>
                     <td className="voice-center">
                       <input type="checkbox" disabled={locked} checked={!!r.params?.match_pitch}
+                        aria-label={`Match pitch for region ${i + 1}`}
                         onChange={(e) => {
                           const on = e.target.checked;
                           edit(r.id, (x) => ({ ...x, params: { ...x.params, match_pitch: on } }));
@@ -331,6 +334,7 @@ export default function RegionsTab({ projectId, voices, presets, defs, reloadEpo
                     </td>
                     <td>
                       <select className="audio-select" disabled={locked} value={pitch}
+                        aria-label={`Pitch shift for region ${i + 1}`}
                         onChange={(e) => {
                           const value = Number(e.target.value);
                           edit(r.id, (x) => ({ ...x, params: { ...x.params, pitch_shift: value } }));
@@ -341,6 +345,7 @@ export default function RegionsTab({ projectId, voices, presets, defs, reloadEpo
                     </td>
                     <td>
                       <select className="audio-select" disabled={locked} value={steps}
+                        aria-label={`Quality steps for region ${i + 1}`}
                         onChange={(e) => {
                           const value = Number(e.target.value);
                           edit(r.id, (x) => ({ ...x, params: { ...x.params, steps: value } }));
@@ -358,7 +363,7 @@ export default function RegionsTab({ projectId, voices, presets, defs, reloadEpo
                     </td>
                     <td>
                       <button type="button" className="audio-icon danger" disabled={running}
-                        title="Remove the region" onClick={() => remove(r)}>
+                        title="Remove the region" aria-label="Remove the region" onClick={() => remove(r)}>
                         ✕
                       </button>
                     </td>

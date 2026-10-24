@@ -175,12 +175,12 @@ export default function NoisePrintCard({ projectId, sourceId, outputNoiseOnly }:
         </button>
         <label className="audio-inline">
           From
-          <input className="audio-num" type="number" step="0.01" min={0} value={start}
+          <input className="audio-num" type="number" step="0.01" min={0} value={start} aria-label="From"
             onChange={(e) => setStart(e.target.value)} />
         </label>
         <label className="audio-inline">
           to
-          <input className="audio-num" type="number" step="0.01" min={0} value={end}
+          <input className="audio-num" type="number" step="0.01" min={0} value={end} aria-label="to"
             onChange={(e) => setEnd(e.target.value)} />
           s
         </label>

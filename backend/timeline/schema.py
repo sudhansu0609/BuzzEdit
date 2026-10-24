@@ -96,6 +96,15 @@ class Transform(BaseModel):
     scale_end: Optional[float] = None
     pos_x_end: Optional[float] = None
     pos_y_end: Optional[float] = None
+    # Set by chunked rendering (render/chunked.py:sub_timeline) when a chunk
+    # boundary cuts through this item's own animation: `anim_total_frames` is
+    # the move's full length (before the cut) and `anim_offset_frames` is how
+    # many of those frames play before this piece starts, so the zoom/pan
+    # expression keeps the same phase on either side of the cut instead of
+    # restarting at 0 in every chunk. None/0 (the default) leaves every
+    # progress expression exactly as it was before these fields existed.
+    anim_total_frames: Optional[int] = None
+    anim_offset_frames: int = 0
 
     def is_identity(self) -> bool:
         return (

@@ -64,6 +64,10 @@ class JobScheduler:
         self.edit_agent = EditAgent()
         self._worker_task: Optional[asyncio.Task] = None
         self._last_progress_save: float = 0.0
+        #: The running job as a task, so cancel_job can really stop it
+        #: (2026-10-21: a cancelled production kept generating for hours).
+        self._current_task: Optional[asyncio.Task] = None
+        self._cancelling: Optional[str] = None
         self._load_jobs()
 
     def _load_jobs(self):
@@ -156,15 +160,31 @@ class JobScheduler:
     def cancel_job(self, job_id: str) -> bool:
         for j in self.jobs:
             if j["id"] == job_id:
-                if j["status"] == "running":
-                    j["status"] = "cancelled"
-                else:
-                    j["status"] = "cancelled"
+                if j["status"] == "running" and self._current_task is not None \
+                        and self.current_job_id == job_id and not self._current_task.done():
+                    # Stop the work itself, not just the record: the worker
+                    # loop marks it cancelled and interrupts ComfyUI.
+                    self._cancelling = job_id
+                    self._current_task.cancel()
+                    logger.info(f"Scheduler: Cancelling the running job {job_id}")
+                    return True
+                j["status"] = "cancelled"
                 j["updated_at"] = datetime.now().isoformat()
                 self._save_jobs()
                 logger.info(f"Scheduler: Cancelled job {job_id}")
                 return True
         return False
+
+    async def _interrupt_comfyui(self) -> None:
+        """Stop whatever ComfyUI is making for the job that was just cancelled."""
+        try:
+            import requests
+            from config import COMFYUI_URL
+            base = COMFYUI_URL.rstrip("/")
+            requests.post(f"{base}/queue", json={"clear": True}, timeout=5)
+            requests.post(f"{base}/interrupt", timeout=5)
+        except Exception as e:  # noqa: BLE001 - best effort
+            logger.debug("ComfyUI interrupt skipped: %s", e)
 
     def clear_completed(self):
         self.jobs = [j for j in self.jobs if j["status"] in ("pending", "running")]
@@ -208,9 +228,20 @@ class JobScheduler:
                     # While a job runs, the backend and ComfyUI outrank
                     # background work in Sentinel (runtime/sentinel_priority.py).
                     with sentinel_priority.job():
-                        await self._process_job(job)
+                        self._current_task = asyncio.create_task(self._process_job(job))
+                        await self._current_task
                     job["status"] = "completed"
                     job["progress"] = 1.0
+                except asyncio.CancelledError:
+                    if self._cancelling != job["id"]:
+                        # The worker itself is being stopped: take the job's task down too.
+                        if self._current_task is not None and not self._current_task.done():
+                            self._current_task.cancel()
+                        raise
+                    logger.warning(f"Scheduler: Job {job['id']} cancelled while running")
+                    job["status"] = "cancelled"
+                    job["error"] = "cancelled"
+                    await self._interrupt_comfyui()
                 except Exception as e:
                     logger.error(f"Scheduler: Job {job['id']} failed: {e}")
                     job["status"] = "failed"
@@ -218,6 +249,8 @@ class JobScheduler:
                 finally:
                     job["updated_at"] = datetime.now().isoformat()
                     self.current_job_id = None
+                    self._current_task = None
+                    self._cancelling = None
                     self._save_jobs()
             else:
                 PowerManager.restore_sleep()

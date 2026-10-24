@@ -138,7 +138,8 @@ async def bench(p: Dict[str, Any], args, style_text: str = "") -> List[Dict[str,
 
     name, key, words, utts = p["name"], p["key"], p["words"], p["utterances"]
     client = editor.EditorClient(base_url=args.base_url, api_key=args.key or _studio_key(),
-                                 model=args.model, effort=args.effort)
+                                 model=args.model, effort=args.effort if args.backend == "proxy" else "",
+                                 backend=args.backend)
     results = []
     for run in range(args.runs):
         started = time.time()
@@ -197,7 +198,8 @@ async def bench_product(name: str, args) -> List[Dict[str, Any]]:
     wav = _wav(name, key)
     words = await _words(name, key, wav)
     client = editor.EditorClient(base_url=args.base_url, api_key=args.key or _studio_key(),
-                                 model=args.model, effort=args.effort)
+                                 model=args.model, effort=args.effort if args.backend == "proxy" else "",
+                                 backend=args.backend)
     results = []
     for run in range(args.runs):
         started = time.time()
@@ -243,6 +245,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--effort", default="medium")
     p.add_argument("--base-url", default="http://127.0.0.1:8787/v1")
     p.add_argument("--key", default="")
+    p.add_argument("--backend", default="proxy", choices=("proxy", "lm_studio", "ollama"),
+                   help="lm_studio/ollama: a local model, read in parts that fit its context")
     p.add_argument("--script", default="", help="written script to tag utterances with")
     p.add_argument("--no-notes", action="store_true", help="leave the audio notes out (ablation)")
     p.add_argument("--no-hints", action="store_true", help="leave similarity and script hints out (ablation)")

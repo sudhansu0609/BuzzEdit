@@ -214,8 +214,9 @@ function EyePreviewPlayer({ preview }: { preview: EyeContactPreview }) {
         </div>
       </div>
       <div className="eye-compare-controls">
-        <button className="btn btn-xs" onClick={togglePlay}>{playing ? '❚❚' : '▶'}</button>
+        <button className="btn btn-xs" onClick={togglePlay} aria-label={playing ? 'Pause' : 'Play'}>{playing ? '❚❚' : '▶'}</button>
         <input type="range" min={0} max={preview.duration_s} step={0.01} value={time}
+          aria-label="Preview position"
           onChange={(e) => seek(Number(e.target.value))} />
         <span className="text-xs text-muted">{time.toFixed(1)}s</span>
         <div className="eye-compare-modes">
@@ -311,6 +312,7 @@ function EyeContactDialog({ entry, projectId, onRun, onClose }: {
         <label>
           Prompter is on your
           <select value={setup.prompter_side}
+            aria-label="Prompter side"
             onChange={(e) => set({ prompter_side: e.target.value as EyeContactSetup['prompter_side'] })}>
             <option value="left">left of the lens</option>
             <option value="right">right of the lens</option>
@@ -322,17 +324,20 @@ function EyeContactDialog({ entry, projectId, onRun, onClose }: {
             <label>
               Re-aim angle (degrees): lower it if the eyes overshoot the lens
               <input type="number" min={1} max={45} step={0.5} value={angle ?? fromDistances}
+                aria-label="Re-aim angle"
                 onChange={(e) => set({ angle_deg: Number(e.target.value) })} />
             </label>
             <div className="text-xs text-muted">or work it out from distances:</div>
             <label>
               Sideways distance, lens to text (cm)
               <input type="number" min={0} max={200} step={1} value={setup.prompter_cm}
+                aria-label="Sideways distance to text"
                 onChange={(e) => set({ prompter_cm: Number(e.target.value), angle_deg: 0 })} />
             </label>
             <label>
               Your distance from the camera (cm)
               <input type="number" min={20} max={1000} step={5} value={setup.camera_cm}
+                aria-label="Distance from camera"
                 onChange={(e) => set({ camera_cm: Number(e.target.value), angle_deg: 0 })} />
             </label>
           </>
@@ -340,21 +345,25 @@ function EyeContactDialog({ entry, projectId, onRun, onClose }: {
         <label>
           Fine aim (degrees, + = toward your left)
           <input type="number" min={-15} max={15} step={0.5} value={setup.aim_deg}
+            aria-label="Fine aim"
             onChange={(e) => set({ aim_deg: Number(e.target.value) })} />
         </label>
         <label>
           Up / down (degrees, + = look lower, − = look higher)
           <input type="number" min={-10} max={10} step={0.5} value={setup.pitch_deg ?? 0}
+            aria-label="Up / down aim"
             onChange={(e) => set({ pitch_deg: Number(e.target.value) })} />
         </label>
         <label>
           Steadiness {Math.round(setup.steadiness * 100)}%
           <input type="range" min={0} max={1} step={0.05} value={setup.steadiness}
+            aria-label="Steadiness"
             onChange={(e) => set({ steadiness: Number(e.target.value) })} />
         </label>
         <label>
           Quality
           <select value={setup.quality}
+            aria-label="Quality"
             onChange={(e) => set({ quality: e.target.value as EyeContactSetup['quality'] })}>
             <option value="standard">standard (smaller file)</option>
             <option value="high">high (about the source size)</option>
@@ -370,6 +379,7 @@ function EyeContactDialog({ entry, projectId, onRun, onClose }: {
             <label>
               Preview {PREVIEW_SECONDS} s starting at {fmtDuration(startS) || '0:00'}
               <input type="range" min={0} max={maxStart} step={1} value={startS}
+                aria-label="Preview start time"
                 onChange={(e) => setStartS(Number(e.target.value))} />
             </label>
           )}
@@ -698,11 +708,12 @@ export default function MediaPool() {
           className="media-search"
           type="search"
           placeholder="Search library…"
+          aria-label="Search library"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
         <label className="media-copy-toggle" title="Copy files into the project folder instead of linking them where they are. Linking is instant and uses no extra disk.">
-          <input type="checkbox" checked={copyOnImport} onChange={(e) => setCopyOnImport(e.target.checked)} />
+          <input type="checkbox" aria-label="Copy in" checked={copyOnImport} onChange={(e) => setCopyOnImport(e.target.checked)} />
           <span className="text-xs text-muted">Copy in</span>
         </label>
       </div>
@@ -785,22 +796,26 @@ export default function MediaPool() {
                 )}
 
                 <div className="media-actions">
-                  <button className="media-action" title="Add at playhead"
+                  <button className="media-action" title="Add at playhead" aria-label="Add at playhead"
                     onClick={(e) => { e.stopPropagation(); handleAddToTimeline(entry); }}>＋</button>
-                  <button className="media-action" title="Rename"
+                  <button className="media-action" title="Rename" aria-label="Rename"
                     onClick={(e) => { e.stopPropagation(); setRenaming(entry.id); }}>✎</button>
                   {entry.kind === 'video' && !entry.missing && !eyeJobs[entry.id] && (
                     <button className="media-action"
                       title={entry.eye_contact
                         ? 'Re-run eye contact correction (from the original recording)'
                         : 'Fix eye contact: re-aim teleprompter gaze at the lens (GPU)'}
+                      aria-label={entry.eye_contact
+                        ? 'Re-run eye contact correction (from the original recording)'
+                        : 'Fix eye contact: re-aim teleprompter gaze at the lens (GPU)'}
                       onClick={(e) => { e.stopPropagation(); setEyeDialog(entry); }}>👁</button>
                   )}
                   {entry.eye_contact && !eyeJobs[entry.id] && (
-                    <button className="media-action" title="Revert to the original eyes"
+                    <button className="media-action" title="Revert to the original eyes" aria-label="Revert to the original eyes"
                       onClick={(e) => { e.stopPropagation(); handleRevertEyeContact(entry); }}>↺</button>
                   )}
                   <button className="media-action danger" title={entry.linked ? 'Remove from library' : 'Remove and delete the copy'}
+                    aria-label={entry.linked ? 'Remove from library' : 'Remove and delete the copy'}
                     onClick={(e) => { e.stopPropagation(); handleRemove(entry); }}>✕</button>
                 </div>
               </div>
@@ -809,6 +824,7 @@ export default function MediaPool() {
                 {renaming === entry.id ? (
                   <input
                     className="media-rename"
+                    aria-label={`Rename ${entry.name}`}
                     autoFocus
                     defaultValue={entry.name}
                     onBlur={(e) => handleRename(entry, e.target.value)}

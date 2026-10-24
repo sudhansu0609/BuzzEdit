@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException
@@ -10,6 +11,7 @@ from config import PROJECTS_DIR
 from store.project_store import ProjectStore
 from store import glossary_store
 from utils.ffmpeg_utils import extract_audio, get_video_info
+from asr import transcribe_checkpoint as ckpt
 from asr import whisper_engine
 from asr.auto_edit import plan_auto_edit, public_report, record_cut_coverage
 from asr.transliterate import to_hinglish
@@ -20,17 +22,56 @@ from timeline.schema import Timeline, frame_to_time
 router = APIRouter()
 project_store = ProjectStore(base_dir=str(PROJECTS_DIR))
 jobs: dict = {}
+#: The full answer of each completed transcription, by job id -- kept apart
+#: from `jobs` so the status polls do not carry the whole timeline.
+_responses: dict = {}
 
 
 def _stage(job_id: str, text: str) -> None:
     """Record where a running transcription is. The Studio follows this record
     (`GET /status/{job_id}`) once its own wait on the POST runs out, and reads a
     stage that keeps changing as proof the job is alive."""
-    import time
     job = jobs.get(job_id)
     if job is not None:
         job["stage"] = text
         job["updated_at"] = time.time()
+
+
+#: How often a second POST for a project already transcribing checks on the
+#: first one, and the longest it waits for it.
+_JOIN_POLL_SECONDS = 5.0
+_JOIN_MAX_SECONDS = 8 * 60 * 60
+
+
+async def _join_running(job_id: str) -> Optional[dict]:
+    """A transcription already running for this project: wait for it and hand
+    back its answer, instead of starting a second one on the same recording.
+
+    The Studio retries a transcription when it loses sight of BuzzEdit for a
+    while; before this, that retry started Whisper a second time beside the
+    first, both on the one GPU, and whichever finished last overwrote the
+    project. None when nothing is running."""
+    running = jobs.get(job_id)
+    if not running or running.get("status") != "running":
+        return None
+    logging.getLogger("transcription").info(
+        "%s is already running (%s); joining it instead of starting another.", job_id, running.get("stage"))
+    started = time.monotonic()
+    while time.monotonic() - started < _JOIN_MAX_SECONDS:
+        await asyncio.sleep(_JOIN_POLL_SECONDS)
+        current = jobs.get(job_id)
+        if not current or current.get("status") != "running":
+            break
+    current = jobs.get(job_id) or {}
+    if current.get("status") == "completed" and _responses.get(job_id) is not None:
+        return _responses[job_id]
+    if current.get("status") == "failed":
+        raise HTTPException(status_code=500, detail=str(current.get("error") or "transcription failed"))
+    raise HTTPException(status_code=409, detail="A transcription is already running for this project")
+
+
+def _save_project_sync(project_id: str, p_data: dict) -> None:
+    project_store.save_project(project_id, p_data)
 
 
 @router.get("/jobs")
@@ -52,12 +93,16 @@ async def transcribe_video(job: TranscribeJob):
         raise HTTPException(status_code=400, detail="Source video missing")
 
     job_id = f"trans_{job.project_id}"
+    joined = await _join_running(job_id)
+    if joined is not None:
+        return joined
     jobs[job_id] = {
         "id": job_id,
         "project_id": job.project_id,
         "job_type": "transcribe",
         "status": "running",
         "progress": 0.0,
+        "updated_at": time.time(),
     }
 
     try:
@@ -105,9 +150,23 @@ async def transcribe_video(job: TranscribeJob):
         vocabulary = settings.get("vocabulary")
         glossary_key = settings.get("glossary")
         glossary_map = glossary_store.load_merged(glossary_key)
-        _stage(job_id, f"transcribing with Whisper ({language or 'auto-detect'})")
-        full = await whisper_engine.transcribe_full_async(
-            audio_path, language=language, vocabulary=vocabulary, glossary=glossary_map)
+        # What an interrupted run of this same transcription left behind
+        # (asr/transcribe_checkpoint.py): Whisper's words, the planned cut.
+        # Each phase is reused when its key matches, so a retry after a crash
+        # does not spend the GPU on the same recording again.
+        ckpt_key = ckpt.key_for(source_video, language, precut, vocabulary)
+        saved = await asyncio.to_thread(ckpt.load, PROJECTS_DIR, job.project_id, ckpt_key)
+        full = saved.get(ckpt.PHASE_WHISPER) if isinstance(saved.get(ckpt.PHASE_WHISPER), dict) else None
+        if full and full.get("words"):
+            _stage(job_id, "reusing the transcription from the interrupted run")
+            logging.getLogger("transcription").info(
+                "%s: reusing Whisper's words from the checkpoint (%d words); not transcribing again.",
+                job_id, len(full["words"]))
+        else:
+            _stage(job_id, f"transcribing with Whisper ({language or 'auto-detect'})")
+            full = await whisper_engine.transcribe_full_async(
+                audio_path, language=language, vocabulary=vocabulary, glossary=glossary_map)
+            await asyncio.to_thread(ckpt.save, PROJECTS_DIR, job.project_id, ckpt_key, ckpt.PHASE_WHISPER, full)
         words = full["words"]
         detected_language = full["language"]
         settings["language"] = detected_language
@@ -135,22 +194,49 @@ async def transcribe_video(job: TranscribeJob):
             aggressiveness = float(settings.get("fumble_aggressiveness", 0.5))
             # `settings` lets the planner give a project its genre's pacing when
             # nobody chose one: horror lives in its silences.
-            _stage(job_id, "planning the cut")
-            # The written script tags each utterance with the paragraph it follows
-            # (a hint for grouping attempts, never a filter). It rides on the same
-            # settings dict the planner writes its genre pacing onto, and is
-            # popped afterwards so it is never saved with the project.
-            _with_script_text(settings, p_data)
-            try:
-                plan = await plan_auto_edit(words, audio_path, aggressiveness=aggressiveness,
-                                            settings=settings)
-            finally:
-                settings.pop("script_text", None)
-            ann_words = plan.words
-            edit_report = plan.report
+            saved_plan = saved.get(ckpt.PHASE_PLAN) if isinstance(saved.get(ckpt.PHASE_PLAN), dict) else None
+            if saved_plan and saved_plan.get("words"):
+                _stage(job_id, "reusing the planned cut from the interrupted run")
+                logging.getLogger("transcription").info(
+                    "%s: reusing the planned cut from the checkpoint; not planning again.", job_id)
+                ann_words = saved_plan["words"]
+                edit_report = dict(saved_plan.get("report") or {})
+                # Pacing the planner settled on (genre pacing, the source of it)
+                # was saved with the plan; the rebuild below reads it from settings.
+                for key, value in (saved_plan.get("settings") or {}).items():
+                    settings.setdefault(key, value)
+            else:
+                _stage(job_id, "planning the cut")
+                # The written script tags each utterance with the paragraph it follows
+                # (a hint for grouping attempts, never a filter). It rides on the same
+                # settings dict the planner writes its genre pacing onto, and is
+                # popped afterwards so it is never saved with the project.
+                _with_script_text(settings, p_data)
+                # The planner names its steps (reads, sweep, verification, final
+                # read) on this job's stage, which the Studio shows live.
+                from asr import editor_planner
+                editor_planner.set_progress(lambda text: _stage(job_id, text))
+                try:
+                    plan = await plan_auto_edit(words, audio_path, aggressiveness=aggressiveness,
+                                                settings=settings)
+                finally:
+                    editor_planner.set_progress(None)
+                    settings.pop("script_text", None)
+                ann_words = plan.words
+                edit_report = plan.report
+                await asyncio.to_thread(
+                    ckpt.save, PROJECTS_DIR, job.project_id, ckpt_key, ckpt.PHASE_PLAN,
+                    {"words": ann_words, "report": edit_report,
+                     "settings": {k: settings.get(k) for k in
+                                  ("max_pause_seconds", "pause_padding_seconds", "pacing_source", "genre")
+                                  if settings.get(k) is not None}})
 
-        # 5. Build EDL Timeline
-        tl = build_timeline_from_transcript(
+        # 5. Build EDL Timeline. The rebuild and the coverage check walk every
+        #    word of a 40-minute take: off the event loop, so the status polls
+        #    (and the health probe the Studio's watchdog relies on) keep answering.
+        _stage(job_id, "building the timeline")
+        tl = await asyncio.to_thread(
+            build_timeline_from_transcript,
             source_path=source_video,
             duration_seconds=v_info.get("duration", 0.0),
             transcript_words=ann_words,
@@ -170,7 +256,7 @@ async def transcribe_video(job: TranscribeJob):
         # The builder rebuilds V1/A1 itself, so this only scores the result: are
         # the words the planner cut actually absent from what will be rendered?
         if not precut:
-            record_cut_coverage(tl, edit_report)
+            await asyncio.to_thread(record_cut_coverage, tl, edit_report)
 
         # Report-only cut check: re-transcribe the finished cut and match it
         # against the plan, so the edit ships with a verdict on whether the video
@@ -221,22 +307,28 @@ async def transcribe_video(job: TranscribeJob):
         p_data["timeline"] = tl.model_dump()
         _stage(job_id, "saving the transcript")
         p_data["status"] = "transcribed"
-        project_store.save_project(job.project_id, p_data)
+        await asyncio.to_thread(_save_project_sync, job.project_id, p_data)
+        # Saved on the project: the checkpoint has done its job.
+        await asyncio.to_thread(ckpt.clear, PROJECTS_DIR, job.project_id)
 
-        jobs[job_id]["status"] = "completed"
-        jobs[job_id]["progress"] = 1.0
-        jobs[job_id]["result"] = {"segments_count": len(segments)}
-
-        return {
+        response = {
             "status": "completed",
             "job_id": job_id,
             "segments": len(segments),
             "timeline": tl,
             "report": public_report(edit_report),
         }
+        jobs[job_id]["result"] = {"segments_count": len(segments)}
+        _responses[job_id] = response
+        jobs[job_id]["progress"] = 1.0
+        jobs[job_id]["status"] = "completed"
+        _stage(job_id, "completed")
+        return response
     except Exception as e:
+        logging.getLogger("transcription").exception("%s failed", job_id)
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
+        _stage(job_id, "failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 _ANNOTATION_KEYS = ("enabled", "disfluency", "candidate", "reason", "take", "note", "_edit_report")
@@ -304,7 +396,9 @@ async def recut_project(project_id: str):
         finally:
             settings.pop("script_text", None)
         ann_words, edit_report = plan.words, plan.report
-        tl = build_timeline_from_transcript(
+        _stage(job_id, "building the timeline")
+        tl = await asyncio.to_thread(
+            build_timeline_from_transcript,
             source_path=source_video,
             duration_seconds=v_info.get("duration", 0.0),
             transcript_words=ann_words,
@@ -321,7 +415,7 @@ async def recut_project(project_id: str):
                                 else Transition(type="fade", duration=float(settings.get("transition_seconds", 0.25)))),
             keep_full_source=False,
         )
-        record_cut_coverage(tl, edit_report)
+        await asyncio.to_thread(record_cut_coverage, tl, edit_report)
         first = segments[0] if segments else {}
         seg = TranscriptSegment(
             id=0, start=ann_words[0]["start"], end=ann_words[-1]["end"],
@@ -335,10 +429,13 @@ async def recut_project(project_id: str):
         p_data["status"] = "transcribed"
         p_data.pop("presented_at", None)
         _stage(job_id, "saving the cut")
-        project_store.save_project(project_id, p_data)
+        await asyncio.to_thread(_save_project_sync, project_id, p_data)
+        response = {"status": "completed", "job_id": job_id, "segments": 1,
+                    "report": public_report(edit_report)}
+        _responses[job_id] = response
         jobs[job_id].update(status="completed", progress=1.0, result={"segments_count": 1})
-        return {"status": "completed", "job_id": job_id, "segments": 1,
-                "report": public_report(edit_report)}
+        _stage(job_id, "completed")
+        return response
     except HTTPException:
         raise
     except Exception as e:

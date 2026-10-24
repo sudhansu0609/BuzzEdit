@@ -117,6 +117,7 @@ export default function ExportSettings() {
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
           <select
             value={colorPreset}
+            aria-label="Color preset"
             onChange={(e) => setColorPreset(e.target.value)}
             style={{ flex: 1, padding: '8px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}
           >
@@ -135,19 +136,19 @@ export default function ExportSettings() {
         <h3 className="section-title">Output Resolution & Codec</h3>
         <div className="setting-row">
           <label className="setting-label">Format</label>
-          <select value={format} onChange={(e) => setFormat(e.target.value)}>
+          <select value={format} aria-label="Format" onChange={(e) => setFormat(e.target.value)}>
             {formats.map(f => <option key={f} value={f}>{f.toUpperCase()}</option>)}
           </select>
         </div>
         <div className="setting-row">
           <label className="setting-label">Resolution</label>
-          <select value={resolution} onChange={(e) => setResolution(e.target.value)}>
+          <select value={resolution} aria-label="Resolution" onChange={(e) => setResolution(e.target.value)}>
             {resolutions.map(r => <option key={r} value={r}>{r}</option>)}
           </select>
         </div>
         <div className="setting-row">
           <label className="setting-label">FPS</label>
-          <select value={fps} onChange={(e) => setFps(Number(e.target.value))}>
+          <select value={fps} aria-label="FPS" onChange={(e) => setFps(Number(e.target.value))}>
             <option value={24}>24</option>
             <option value={30}>30</option>
             <option value={60}>60</option>
