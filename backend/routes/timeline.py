@@ -215,9 +215,13 @@ class AspectRequest(BaseModel):
 
 
 class PreviewProxyRequest(BaseModel):
-    # 540 keeps a 1080p programme watchable while staying roughly 2.5x realtime
-    # to build; 360 is for a long edit you only want to sanity-check.
+    # 540 keeps a 1080p programme watchable; 360 is for a long edit you only
+    # want to sanity-check.
     height: int = 540
+    # A window of programme time (seconds) drafts just that stretch; its proxy
+    # sits beside the full one and its status reports `offset_s`.
+    start_s: Optional[float] = None
+    end_s: Optional[float] = None
 
 
 class CaptionsRequest(BaseModel):
@@ -768,20 +772,25 @@ async def preview_frame(project_id: str, t: float = 0.0, w: int = 640):
 
 
 @router.get("/{project_id}/preview/proxy")
-async def preview_proxy_status(project_id: str):
-    """Whether a dressed proxy exists, is building, or is behind the edit."""
+async def preview_proxy_status(project_id: str, start_s: Optional[float] = None,
+                               end_s: Optional[float] = None):
+    """Whether a dressed proxy (the full draft, or the `start_s`-`end_s`
+    window's) exists, is building, or is behind the edit."""
     _p_data, tl = _load_timeline(project_id)
-    return preview.proxy_status(project_id, tl.revision)
+    window = (start_s, end_s) if start_s is not None and end_s is not None else None
+    return preview.proxy_status(project_id, tl.revision, window=window)
 
 
 @router.post("/{project_id}/preview/proxy")
 async def preview_proxy_build(project_id: str, body: PreviewProxyRequest):
-    """Build a low-resolution encode of the dressed programme in the background.
+    """Build a draft of the dressed programme (or of one window) in the background.
 
-    Roughly 2.5x realtime, so this is deliberately something the user asks for.
+    A fast 540p draft (render/preview.py), still something the user asks for.
     """
     _p_data, tl = _load_timeline(project_id)
-    return preview.start_proxy(project_id, tl, height=body.height)
+    window = ((body.start_s, body.end_s)
+              if body.start_s is not None and body.end_s is not None else None)
+    return preview.start_proxy(project_id, tl, height=body.height, window=window)
 
 
 @router.post("/{project_id}/text/add")
@@ -875,6 +884,39 @@ async def delete_track(project_id: str, body: DeleteTrackRequest):
     return _clip_op(project_id, lambda tl: clip_ops.delete_track(tl, body.track))
 
 
+def _register_source(tl: Timeline, src_path: Path, kind: str,
+                     still_seconds: Optional[float] = None) -> SourceFile:
+    """The timeline source for a file, registering it when it is new.
+
+    A path already on the timeline reuses its existing source, so the render
+    graph never opens the same file twice. Places nothing on a track."""
+    existing = next((s for s in tl.sources.values()
+                     if Path(s.path).resolve() == src_path.resolve()), None)
+    if existing is not None:
+        return existing
+    info = media_pool.probe(src_path, kind)
+    duration = info["duration"]
+    if kind == "image":
+        duration = float(still_seconds or 5.0)
+    elif duration <= 0:
+        raise HTTPException(status_code=400, detail=f"Could not read media: {src_path.name}")
+
+    source_id = f"src_{uuid.uuid4().hex[:8]}"
+    source = SourceFile(
+        id=source_id,
+        path=str(src_path),
+        duration_seconds=duration,
+        width=int(info["width"] or 1920),
+        height=int(info["height"] or 1080),
+        fps_num=tl.fps_num,
+        fps_den=tl.fps_den,
+        has_audio=info["has_audio"],
+        kind=kind,
+    )
+    tl.sources[source_id] = source
+    return source
+
+
 @router.post("/{project_id}/add_media")
 async def add_media(project_id: str, body: AddMediaRequest):
     """Register a media file as a timeline source and place it as a clip on a track.
@@ -891,34 +933,9 @@ async def add_media(project_id: str, body: AddMediaRequest):
         raise HTTPException(status_code=400, detail=f"File not found: {body.path}")
 
     kind = media_pool.media_kind(src_path)
-
-    existing = next((s for s in tl.sources.values()
-                     if Path(s.path).resolve() == src_path.resolve()), None)
-    if existing is not None:
-        source = existing
-        source_id = existing.id
-        duration = existing.duration_seconds
-    else:
-        info = media_pool.probe(src_path, kind)
-        duration = info["duration"]
-        if kind == "image":
-            duration = float(body.duration_seconds or 5.0)
-        elif duration <= 0:
-            raise HTTPException(status_code=400, detail=f"Could not read media: {src_path.name}")
-
-        source_id = f"src_{uuid.uuid4().hex[:8]}"
-        source = SourceFile(
-            id=source_id,
-            path=str(src_path),
-            duration_seconds=duration,
-            width=int(info["width"] or 1920),
-            height=int(info["height"] or 1080),
-            fps_num=tl.fps_num,
-            fps_den=tl.fps_den,
-            has_audio=info["has_audio"],
-            kind=kind,
-        )
-        tl.sources[source_id] = source
+    source = _register_source(tl, src_path, kind, body.duration_seconds)
+    source_id = source.id
+    duration = source.duration_seconds
 
     # On an empty timeline the first clip becomes the program itself, so a project
     # built purely by dragging media in still renders. Transcribing later rebuilds
@@ -993,3 +1010,245 @@ async def add_media(project_id: str, body: AddMediaRequest):
 
     _save_timeline(project_id, p_data, tl)
     return {"status": "success", "item": item, "item_ids": [p.id for p in placed], "timeline": tl}
+
+
+# ---------------------------------------------------------------------------
+# Multicam angles and external audio sync (docs/MULTICAM_SYNC_PLAN.md)
+#
+# Undo: the angle routes are ordinary timeline edits -- the editor keeps its
+# snapshot and puts it back with POST /replace. /sync/audio pushes a version on
+# the primary source's audio_history, so POST /api/audio/{id}/undo reverts it.
+# ---------------------------------------------------------------------------
+
+class SyncAudioRequest(BaseModel):
+    media_id: str
+    # Only reported back as a hint: a transcription is never started from here.
+    retranscribe: bool = False
+
+
+class AngleSyncRequest(BaseModel):
+    media_id: str
+
+
+class AngleSetRequest(BaseModel):
+    start_frame: int                   # programme frames
+    end_frame: int
+    source_id: Optional[str] = None    # None = back to the primary
+
+
+class AngleAutoRequest(BaseModel):
+    mode: str                          # "hide_cuts" | "rhythm" | "off"
+    min_shot_s: float = 2.5
+    cadence_s: float = 8.0
+
+
+def _primary_source(tl: Timeline) -> SourceFile:
+    """The programme's own recording: the first source, as every V1/A1 route uses."""
+    if not tl.sources:
+        raise HTTPException(status_code=400, detail="The timeline has no source yet")
+    return tl.sources[list(tl.sources.keys())[0]]
+
+
+def _pool_media(p_data: Dict[str, Any], media_id: str) -> Dict[str, Any]:
+    entry = next((m for m in p_data.get("media_pool", []) if m.get("id") == media_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"No media {media_id!r} in the library")
+    path = entry.get("path") or ""
+    if not path or not Path(path).is_file():
+        raise HTTPException(status_code=400, detail=f"Media file not found: {path}")
+    return entry
+
+
+def _unreliable(result) -> HTTPException:
+    return HTTPException(status_code=422, detail={
+        "message": (f"The two soundtracks do not line up reliably (confidence "
+                    f"{result.confidence:.2f} < 1.5); nothing was changed"),
+        **result.to_dict()})
+
+
+def _measure(ref_path: str, other_path: str):
+    from sync.audio_sync import SyncError, find_offset
+    try:
+        return find_offset(ref_path, other_path)
+    except SyncError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/{project_id}/sync/audio")
+async def sync_external_audio(project_id: str, body: SyncAudioRequest):
+    """Make an external recorder's audio the programme sound of the primary source.
+
+    The recording is aligned to the primary's clock (offset, and drift corrected
+    past 20 ppm), written as a 48 kHz WAV exactly as long as the primary into
+    the project's audio/versions, and pushed on the primary's audio_history as
+    `external_audio_sync` -- so render, preview and live playback use it, and
+    POST /api/audio/{id}/undo puts the camera sound back. 422 when the match is
+    unreliable (nothing written). Re-transcribing afterwards transcribes it.
+    """
+    from routes.audio_process import _no_render_running
+    from audio import noise, processes
+    from sync.audio_sync import write_aligned_wav
+    from datetime import datetime
+
+    _no_render_running()
+    p_data, tl = _load_timeline(project_id)
+    primary = _primary_source(tl)
+    entry = _pool_media(p_data, body.media_id)
+    if entry.get("kind") not in ("audio", "video") or entry.get("has_audio") is False:
+        raise HTTPException(status_code=400, detail="That media has no audio to sync")
+    if not primary.has_audio or primary.duration_seconds <= 0:
+        raise HTTPException(status_code=400, detail="The primary source has no audio to sync against")
+    other_path = str(entry["path"])
+    result = await asyncio.to_thread(_measure, primary.path, other_path)
+    if not result.reliable:
+        raise _unreliable(result)
+
+    def write() -> Dict[str, Any]:
+        sid = primary.id
+        with processes._source_lock(project_id, sid):
+            versions = noise.audio_dir(project_id) / "versions"
+            versions.mkdir(parents=True, exist_ok=True)
+            final = versions / f"{processes._next_version(versions)}_external_audio_sync.wav"
+            write_aligned_wav(other_path, result, primary.duration_seconds, str(final))
+            version = {"path": str(final), "effect": "external_audio_sync",
+                       "params": {"media_id": body.media_id, "offset_s": result.offset_s,
+                                  "confidence": result.confidence,
+                                  "drift_ppm": result.drift_ppm},
+                       "start_s": None, "end_s": None,
+                       "created": datetime.now().isoformat(timespec="seconds")}
+
+            def push(src: Any) -> None:
+                src.audio_history.append(version)
+                src.audio_override = str(final)
+
+            state = processes._save_source(project_id, sid, push)
+        return {**state, "version": version}
+
+    try:
+        state = await asyncio.to_thread(write)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not write the synced audio: {e}")
+    return {"status": "success", **result.to_dict(), "source_id": primary.id,
+            "version_path": state["version"]["path"], "audio_override": state["audio_override"],
+            "history_len": state["history_len"], "revision": state["revision"],
+            "undo": {"method": "POST", "path": f"/api/audio/{project_id}/undo",
+                     "body": {"source_id": primary.id}},
+            "retranscribe_hint": ({"method": "POST", "path": "/api/transcription/transcribe",
+                                   "body": {"project_id": project_id}}
+                                  if body.retranscribe else None)}
+
+
+def _angles_view(p_data: Dict[str, Any], tl: Timeline) -> Dict[str, Any]:
+    from timeline.ops import angle_sources, program_angle_spans
+    if not tl.sources:
+        return {"primary_source_id": None, "angles": [], "spans": [], "stored_spans": []}
+    primary = _primary_source(tl)
+    pool = p_data.get("media_pool", []) or []
+    angles = []
+    for source in angle_sources(tl, primary.id):
+        entry = next((m for m in pool if (m.get("angle") or {}).get("source_id") == source.id), None) \
+            or next((m for m in pool if m.get("path") and Path(m["path"]).resolve()
+                     == Path(source.path).resolve()), None) or {}
+        angles.append({"source_id": source.id, "media_id": entry.get("id"),
+                       "name": entry.get("name") or Path(source.path).name,
+                       "offset_s": source.sync_offset_s, "confidence": source.sync_confidence,
+                       "width": source.width, "height": source.height,
+                       "fps": entry.get("fps") or None})
+    return {"primary_source_id": primary.id, "angles": angles,
+            "spans": program_angle_spans(tl), "stored_spans": tl.angle_spans}
+
+
+@router.post("/{project_id}/angles/sync")
+async def sync_angle(project_id: str, body: AngleSyncRequest):
+    """Register a library video as a camera angle of the primary recording.
+
+    The offset is measured from the two soundtracks and stored on the new source
+    (synced_to / sync_offset_s / sync_confidence) and mirrored on the library
+    entry as `angle`. No clip is placed: angles are chosen with /angles/set or
+    /angles/auto. 422 when the soundtracks do not line up reliably.
+    """
+    from timeline.ops import _reapply_angles
+    p_data, tl = _load_timeline(project_id)
+    primary = _primary_source(tl)
+    entry = _pool_media(p_data, body.media_id)
+    if entry.get("kind") != "video":
+        raise HTTPException(status_code=400, detail="A camera angle has to be a video")
+    if Path(entry["path"]).resolve() == Path(primary.path).resolve():
+        raise HTTPException(status_code=400, detail="That is the primary recording itself")
+    if not primary.has_audio:
+        raise HTTPException(status_code=400, detail="The primary source has no audio to sync against")
+    result = await asyncio.to_thread(_measure, primary.path, str(entry["path"]))
+    if not result.reliable:
+        raise _unreliable(result)
+
+    # Read again: the measurement takes a while and the timeline may have moved.
+    p_data, tl = _load_timeline(project_id)
+    primary = _primary_source(tl)
+    entry = _pool_media(p_data, body.media_id)
+    source = _register_source(tl, Path(entry["path"]), "video")
+    source.synced_to = primary.id
+    source.sync_offset_s = float(result.offset_s)
+    source.sync_confidence = float(result.confidence)
+    entry["angle"] = {"synced_to": primary.id, "offset_s": float(result.offset_s),
+                      "confidence": float(result.confidence), "source_id": source.id,
+                      "drift_ppm": float(result.drift_ppm)}
+    # A source already showing on V1 moves with its new offset.
+    _reapply_angles(tl, primary.id)
+    _save_timeline(project_id, p_data, tl)
+    warning = None
+    if abs(result.drift_ppm) > 20:
+        warning = (f"The two clocks drift {result.drift_ppm:+.0f} ppm; the angle's picture is "
+                   f"placed with one offset, so it slips by up to "
+                   f"{abs(result.drift_ppm) * primary.duration_seconds / 1e6:.2f}s over the take")
+    return {"status": "success", "source_id": source.id, **result.to_dict(),
+            "warning": warning, **_angles_view(p_data, tl), "timeline": tl}
+
+
+@router.get("/{project_id}/angles")
+async def list_angles(project_id: str):
+    """The synced camera angles and where each shows on the programme.
+
+    `spans` are programme frames (start/end) with the primary-source frames they
+    cover (source_start/source_end); `stored_spans` is Timeline.angle_spans."""
+    p_data, tl = _load_timeline_readonly(project_id)
+    return _angles_view(p_data, tl)
+
+
+@router.post("/{project_id}/angles/set")
+async def set_angle_range(project_id: str, body: AngleSetRequest):
+    """Show an angle (or, with source_id null, the primary) for a programme range."""
+    from timeline.ops import set_angle
+    p_data, tl = _load_timeline(project_id)
+    primary = _primary_source(tl)
+    try:
+        set_angle(tl, body.start_frame, body.end_frame, body.source_id, primary.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _save_timeline(project_id, p_data, tl)
+    return {"status": "success", "angle_spans": tl.angle_spans, "timeline": tl}
+
+
+@router.delete("/{project_id}/angles")
+async def clear_angle_spans(project_id: str):
+    """Every angle choice removed: V1 is the primary recording again."""
+    from timeline.ops import clear_angles
+    p_data, tl = _load_timeline(project_id)
+    clear_angles(tl, _primary_source(tl).id)
+    _save_timeline(project_id, p_data, tl)
+    return {"status": "success", "angle_spans": [], "timeline": tl}
+
+
+@router.post("/{project_id}/angles/auto")
+async def auto_angle_spans(project_id: str, body: AngleAutoRequest):
+    """Let the cut choose the angles: hide_cuts | rhythm | off (see ops.auto_angles)."""
+    from timeline.ops import auto_angles
+    p_data, tl = _load_timeline(project_id)
+    primary = _primary_source(tl)
+    try:
+        out = auto_angles(tl, primary.id, body.mode, min_shot_s=float(body.min_shot_s),
+                          cadence_s=float(body.cadence_s))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _save_timeline(project_id, p_data, tl)
+    return {"status": "success", "angle_spans": out["angle_spans"], "summary": out["summary"],
+            "timeline": tl}

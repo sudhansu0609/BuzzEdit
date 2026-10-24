@@ -29,10 +29,17 @@ def resolve_style_font(style: TextStyle) -> Optional[str]:
 
 def write_text_asset(content: str, assets_dir: Path) -> Path:
     assets_dir.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha1(content.encode("utf-8")).hexdigest()[:16]
+    # Line breaks are written as a lone CR, as bytes. drawtext (ffmpeg 8.1)
+    # breaks the line at CR or LF but still shapes the break character and
+    # draws its glyph: no font here maps LF, and the .notdef is a tofu box,
+    # while most fonts (Poppins, Nirmala UI, Segoe UI) map CR to an empty
+    # glyph. Text mode on Windows had also turned "\n" into "\r\n", which put
+    # the box on a line of its own (the title/body cards, 2026-10-24).
+    data = content.replace("\r\n", "\n").replace("\n", "\r").encode("utf-8")
+    digest = hashlib.sha1(data).hexdigest()[:16]
     path = assets_dir / f"text_{digest}.txt"
-    if not path.exists():
-        path.write_text(content, encoding="utf-8")
+    if not path.exists() or path.read_bytes() != data:
+        path.write_bytes(data)
     return path
 
 

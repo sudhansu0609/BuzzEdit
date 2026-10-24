@@ -433,6 +433,12 @@ class PresentationSettings(BaseModel):
     chapter_titles: bool = True      # each topic's name slams in at its start
     end_screen: bool = True          # subscribe call-out over the last seconds
     end_screen_text: str = "SUBSCRIBE"
+    # An on-screen progress bar with chapter ticks and the chapter's name
+    # (render/atmosphere `progress_bar`). `progress_bar_style`: "auto" = only
+    # for explainer genres (director.PROGRESS_GENRES), "on" = every genre,
+    # "off" = never.
+    progress_bar: bool = False
+    progress_bar_style: str = "auto"
     # A map cutaway for the first place named in a topic (drawn offline).
     maps: bool = True
     # "A versus B" as two stills side by side when the speaker compares things.
@@ -668,6 +674,13 @@ class PresentationSettings(BaseModel):
     # runs focus as a plain face spotlight, the same degrade as no backend
     # being available at all.
     person_matte: str = "auto"
+    # Emoji reactions on key spoken words (presentation.emoji_fx): "auto" runs
+    # them for infotainment-type genres only (emoji_fx.AUTO_GENRES), "on" for
+    # any genre, "off" never. At most 6 * emoji_density per minute; only the
+    # "pop" style exists so far.
+    emoji_reactions: str = "auto"
+    emoji_density: float = 1.0
+    emoji_style: str = "pop"
 
     def resolve_density(self) -> "PresentationSettings":
         """Fill any density-covered field the caller did not explicitly set
@@ -853,6 +866,8 @@ class PresentationReport(BaseModel):
     # The opening title that was drawn, if any, and the atmosphere effect applied.
     title_text: str = ""
     atmosphere_applied: str = ""
+    # The progress bar the pass drew, e.g. {"chapters": 5}; None when off.
+    progress_bar: Optional[Dict[str, Any]] = None
     grade_applied: str = ""
     topic_transitions: int = 0
     # Structure: the acts, the cold open that was cut (or why not), the listing.
@@ -903,6 +918,8 @@ class PresentationReport(BaseModel):
     text_fx_placed: Dict[str, int] = Field(default_factory=dict)
     person_matte_used: str = ""
     text_fx_skipped: List[Dict[str, str]] = Field(default_factory=list)
+    # Emoji reactions placed (presentation.emoji_fx); None when the pass did not run.
+    emoji_reactions: Optional[int] = None
     # Designed graphics (presentation/graphics.py) placed, by kind -- the
     # full-frame layouts, the live speaker slots and the overlays.
     designed_graphics: Dict[str, int] = Field(default_factory=dict)

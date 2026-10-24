@@ -269,6 +269,30 @@ def sub_timeline(timeline: Timeline, a: int, b: int) -> Timeline:
         item.timeline_start_frame, item.timeline_end_frame = s - a, e - a
         items.append(item)
     copy.items = items
+    # A progress bar is drawn on programme time, not chunk time: tell it where
+    # this chunk starts and how long the whole programme is (render/atmosphere
+    # `_progress_bar`). Per-clip copies (adjustment layers) too.
+    # The text-fx effects (knockout, behind_head, focus, annotation,
+    # newspaper_sweep, ...) carry their window as `extra` start_s/end_s on
+    # programme time, read as between(t, start_s, end_s) (and as the matte's
+    # setpts anchor). The chunk restarts t at 0, so the window moves with it.
+    # An effect whose window misses this chunk is disabled. `matte_offset` is
+    # a seek into the matte file, not programme time, so it stays.
+    fps = timeline.fps_num / max(1, timeline.fps_den)
+    off_s, span_s = a / fps, (b - a) / fps
+    for effect in list(copy.effects) + [e for i in items for e in i.atmosphere]:
+        if (effect.type or "").lower() == "progress_bar":
+            effect.extra["_offset_s"] = float(effect.extra.get("_offset_s") or 0.0) + off_s
+            effect.extra["_programme_s"] = float(effect.extra.get("_programme_s")
+                                                 or timeline.duration_frames / fps)
+        elif "start_s" in effect.extra or "end_s" in effect.extra:
+            start = float(effect.extra.get("start_s") or 0.0)
+            end = float(effect.extra.get("end_s", start) or 0.0)
+            if end <= off_s or start >= off_s + span_s:
+                effect.enabled = False
+            effect.extra["start_s"] = start - off_s
+            if "end_s" in effect.extra:
+                effect.extra["end_s"] = end - off_s
     copy.duration_frames = b - a
     if a > 0:
         copy.program_offset_frames = 0
@@ -443,6 +467,7 @@ async def render_chunked(
     prefer_nvenc: bool,
     progress_callback: Optional[Callable[[float], None]] = None,
     workers: Optional[int] = None,
+    encoder_profile: str = "final",
 ) -> Optional[str]:
     """Render `timeline` in parallel chunks. Returns the output path, or None
     when the programme is too short or offers no safe cut (the caller then
@@ -459,7 +484,7 @@ async def render_chunked(
 
     _cleanup_old_work_dirs()
 
-    encoder = [f for f in get_encoder_flags(prefer_nvenc=prefer_nvenc)]
+    encoder = [f for f in get_encoder_flags(prefer_nvenc=prefer_nvenc, profile=encoder_profile)]
     # Video only per chunk; the audio flags and faststart belong to the final mux.
     video_flags: List[str] = []
     skip = 0

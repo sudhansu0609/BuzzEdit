@@ -1,6 +1,6 @@
 import logging
 import uuid
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from .schema import Timeline, TimelineItem, WordItem, SourceFile, Transform
 
 logger = logging.getLogger("timeline.ops")
@@ -293,6 +293,8 @@ def rebuild_primary_tracks(timeline: Timeline, primary_source_id: str) -> None:
     _rebuild_primary_tracks_inner(timeline, primary_source_id)
     if timeline.manual_cuts:
         trim_source_regions(timeline, timeline.manual_cuts, primary_source_id)
+    # Camera angles last: they repoint pieces of the finished cut, never change it.
+    apply_angle_spans(timeline, primary_source_id)
 
 
 def _rebuild_primary_tracks_inner(timeline: Timeline, primary_source_id: str) -> None:
@@ -628,11 +630,15 @@ def trim_source_regions(timeline: Timeline, regions: List[List[int]],
 
     v1 = sorted([i for i in timeline.items if i.track == "V1"],
                 key=lambda i: i.timeline_start_frame)
+    # Camera-angle pieces are read back in primary frames, and the pieces one
+    # segment was split into for them are joined again; the angles are laid
+    # back over the result at the end.
+    spans_now = _merge_angle_pieces([(*v1_primary_span(timeline, i), i.anchor_word_id)
+                                     for i in v1])
     segments: List[tuple] = []
-    for item in v1:
-        for start, end in _subtract_regions(
-                [item.source_start_frame, item.source_end_frame], collapsed):
-            segments.append((start, end, item.anchor_word_id))
+    for p_start, p_end, anchor in spans_now:
+        for start, end in _subtract_regions([p_start, p_end], collapsed):
+            segments.append((start, end, anchor))
     if [(a, b) for a, b, _ in segments] == [(i.source_start_frame, i.source_end_frame) for i in v1]:
         return 0                                       # nothing overlapped (an edge trim keeps the
                                                        # count, so compare the spans themselves)
@@ -657,6 +663,7 @@ def trim_source_regions(timeline: Timeline, regions: List[List[int]],
             timeline.items.append(item)
         current = tl_end
 
+    apply_angle_spans(timeline, primary_source_id)
     timeline.recalculate_duration()
     timeline.revision += 1
     return len(collapsed)
@@ -702,8 +709,9 @@ def cut_program_range(timeline: Timeline, start_frame: int, end_frame: int,
         overlap_end = min(item.timeline_end_frame, end_frame)
         if overlap_end <= overlap_start:
             continue
-        src_start = item.source_start_frame + (overlap_start - item.timeline_start_frame)
-        src_end = item.source_start_frame + (overlap_end - item.timeline_start_frame)
+        primary_start, _primary_end = v1_primary_span(timeline, item)
+        src_start = primary_start + (overlap_start - item.timeline_start_frame)
+        src_end = primary_start + (overlap_end - item.timeline_start_frame)
         if src_end > src_start:
             new_spans.append([src_start, src_end])
 
@@ -798,3 +806,423 @@ def add_broll_item(
     timeline.recalculate_duration()
     timeline.revision += 1
     return broll_item
+
+
+# ---------------------------------------------------------------------------
+# Camera angles (MULTICAM_SYNC_PLAN.md §3-5)
+#
+# Every source's frames are counted at the TIMELINE fps (the compiler, clip_ops
+# and program_time all read source_start_frame that way; the per-clip fps=
+# filter resamples the picture), so moving a piece of the cut from the primary
+# to a synced angle is a constant frame shift:
+#     angle_frame = primary_frame + round(sync_offset_s * tl_fps)
+# whatever rate the angle was recorded at.
+# ---------------------------------------------------------------------------
+
+_SENTENCE_END = (".", "?", "!", "।", "॥", "…", ";", ":")
+RHYTHM_GAP_SECONDS = 0.6
+
+
+def angle_offset_frames(timeline: Timeline, source: SourceFile) -> int:
+    """Frames to add to a primary-source frame to land on the same instant of `source`."""
+    fps = timeline.fps_num / max(1, timeline.fps_den)
+    return int(round(float(source.sync_offset_s or 0.0) * fps))
+
+
+def _angle_frames(timeline: Timeline, source: SourceFile) -> int:
+    fps = timeline.fps_num / max(1, timeline.fps_den)
+    return int(round(float(source.duration_seconds or 0.0) * fps))
+
+
+def v1_primary_span(timeline: Timeline, item: TimelineItem) -> Tuple[int, int]:
+    """A V1 item's [start, end) in PRIMARY-source frames.
+
+    The same as its own source frames, except for a piece that shows a synced
+    camera angle, whose frames are on the angle's clock. Everything that maps the
+    transcript through V1 (captions, cut_program_range, kept words) reads V1
+    through this so an angle piece still lines up with its words."""
+    source = timeline.sources.get(item.source_id or "")
+    if source is not None and source.synced_to:
+        shift = angle_offset_frames(timeline, source)
+        return item.source_start_frame - shift, item.source_end_frame - shift
+    return item.source_start_frame, item.source_end_frame
+
+
+def is_angle_switch(timeline: Timeline, before: TimelineItem, after: TimelineItem) -> bool:
+    """Two adjacent V1 clips of different sources that are one continuous moment of
+    the primary recording: a change of camera, not a jump cut."""
+    if not before.source_id or not after.source_id or before.source_id == after.source_id:
+        return False
+    if before.timeline_end_frame != after.timeline_start_frame:
+        return False
+    return v1_primary_span(timeline, before)[1] == v1_primary_span(timeline, after)[0]
+
+
+def _merge_angle_pieces(spans: List[tuple]) -> List[tuple]:
+    """Join contiguous (start, end, anchor) pieces of one anchored segment."""
+    merged: List[list] = []
+    for start, end, anchor in spans:
+        if (merged and anchor is not None and merged[-1][2] == anchor
+                and merged[-1][1] == start):
+            merged[-1][1] = end
+        else:
+            merged.append([start, end, anchor])
+    return [tuple(m) for m in merged]
+
+
+def angle_sources(timeline: Timeline, primary_source_id: str) -> List[SourceFile]:
+    """The camera angles synced to the primary, in the order they were added."""
+    return [s for s in timeline.sources.values()
+            if s.synced_to == primary_source_id and s.id != primary_source_id]
+
+
+def _clean_spans(timeline: Timeline, primary_source_id: str) -> List[Dict[str, Any]]:
+    spans = []
+    for span in timeline.angle_spans or []:
+        try:
+            start, end, sid = int(span["start"]), int(span["end"]), span.get("source_id")
+        except (KeyError, TypeError, ValueError):
+            continue
+        source = timeline.sources.get(sid or "")
+        if end > start and source is not None and sid != primary_source_id and source.synced_to:
+            spans.append({"start": start, "end": end, "source_id": sid})
+    return sorted(spans, key=lambda s: s["start"])
+
+
+def _unapply_angle_spans(timeline: Timeline, primary_source_id: str) -> None:
+    """Put every auto V1 angle piece back on the primary and rejoin the split segments."""
+    fresh: List[TimelineItem] = []
+    pending: Optional[TimelineItem] = None
+    for item in timeline.items:
+        if item.track != "V1" or item.origin != "auto" or item.kind != "media":
+            if pending is not None:
+                fresh.append(pending)
+                pending = None
+            fresh.append(item)
+            continue
+        source = timeline.sources.get(item.source_id or "")
+        if source is not None and source.synced_to == primary_source_id:
+            start, end = v1_primary_span(timeline, item)
+            item.source_id = primary_source_id
+            item.source_start_frame, item.source_end_frame = start, end
+        if (pending is not None and item.source_id == pending.source_id
+                and item.anchor_word_id is not None
+                and item.anchor_word_id == pending.anchor_word_id
+                and pending.source_end_frame == item.source_start_frame
+                and pending.timeline_end_frame == item.timeline_start_frame):
+            pending.source_end_frame = item.source_end_frame
+            pending.timeline_end_frame = item.timeline_end_frame
+            continue
+        if pending is not None:
+            fresh.append(pending)
+        pending = item
+    if pending is not None:
+        fresh.append(pending)
+    timeline.items = fresh
+
+
+def apply_angle_spans(timeline: Timeline, primary_source_id: str) -> int:
+    """Show the chosen camera angle on V1 for every `angle_spans` span.
+
+    Splits the transcript-built (origin "auto") V1 clips of the primary at the
+    span edges and repoints the pieces inside a span at the angle, shifted onto
+    its clock. A piece the angle did not record (it started late or stopped
+    early) stays on the primary. A1 is never touched -- the sound stays
+    continuous on the primary (or its audio_override) -- and link_id, anchor
+    word, transform and grade ride along on every piece. Idempotent. Returns
+    the number of V1 pieces now on an angle.
+    """
+    spans = _clean_spans(timeline, primary_source_id)
+    if not spans:
+        return 0
+    covers: Dict[str, Tuple[int, int, int]] = {}
+    for span in spans:
+        source = timeline.sources[span["source_id"]]
+        shift = angle_offset_frames(timeline, source)
+        # Primary frames the angle has picture for: [-shift, angle_len - shift).
+        covers[source.id] = (shift, -shift, _angle_frames(timeline, source) - shift)
+
+    placed = 0
+    out: List[TimelineItem] = []
+    for item in timeline.items:
+        if (item.track != "V1" or item.origin != "auto" or item.kind != "media"
+                or item.source_id != primary_source_id
+                or item.source_end_frame <= item.source_start_frame):
+            out.append(item)
+            continue
+        s, e = item.source_start_frame, item.source_end_frame
+        edges = {s, e}
+        for span in spans:
+            if span["start"] < e and span["end"] > s:
+                _shift, lo, hi = covers[span["source_id"]]
+                for edge in (span["start"], span["end"], lo, hi):
+                    if s < edge < e:
+                        edges.add(edge)
+        bounds = sorted(edges)
+        pieces: List[list] = []
+        for a, b in zip(bounds, bounds[1:]):
+            target = None
+            for span in spans:
+                if span["start"] <= a and b <= span["end"]:
+                    _shift, lo, hi = covers[span["source_id"]]
+                    if lo <= a and b <= hi:
+                        target = span["source_id"]
+                    break
+            if pieces and pieces[-1][2] == target:
+                pieces[-1][1] = b
+            else:
+                pieces.append([a, b, target])
+        if all(target is None for _a, _b, target in pieces):
+            out.append(item)
+            continue
+        for index, (a, b, target) in enumerate(pieces):
+            update: Dict[str, Any] = {
+                "id": item.id if index == 0 else f"{item.id}_ang{index}",
+                "source_start_frame": a,
+                "source_end_frame": b,
+                "timeline_start_frame": item.timeline_start_frame + (a - s),
+                "timeline_end_frame": item.timeline_start_frame + (b - s),
+            }
+            if index > 0:
+                update["transition"] = None   # a switch inside one take is a hard cut
+            if target is not None:
+                shift = covers[target][0]
+                update.update(source_id=target, source_start_frame=a + shift,
+                              source_end_frame=b + shift)
+                placed += 1
+            out.append(item.model_copy(deep=True, update=update))
+    timeline.items = out
+    return placed
+
+
+def _reapply_angles(timeline: Timeline, primary_source_id: str) -> None:
+    _unapply_angle_spans(timeline, primary_source_id)
+    apply_angle_spans(timeline, primary_source_id)
+    timeline.recalculate_duration()
+    timeline.revision += 1
+
+
+def _program_to_primary(timeline: Timeline, start_frame: int,
+                        end_frame: int) -> List[List[int]]:
+    """A programme range as primary-source spans (cut_program_range's mapping).
+
+    Material the cut removed between two consecutive pieces of the range is
+    bridged, so one programme range is one span -- the same shape auto_angles
+    writes -- and a word restored inside it later shows the same angle."""
+    spans: List[List[int]] = []
+    for item in sorted([i for i in timeline.items if i.track == "V1" and i.kind == "media"],
+                       key=lambda i: i.timeline_start_frame):
+        lo = max(item.timeline_start_frame, start_frame)
+        hi = min(item.timeline_end_frame, end_frame)
+        if hi <= lo:
+            continue
+        p_start, _p_end = v1_primary_span(timeline, item)
+        span = [p_start + (lo - item.timeline_start_frame), p_start + (hi - item.timeline_start_frame)]
+        if spans and span[0] >= spans[-1][1]:
+            spans[-1][1] = span[1]                 # bridge the removed gap
+        else:
+            spans.append(span)
+    return _merge_regions(spans)
+
+
+def _write_spans(timeline: Timeline, primary_source_id: str,
+                 ranges: List[List[int]], source_id: Optional[str]) -> None:
+    """Overwrite `ranges` (primary frames) with `source_id` (None = the primary)."""
+    kept: List[Dict[str, Any]] = []
+    for span in _clean_spans(timeline, primary_source_id):
+        for a, b in _subtract_regions([span["start"], span["end"]], ranges):
+            kept.append({"start": a, "end": b, "source_id": span["source_id"]})
+    if source_id is not None:
+        kept.extend({"start": a, "end": b, "source_id": source_id} for a, b in ranges)
+    kept.sort(key=lambda s: s["start"])
+    merged: List[Dict[str, Any]] = []
+    for span in kept:
+        if merged and merged[-1]["source_id"] == span["source_id"] \
+                and span["start"] <= merged[-1]["end"]:
+            merged[-1]["end"] = max(merged[-1]["end"], span["end"])
+        else:
+            merged.append(dict(span))
+    timeline.angle_spans = merged
+
+
+def set_angle(timeline: Timeline, start_frame: int, end_frame: int,
+              source_id: Optional[str], primary_source_id: str) -> List[Dict[str, Any]]:
+    """Show `source_id` for the PROGRAMME range [start_frame, end_frame).
+
+    The range is mapped through V1 to primary-source spans (like
+    cut_program_range) and stored in `angle_spans`, overwriting whatever was
+    chosen there before; `source_id` None (or the primary) puts the primary back.
+    The angle layer is then laid again over the current cut.
+    """
+    start_frame, end_frame = int(start_frame), int(end_frame)
+    if start_frame < 0 or end_frame <= start_frame:
+        raise ValueError("set_angle: invalid or empty range")
+    if source_id == primary_source_id:
+        source_id = None
+    if source_id is not None:
+        source = timeline.sources.get(source_id)
+        if source is None:
+            raise ValueError(f"set_angle: no source {source_id!r}")
+        if source.synced_to != primary_source_id:
+            raise ValueError(f"set_angle: {source_id} is not a camera angle synced to the primary")
+    ranges = _program_to_primary(timeline, start_frame, end_frame)
+    if not ranges:
+        raise ValueError("set_angle: the range holds no V1 footage")
+    _write_spans(timeline, primary_source_id, ranges, source_id)
+    _reapply_angles(timeline, primary_source_id)
+    return timeline.angle_spans
+
+
+def clear_angles(timeline: Timeline, primary_source_id: str) -> None:
+    timeline.angle_spans = []
+    _reapply_angles(timeline, primary_source_id)
+
+
+def program_angle_spans(timeline: Timeline) -> List[Dict[str, Any]]:
+    """The programme view of the angle choice: one entry per run of V1 on an angle,
+    {start, end (programme frames), source_id, source_start, source_end (primary frames)}."""
+    out: List[Dict[str, Any]] = []
+    v1 = sorted([i for i in timeline.items if i.track == "V1" and i.kind == "media"],
+                key=lambda i: i.timeline_start_frame)
+    for item in v1:
+        source = timeline.sources.get(item.source_id or "")
+        if source is None or not source.synced_to:
+            continue
+        p_start, p_end = v1_primary_span(timeline, item)
+        if out and out[-1]["source_id"] == item.source_id \
+                and out[-1]["end"] == item.timeline_start_frame:
+            out[-1]["end"] = item.timeline_end_frame
+            out[-1]["source_end"] = p_end
+        else:
+            out.append({"start": item.timeline_start_frame, "end": item.timeline_end_frame,
+                        "source_id": item.source_id, "source_start": p_start,
+                        "source_end": p_end})
+    return out
+
+
+def _covered_by(timeline: Timeline, source: SourceFile, p_start: int, p_end: int) -> bool:
+    shift = angle_offset_frames(timeline, source)
+    return -shift <= p_start and p_end <= _angle_frames(timeline, source) - shift
+
+
+def _rhythm_points(timeline: Timeline, v1: List[TimelineItem]) -> List[Tuple[int, bool]]:
+    """(primary frame, at a jump cut) of each sentence/segment boundary that plays."""
+    fps = timeline.fps_num / max(1, timeline.fps_den)
+    gap_frames = int(round(RHYTHM_GAP_SECONDS * fps))
+    words = sorted((w for w in timeline.words if w.enabled), key=lambda w: w.start_frame)
+    spans = [v1_primary_span(timeline, i) for i in v1]
+    points: List[Tuple[int, bool]] = []
+    for prev, nxt in zip(words, words[1:]):
+        ends_sentence = (prev.text or "").strip().endswith(_SENTENCE_END)
+        if not ends_sentence and nxt.start_frame - prev.end_frame < gap_frames:
+            continue
+        index = next((k for k, (a, b) in enumerate(spans) if a <= nxt.start_frame < b), None)
+        if index is None:
+            continue
+        p_start = spans[index][0]
+        if p_start >= prev.end_frame and index > 0:
+            points.append((p_start, True))        # the boundary is a jump cut: switch on it
+        else:
+            points.append((max(p_start, (prev.end_frame + nxt.start_frame) // 2), False))
+    return points
+
+
+def auto_angles(timeline: Timeline, primary_source_id: str, mode: str,
+                min_shot_s: float = 2.5, cadence_s: float = 8.0) -> Dict[str, Any]:
+    """Choose the angle spans automatically and lay them.
+
+    hide_cuts: every jump cut becomes an angle change (rotating primary, angle 1,
+    angle 2, ...), so the head-position snap reads as a camera cut. A cut under a
+    B-roll window is already hidden and gets no switch; no shot is shorter than
+    `min_shot_s` (a cut that would make one stays a plain jump cut).
+    rhythm: switch at sentence/segment boundaries (end punctuation, or a gap of
+    0.6 s or more) roughly every `cadence_s`.
+    off: clear every span.
+    Returns {"angle_spans", "summary": {switches, cuts_hidden, cuts_total,
+    cuts_by_angle, cuts_by_broll, mode}}.
+    """
+    from presentation.placement import broll_windows, jump_cut_times
+
+    mode = (mode or "").strip().lower()
+    if mode not in ("hide_cuts", "rhythm", "off"):
+        raise ValueError(f"auto_angles: unknown mode {mode!r} (hide_cuts | rhythm | off)")
+    fps = timeline.fps_num / max(1, timeline.fps_den)
+
+    # Decide on the cut without any angle on it.
+    timeline.angle_spans = []
+    _reapply_angles(timeline, primary_source_id)
+    cuts = jump_cut_times(timeline)
+    windows = broll_windows(timeline)
+
+    def under_broll(t: float) -> bool:
+        return any(start + 0.1 <= t <= end - 0.1 for start, end in windows)
+
+    cuts_by_broll = sum(1 for t in cuts if under_broll(t))
+    summary: Dict[str, Any] = {"mode": mode, "switches": 0, "cuts_total": len(cuts),
+                               "cuts_by_angle": 0, "cuts_by_broll": cuts_by_broll,
+                               "cuts_hidden": cuts_by_broll}
+    if mode == "off":
+        return {"angle_spans": [], "summary": summary}
+
+    angles = angle_sources(timeline, primary_source_id)
+    if not angles:
+        raise ValueError("auto_angles: no camera angle is synced to the primary")
+    v1 = sorted([i for i in timeline.items if i.track == "V1" and i.enabled and i.kind == "media"],
+                key=lambda i: i.timeline_start_frame)
+    if not v1:
+        return {"angle_spans": [], "summary": summary}
+    spans_p = [v1_primary_span(timeline, i) for i in v1]
+
+    def prog_s(p_frame: int) -> Optional[float]:
+        for (a, b), item in zip(spans_p, v1):
+            if a <= p_frame < b:
+                return (item.timeline_start_frame + (p_frame - a)) / fps
+        return None
+
+    program_start = v1[0].timeline_start_frame / fps
+    program_end = v1[-1].timeline_end_frame / fps
+    if mode == "hide_cuts":
+        candidates = [(spans_p[k + 1][0], True) for k in range(len(v1) - 1)]
+    else:
+        candidates = _rhythm_points(timeline, v1)
+    min_gap = max(min_shot_s, cadence_s) if mode == "rhythm" else min_shot_s
+
+    rotation: List[Optional[SourceFile]] = [None, *angles]
+    current, last_switch = 0, program_start
+    switches: List[Tuple[int, int, bool]] = []     # (primary frame, rotation index, at a cut)
+    last_p_end = spans_p[-1][1]
+    for p_frame, at_cut in sorted(set(candidates)):
+        t = prog_s(p_frame)
+        if t is None or under_broll(t):
+            continue
+        if t - last_switch < min_gap - 1e-6 or program_end - t < min_shot_s - 1e-6:
+            continue
+        # The next angle in the rotation that has picture for the shot it would open.
+        shot_end = min(last_p_end, p_frame + int(round(min_shot_s * fps)))
+        chosen = None
+        for step in range(1, len(rotation)):
+            index = (current + step) % len(rotation)
+            source = rotation[index]
+            if source is None or _covered_by(timeline, source, p_frame, shot_end):
+                chosen = index
+                break
+        if chosen is None:
+            continue
+        switches.append((p_frame, chosen, at_cut))
+        current, last_switch = chosen, t
+
+    spans: List[Dict[str, Any]] = []
+    for n, (p_frame, index, _at_cut) in enumerate(switches):
+        source = rotation[index]
+        if source is None:
+            continue
+        end = switches[n + 1][0] if n + 1 < len(switches) else last_p_end
+        if end > p_frame:
+            spans.append({"start": p_frame, "end": end, "source_id": source.id})
+    timeline.angle_spans = spans
+    _reapply_angles(timeline, primary_source_id)
+
+    by_angle = sum(1 for _p, _i, at_cut in switches if at_cut)
+    summary.update(switches=len(switches), cuts_by_angle=by_angle,
+                   cuts_hidden=by_angle + cuts_by_broll)
+    return {"angle_spans": timeline.angle_spans, "summary": summary}

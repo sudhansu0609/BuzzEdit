@@ -439,19 +439,28 @@ def _stamp(seconds: float) -> str:
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
-def chapters_for(topics: Sequence[Topic], offset_s: float = 0.0,
-                 min_gap_s: float = 10.0) -> List[Tuple[str, str]]:
-    """(timestamp, name) per chapter; YouTube wants the first at 0:00 and at
-    least ten seconds between chapters."""
-    out: List[Tuple[str, str]] = []
+def chapter_seconds(topics: Sequence[Topic], offset_s: float = 0.0,
+                    min_gap_s: float = 10.0) -> List[Tuple[float, str]]:
+    """(programme seconds, name) per chapter -- the same chapters as
+    `chapters_for`, unrounded (the on-screen progress bar places its ticks
+    from these)."""
+    out: List[Tuple[float, str]] = []
     last = -min_gap_s
     for index, topic in enumerate(sorted(topics, key=lambda t: t.start_s)):
         at = 0.0 if index == 0 else topic.start_s + offset_s
         if index and at - last < min_gap_s:
             continue
         name = (topic.heading or topic.topic or f"Part {index + 1}").strip()
-        out.append((_stamp(at), name[:60]))
+        out.append((at, name[:60]))
         last = at
+    return out
+
+
+def chapters_for(topics: Sequence[Topic], offset_s: float = 0.0,
+                 min_gap_s: float = 10.0) -> List[Tuple[str, str]]:
+    """(timestamp, name) per chapter; YouTube wants the first at 0:00 and at
+    least ten seconds between chapters."""
+    out = [(_stamp(at), name) for at, name in chapter_seconds(topics, offset_s, min_gap_s)]
     if out and out[0][0] != "0:00":
         out[0] = ("0:00", out[0][1])
     return out

@@ -450,8 +450,11 @@ MOODS: Dict[str, Dict[str, Any]] = {
     "horror_narrator": {
         "id": "horror_narrator", "label": "Horror / detective narrator",
         "description": "Slow, grave, low-key: the voice of a case file read back in the dark.",
-        "style": {"exaggeration": 0.3, "cfg_weight": 0.25, "temperature": 0.6, "pace": 0.85,
-                  "word_gap_ms": 70, "phrase_pause_s": 0.3, "sentence_pause_s": 0.6},
+        # Tempo picked by the creator 2026-10-24 ("faster_b"): 0.85 with 0.6 s sentence pauses
+        # plus the director's pause cues read "very slow" in a 90 s reel; 0.93 then needed to be
+        # "slightly slower" (same day), so 0.90 with a little more air between words and lines.
+        "style": {"exaggeration": 0.3, "cfg_weight": 0.25, "temperature": 0.6, "pace": 0.90,
+                  "word_gap_ms": 50, "phrase_pause_s": 0.25, "sentence_pause_s": 0.5},
     },
 }
 

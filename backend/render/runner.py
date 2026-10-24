@@ -93,6 +93,20 @@ def _scale_text(timeline: Timeline, canvas: Tuple[int, int]) -> Timeline:
     return copy
 
 
+def compose_canvas(timeline: Timeline, target: Optional[Tuple[int, int]]
+                   ) -> Tuple[Timeline, Optional[Tuple[int, int]]]:
+    """(timeline, canvas) for composing at the delivery size `target`: the
+    canvas the programme fits into (None = its own size) and a timeline whose
+    width/height and text pixel sizes suit it. Shared by the render and the
+    draft preview (render/preview.py:draft_timeline)."""
+    canvas = _render_canvas(FilterGraphCompiler(timeline)._canvas_size(), target)
+    if canvas is not None:
+        logger.info("Composing at %dx%d (the delivery size) instead of the source's size", *canvas)
+        timeline = timeline.model_copy(update={"width": canvas[0], "height": canvas[1]})
+    timeline = _scale_text(timeline, canvas or FilterGraphCompiler(timeline)._canvas_size())
+    return timeline, canvas
+
+
 async def render_timeline_async(
     timeline: Timeline,
     output_path: str,
@@ -102,6 +116,9 @@ async def render_timeline_async(
     window: Optional[Tuple[float, float]] = None,
     prerender: bool = True,
     chunked: bool = True,
+    workers: Optional[int] = None,
+    encoder_profile: str = "final",
+    composed_canvas: Optional[Tuple[int, int]] = None,
 ) -> str:
     """
     Render a Timeline EDL into a single video file using single-pass FFmpeg compilation.
@@ -113,6 +130,11 @@ async def render_timeline_async(
     `window` ((start_s, end_s) of programme time) writes only that stretch --
     the effects sample (presentation/effects_sample.py). It skips the two-pass
     loudness measurement, which would read the whole programme for a clip.
+
+    `workers` caps the parallel chunk renders (None = as many as RAM allows);
+    `encoder_profile` picks get_encoder_flags' profile ("final" or "draft");
+    `composed_canvas` says the timeline was already composed at that size (by
+    compose_canvas -- the draft preview), so it is not scaled again.
     """
     # Compose at the delivery size. A 4K recording delivered at 1080p used to
     # be composed at 4K and scaled down at the very end: every overlay, zoom
@@ -121,11 +143,10 @@ async def render_timeline_async(
     # paged at 0.06x. Text sizes are authored for 1080p, so this also stops
     # captions and cards coming out at half size on 4K footage.
     target = _parse_resolution(output_resolution)
-    canvas = _render_canvas(FilterGraphCompiler(timeline)._canvas_size(), target)
-    if canvas is not None:
-        logger.info("Composing at %dx%d (the delivery size) instead of the source's size", *canvas)
-        timeline = timeline.model_copy(update={"width": canvas[0], "height": canvas[1]})
-    timeline = _scale_text(timeline, canvas or FilterGraphCompiler(timeline)._canvas_size())
+    if composed_canvas is not None:
+        canvas: Optional[Tuple[int, int]] = tuple(composed_canvas)
+    else:
+        timeline, canvas = compose_canvas(timeline, target)
 
     # Ken Burns moves on stills are rendered first, in parallel on the GPU
     # encoder (render/prerender.py) -- half of a real render's time was
@@ -146,7 +167,7 @@ async def render_timeline_async(
         try:
             done = await render_chunked(
                 timeline, output_path, canvas, target, hw_decode, prefer_nvenc,
-                progress_callback)
+                progress_callback, workers=workers, encoder_profile=encoder_profile)
             if done:
                 return done
         except Exception as e:
@@ -206,7 +227,7 @@ async def render_timeline_async(
     if total_duration_sec <= 0:
         total_duration_sec = 1.0
 
-    encoder_flags = get_encoder_flags(prefer_nvenc=prefer_nvenc)
+    encoder_flags = get_encoder_flags(prefer_nvenc=prefer_nvenc, profile=encoder_profile)
 
     # Force a constant output frame rate matching the timeline so concatenated /
     # overlaid clips from mixed-fps sources don't drift or produce VFR output.

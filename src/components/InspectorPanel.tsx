@@ -15,6 +15,7 @@ import {
 } from './controls';
 import { useLayoutStore } from '../hooks/layout';
 import { getEffects } from '../hooks/audioApi';
+import CameraAnglesSection from './CameraAnglesSection';
 
 const DEFAULT_TRANSFORM: ClipTransform = {
   crop_left: 0, crop_top: 0, crop_right: 0, crop_bottom: 0,
@@ -1092,6 +1093,8 @@ export default function InspectorPanel() {
           />
         )}
       </Section>
+
+      <CameraAnglesSection />
 
       <Section title="Match a reference video" defaultOpen={false}>
         <div className="text-xs text-muted" style={{ marginBottom: 6 }}>

@@ -148,6 +148,45 @@ export interface SpeakerSpansResponse {
 
 export type VoiceMapEntry = VoiceParams & { voice?: string; preset?: string | null };
 
+/** One checked span (`audio/lipsync_check.py`): mouth-vs-voice correlation before and after the
+ *  conversion; reason "weak_match" / "lag" (flagged), "no_face" / "short" (not flagged). */
+export interface LipsyncSpan {
+  start_s: number;
+  end_s: number;
+  corr_original: number | null;
+  corr_converted: number | null;
+  lag_frames: number | null;
+  flag: boolean;
+  reason: string | null;
+}
+
+/** A conversion entry's `lipsync`: its worst span's numbers plus every span. */
+export interface LipsyncSummary {
+  corr_original: number | null;
+  corr_converted: number | null;
+  lag_frames: number | null;
+  flag: boolean;
+  reason: string | null;
+  spans: LipsyncSpan[];
+}
+
+/** `project.metadata.voice_conversions[]` after a voice-map apply. */
+export interface VoiceConversion {
+  speaker: string;
+  voice: string;
+  spans: [number, number][];
+  seconds: number;
+  lipsync?: LipsyncSummary | null;
+}
+
+/** The lip-sync re-check job's result. */
+export interface LipsyncCheckResult {
+  spans: LipsyncSpan[];
+  lipsync_flags: number;
+  original_audio?: string;
+  converted_audio?: string;
+}
+
 /** What a job's poll answers (`processes.JOBS`). */
 export interface JobState {
   id: string;
@@ -249,6 +288,12 @@ export function putVoiceMap(projectId: string, voiceMap: Record<string, VoiceMap
 
 export function applyVoiceMap(projectId: string): Promise<{ job_id: string }> {
   return call(audio(`/${pid(projectId)}/voice/apply_map`), send('POST'));
+}
+
+/** Re-check the converted spans against the speaker's mouth (no re-conversion); default spans:
+ *  the applied voice map's. Poll the job; its result is a `LipsyncCheckResult`. */
+export function startLipsyncCheck(projectId: string, spans?: [number, number][]): Promise<{ job_id: string }> {
+  return call(audio(`/${pid(projectId)}/voice/lipsync_check`), send('POST', spans ? { spans } : {}));
 }
 
 /** One range in a voice as a process-lane job (a new version; Undo pops it). `program_range`:

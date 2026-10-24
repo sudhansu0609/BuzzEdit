@@ -110,7 +110,7 @@ def test_horror_gets_layers_hits_loops_and_transitions():
     assert aftermath.transform.scale > aftermath.transform.scale_end     # a pull-back
 
     hits = [i for i in timeline.items if i.origin == mood.MOOD_ORIGIN and i.label.startswith("hit:")]
-    assert {i.label for i in hits} == {"hit: flash", "hit: shake", "hit: glitch"}
+    assert {i.label for i in hits} == {"hit: flash", "hit: shutter", "hit: shake", "hit: glitch"}
     flash = next(i for i in hits if i.label == "hit: flash")
     assert flash.timeline_start_frame == 30 * 13 and flash.duration_frames <= 3
     assert dict(plan.sfx)[13.0] == "thunder"

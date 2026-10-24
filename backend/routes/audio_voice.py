@@ -12,6 +12,10 @@ prefix beside the audio suite's.
     PUT    /{project}/voice_map            {voice_map}
     POST   /{project}/voice/apply_map      -> {job_id}: every mapped speaker's spans, one version;
                                            idempotent (result skipped / replaced / removed / warning)
+    POST   /{project}/voice/lipsync_check  {spans?} -> {job_id}: re-check converted spans against the
+                                           speaker's mouth; result {spans: [{start_s, end_s, corr_original,
+                                           corr_converted, lag_frames, flag, reason}], lipsync_flags};
+                                           503 when the GPU landmark pipeline is unavailable
     POST   /{project}/voice/convert        {source_id?, start_s, end_s, program_range?, voice?, preset?,
                                            params} -> {job_id}; program_range: programme seconds,
                                            mapped to source pieces (a cut = several, one version)
@@ -43,7 +47,7 @@ from typing import Any, Callable, Dict, List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from audio import analysis, noise, processes, seedvc_env, voice_conversion
+from audio import analysis, lipsync_check, noise, processes, seedvc_env, voice_conversion
 from audio.analysis import AudioToolError
 from audio.noise import Conflict, NotFound
 
@@ -64,6 +68,10 @@ router = APIRouter(dependencies=[Depends(_no_render_running)])
 
 class RenameRequest(BaseModel):
     name: str
+
+
+class LipsyncRequest(BaseModel):
+    spans: Optional[List[List[float]]] = None    # [start_s, end_s] source seconds; default: the applied map's
 
 
 class VoiceMapRequest(BaseModel):
@@ -221,6 +229,21 @@ async def apply_voice_map(project_id: str):
 
     await _call(check)
     return {"job_id": voice_conversion.start_apply_job(project_id)}
+
+
+def _landmarks_available() -> Any:
+    import eyecontact
+    return eyecontact.available()
+
+
+@router.post("/{project_id}/voice/lipsync_check")
+async def lipsync_check_route(project_id: str, body: Optional[LipsyncRequest] = None):
+    """Queue `lipsync_check.check_project` (no re-conversion); poll the process job."""
+    ok, why = await asyncio.to_thread(_landmarks_available)
+    if not ok:
+        raise HTTPException(status_code=503, detail=f"Lip-sync check unavailable: {why}")
+    await _call(noise.load_project, project_id)
+    return {"job_id": lipsync_check.start_check_job(project_id, body.spans if body else None)}
 
 
 @router.post("/{project_id}/voice/convert")

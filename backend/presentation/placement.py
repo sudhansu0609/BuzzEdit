@@ -77,12 +77,14 @@ def jump_cut_times(timeline: Timeline) -> List[float]:
     between them, so the speaker's head position snaps. They are what the
     cut-covering shift below hides.
     """
+    from timeline.ops import is_angle_switch
     from timeline.schema import frame_to_time
     v1 = sorted((i for i in timeline.items
                  if i.track == "V1" and i.enabled and i.kind == "media"),
                 key=lambda i: i.timeline_start_frame)
+    # A change of camera angle inside one continuous moment is not a jump cut.
     return [frame_to_time(item.timeline_end_frame, timeline.fps_num, timeline.fps_den)
-            for item in v1[:-1]]
+            for item, after in zip(v1, v1[1:]) if not is_angle_switch(timeline, item, after)]
 
 
 def _cuts_covered(start_s: float, end_s: float, cuts: List[float],
@@ -100,7 +102,16 @@ def jump_cut_coverage(timeline: Timeline) -> Dict[str, int]:
     windows = broll_windows(timeline)
     covered = sum(1 for cut in cuts
                   if any(start + 0.1 <= cut <= end - 0.1 for start, end in windows))
-    return {"total": len(cuts), "covered": covered}
+    report = {"total": len(cuts), "covered": covered}
+    if timeline.angle_spans:
+        # Camera changes on V1 (MULTICAM_SYNC_PLAN.md §5): every join where the
+        # source changes. Only reported once angles are in use.
+        v1 = sorted((i for i in timeline.items
+                     if i.track == "V1" and i.enabled and i.kind == "media"),
+                    key=lambda i: i.timeline_start_frame)
+        report["angle_switches"] = sum(1 for a, b in zip(v1, v1[1:])
+                                       if a.source_id != b.source_id)
+    return report
 
 
 def place_broll(timeline: Timeline, beats: List[Beat], assets: List[Asset],

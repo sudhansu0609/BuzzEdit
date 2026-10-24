@@ -16,7 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useProjectStore } from '../hooks/store';
 import {
   addAdjustment, addEffect, listPresets, removeEffect, updateEffect,
-  AtmosphereEffect, PresetCatalogue,
+  AtmosphereEffect, PresetCatalogue, ProgressBarChapter,
 } from '../hooks/api';
 import { ColorField, PresetChips, Section, Slider, toHex } from './controls';
 
@@ -28,6 +28,59 @@ const TINTABLE = new Set(['sunlight', 'light_leak', 'flash']);
 const MOMENTARY = new Set(['flash', 'shake', 'glitch']);
 
 const ADJUSTMENT_SECONDS = 2.0;
+
+/** The progress bar's own params, all in `extra` (merged key by key by the backend). */
+function ProgressBarEditor({ effect, busy, packChapters, onSet, onSchedule }: {
+  effect: AtmosphereEffect;
+  busy: boolean;
+  packChapters: ProgressBarChapter[] | null;
+  onSet: (extra: Record<string, any>) => void;
+  onSchedule: (extra: Record<string, any>) => void;
+}) {
+  const extra = effect.extra || {};
+  const chapters: ProgressBarChapter[] = Array.isArray(extra.chapters) ? extra.chapters : [];
+  return (
+    <div className="fx-progress-editor">
+      <label className="fx-progress-row">
+        <span>Position</span>
+        <select value={extra.position === 'top' ? 'top' : 'bottom'} aria-label="Progress bar position"
+          disabled={busy} onChange={(e) => onSet({ position: e.target.value })}>
+          <option value="bottom">Bottom</option>
+          <option value="top">Top</option>
+        </select>
+      </label>
+      <Slider label="Height" value={Number(extra.height_px ?? 6)} min={2} max={40} step={1}
+        hint="Bar thickness in 1080p pixels (scaled with the canvas)"
+        onChange={(v) => onSchedule({ height_px: Math.round(v) })}
+        format={(v) => `${Math.round(v)} px`} />
+      <label className="fx-progress-row">
+        <span>Chapter ticks</span>
+        <input type="checkbox" checked={extra.ticks !== false} aria-label="Chapter ticks"
+          disabled={busy} onChange={(e) => onSet({ ticks: e.target.checked })} />
+      </label>
+      <label className="fx-progress-row">
+        <span>Label</span>
+        <select value={extra.label === 'none' ? 'none' : 'name'} aria-label="Progress bar label"
+          disabled={busy} onChange={(e) => onSet({ label: e.target.value })}>
+          <option value="name">Current chapter's name</option>
+          <option value="none">None</option>
+        </select>
+      </label>
+      <div className="fx-progress-chapters text-xs text-muted">
+        {chapters.length
+          ? `${chapters.length} chapter${chapters.length === 1 ? '' : 's'}: ${chapters.map((c) => c.name).join(' · ')}`
+          : 'No chapters: the bar fills without ticks or a label.'}
+      </div>
+      <button className="btn btn-xs" disabled={busy || !packChapters}
+        title={packChapters
+          ? 'Copy the chapters the presentation pass wrote for the metadata pack (times already shifted by the cold open)'
+          : 'No chapters yet: run the presentation pass with Story structure on and the progress bar enabled'}
+        onClick={() => packChapters && onSet({ chapters: packChapters })}>
+        Use chapters from the metadata pack
+      </button>
+    </div>
+  );
+}
 
 export default function EffectsPanel() {
   const { project, updateProject, selectedClipId, currentTime, setError } = useProjectStore();
@@ -88,6 +141,16 @@ export default function EffectsPanel() {
 
   const catalogue = presets?.effect_catalogue ?? [];
 
+  // The metadata pack's chapters, as the presentation pass placed them on its own
+  // progress bar (programme seconds, already shifted by the cold open). The pack
+  // itself (metadata.json) has no route, so this is where the UI can read them.
+  const packChapters: ProgressBarChapter[] | null = useMemo(() => {
+    const own = ((timeline?.effects || []) as AtmosphereEffect[]).find(
+      (e) => e.type === 'progress_bar' && e.origin === 'presentation:progress'
+        && Array.isArray(e.extra?.chapters) && e.extra!.chapters.length > 0);
+    return own ? (own.extra!.chapters as ProgressBarChapter[]) : null;
+  }, [timeline]);
+
   if (!projectId) {
     return <div className="fx-empty">Open a project to add effects.</div>;
   }
@@ -118,7 +181,8 @@ export default function EffectsPanel() {
         <div className="fx-cards">
           {catalogue.map((fx) => (
             <button key={fx.id} className="fx-card" disabled={busy}
-              onClick={() => add({ type: fx.id, intensity: 0.5, speed: 1.0 })}>
+              onClick={() => add({ type: fx.id, intensity: 0.5, speed: 1.0,
+                ...(fx.extra ? { extra: fx.extra } : {}) })}>
               <span className="fx-card-name">{fx.label}</span>
               <span className="fx-card-desc">{fx.description}</span>
               {MOMENTARY.has(fx.id) && (
@@ -160,6 +224,11 @@ export default function EffectsPanel() {
               <ColorField label="Tint" value={toHex(effect.color || '#ffcc88')} allowAlpha={false}
                 onChange={(v) => schedule(() => updateEffect(
                   projectId, index, { color: `0x${v.replace('#', '').toUpperCase()}FF` }, owner))} />
+            )}
+            {effect.type === 'progress_bar' && (
+              <ProgressBarEditor effect={effect} busy={busy} packChapters={packChapters}
+                onSet={(extra) => run(() => updateEffect(projectId, index, { extra }, owner))}
+                onSchedule={(extra) => schedule(() => updateEffect(projectId, index, { extra }, owner))} />
             )}
           </div>
         ))}

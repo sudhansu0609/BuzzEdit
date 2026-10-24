@@ -4,11 +4,16 @@ import { useCommand } from '../hooks/commands';
 import {
   useElectron, listMedia, importMedia, removeMedia, renameMedia, relinkMedia,
   getMediaWaveform, mediaThumbUrl, mediaStreamUrl, addMedia, getProject,
-  startEyeContact, getEyeContactStatus, cancelEyeContact, revertEyeContact,
-  getEyeContactSetup, saveEyeContactSetup, startEyeContactPreview,
-  MediaEntry, MEDIA_FILTERS, WaveformData, EyeContactJob, EyeContactSetup, EyeContactPreview,
+  startEyeContact, getEyeContactStatus, cancelEyeContact, revertEyeContact, saveEyeContactSetup,
+  syncAngle, apiErrorDetail,
+  startStabilize, getStabilizeStatus, cancelStabilize, revertStabilize, saveStabilizeSetup,
+  MediaEntry, MEDIA_FILTERS, WaveformData, EyeContactJob, EyeContactSetup,
+  StabilizeJob, StabilizeSetup, StabilizeReport,
 } from '../hooks/api';
 import ContextMenu, { MenuEntry } from './ContextMenu';
+import EyeContactDialog, { eyeLensSummary } from './EyeContactDialog';
+import StabilizeDialog, { stabilizeSummary } from './StabilizeDialog';
+import SyncAudioDialog, { fmtDrift, fmtOffset } from './SyncAudioDialog';
 import { mediaPoolChanged, openVoicePanel } from '../hooks/voiceApi';
 
 export const MEDIA_DND_TYPE = 'application/x-buzzedit-media';
@@ -117,310 +122,6 @@ function VideoPoster({ entry, projectId }: { entry: MediaEntry; projectId: strin
   );
 }
 
-/**
- * Where the prompter sits relative to the lens decides how far the eyes get re-aimed:
- * reading text 30 cm beside a lens at 1.1 m is a ~15 degree look away. Saved once,
- * pre-filled here every time, editable per run.
- */
-const PREVIEW_SECONDS = 10;
-/** What changes the eyes; quality only changes the full run's file size. */
-const setupKey = ({ quality, ...rest }: EyeContactSetup) => JSON.stringify(rest);
-type CompareMode = 'before' | 'after' | 'split';
-
-/**
- * Before/after of a corrected stretch. "After" is the clock and carries the audio;
- * "before" follows it, and lands on the exact same frame whenever playback pauses, so
- * flipping between the two while paused shows only what the correction moved.
- * Click the picture to zoom 3x on that spot (both sides zoom together).
- */
-function EyePreviewPlayer({ preview }: { preview: EyeContactPreview }) {
-  const before = useRef<HTMLVideoElement>(null);
-  const after = useRef<HTMLVideoElement>(null);
-  const [mode, setMode] = useState<CompareMode>('after');
-  const [zoom, setZoom] = useState<{ x: number; y: number } | null>(null);
-  const [playing, setPlaying] = useState(true);
-  const [time, setTime] = useState(0);
-  const [aspect, setAspect] = useState(16 / 9);
-
-  useEffect(() => {
-    let raf = 0;
-    const tick = () => {
-      const a = after.current, b = before.current;
-      if (a && b) {
-        setTime(a.currentTime);
-        if (!a.paused && Math.abs(b.currentTime - a.currentTime) > 0.1) b.currentTime = a.currentTime;
-      }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, []);
-
-  const lockstep = () => {
-    const a = after.current, b = before.current;
-    if (a && b) b.currentTime = a.currentTime;
-  };
-  const togglePlay = () => {
-    const a = after.current, b = before.current;
-    if (!a || !b) return;
-    if (a.paused) {
-      lockstep();
-      a.play().catch(() => {});
-      b.play().catch(() => {});
-      setPlaying(true);
-    } else {
-      a.pause();
-      b.pause();
-      lockstep();
-      setPlaying(false);
-    }
-  };
-  const seek = (t: number) => {
-    if (after.current) after.current.currentTime = t;
-    if (before.current) before.current.currentTime = t;
-    setTime(t);
-  };
-  const onPictureClick = (e: React.MouseEvent<HTMLVideoElement>) => {
-    if (zoom) { setZoom(null); return; }
-    const r = e.currentTarget.getBoundingClientRect();
-    setZoom({ x: ((e.clientX - r.left) / r.width) * 100, y: ((e.clientY - r.top) / r.height) * 100 });
-  };
-  const zoomStyle: React.CSSProperties = zoom
-    ? { transform: 'scale(3)', transformOrigin: `${zoom.x}% ${zoom.y}%` } : {};
-  const video = (which: 'before' | 'after') => (
-    <video
-      ref={which === 'before' ? before : after}
-      src={mediaStreamUrl(which === 'before' ? preview.before_path : preview.after_path)}
-      autoPlay loop playsInline preload="auto" muted={which === 'before'}
-      style={zoomStyle}
-      onClick={onPictureClick}
-      onSeeked={which === 'after' ? () => { if (after.current?.paused) lockstep(); } : undefined}
-      onLoadedMetadata={which === 'after'
-        ? (e) => setAspect(e.currentTarget.videoWidth / Math.max(1, e.currentTarget.videoHeight)) : undefined}
-    />
-  );
-
-  return (
-    <div className="eye-compare">
-      <div className={`eye-compare-stage ${mode === 'split' ? 'split' : ''}`}
-        style={{ aspectRatio: mode === 'split' ? `${aspect * 2}` : `${aspect}` }}>
-        <div className={`eye-compare-cell ${mode === 'after' ? 'hidden' : ''}`}>
-          {video('before')}
-          <span className="eye-compare-label">Before</span>
-        </div>
-        <div className={`eye-compare-cell ${mode === 'before' ? 'hidden' : ''}`}>
-          {video('after')}
-          <span className="eye-compare-label after">After</span>
-        </div>
-      </div>
-      <div className="eye-compare-controls">
-        <button className="btn btn-xs" onClick={togglePlay} aria-label={playing ? 'Pause' : 'Play'}>{playing ? '❚❚' : '▶'}</button>
-        <input type="range" min={0} max={preview.duration_s} step={0.01} value={time}
-          aria-label="Preview position"
-          onChange={(e) => seek(Number(e.target.value))} />
-        <span className="text-xs text-muted">{time.toFixed(1)}s</span>
-        <div className="eye-compare-modes">
-          {(['before', 'after', 'split'] as CompareMode[]).map((m) => (
-            <button key={m} className={`btn btn-xs ${mode === m ? 'btn-primary' : ''}`}
-              onClick={() => setMode(m)}>
-              {m === 'split' ? 'Side by side' : m[0].toUpperCase() + m.slice(1)}
-            </button>
-          ))}
-        </div>
-      </div>
-      <div className="text-xs text-muted">
-        {fmtDuration(preview.start_s)}–{fmtDuration(preview.start_s + preview.duration_s)}:
-        face found {preview.face_found_pct}%, re-aimed {preview.prompter_offset_deg}°
-        ({preview.median_shift_px}px), reading sweep {preview.reading_sweep_deg}°.
-        Pause and flip Before/After to compare one frame; click the picture to zoom on the eyes.
-      </div>
-    </div>
-  );
-}
-
-function EyeContactDialog({ entry, projectId, onRun, onClose }: {
-  entry: MediaEntry;
-  projectId: string;
-  onRun: (setup: EyeContactSetup) => void;
-  onClose: () => void;
-}) {
-  const [setup, setSetup] = useState<EyeContactSetup | null>(null);
-  const maxStart = Math.max(0, Math.floor((entry.duration || 0) - PREVIEW_SECONDS));
-  const [startS, setStartS] = useState(() => Math.floor(maxStart / 2));
-  const [previewJob, setPreviewJob] = useState<EyeContactJob | null>(null);
-  const [preview, setPreview] = useState<{ result: EyeContactPreview; setupKey: string } | null>(null);
-  const jobRef = useRef<EyeContactJob | null>(null);
-  jobRef.current = previewJob;
-
-  useEffect(() => {
-    getEyeContactSetup().then(setSetup).catch(() => setSetup({
-      prompter_side: 'left', angle_deg: 0, prompter_cm: 30, camera_cm: 110, steadiness: 0.7, aim_deg: 0,
-      pitch_deg: 0, quality: 'high',
-    }));
-  }, []);
-
-  // a preview still running when the dialog goes away is wasted GPU time
-  useEffect(() => () => {
-    const j = jobRef.current;
-    if (j && (j.status === 'queued' || j.status === 'running')) cancelEyeContact(j.id).catch(() => {});
-  }, []);
-
-  const previewSetupKey = useRef('');
-  const jobId = previewJob?.id;
-  const jobActive = previewJob?.status === 'queued' || previewJob?.status === 'running';
-  useEffect(() => {
-    if (!jobId || !jobActive) return;
-    const timer = setInterval(async () => {
-      try {
-        const next = await getEyeContactStatus(jobId);
-        setPreviewJob(next);
-        if (next.status === 'completed' && next.result) {
-          setPreview({ result: next.result as EyeContactPreview, setupKey: previewSetupKey.current });
-        }
-      } catch (err) {
-        console.warn('Eye contact preview poll failed:', err);
-      }
-    }, 600);
-    return () => clearInterval(timer);
-  }, [jobId, jobActive]);
-
-  if (!setup) return null;
-
-  const runPreview = async () => {
-    if (jobRef.current && jobActive) await cancelEyeContact(jobRef.current.id).catch(() => {});
-    previewSetupKey.current = setupKey(setup);
-    try {
-      const { job_id } = await startEyeContactPreview(projectId, entry.id, setup, startS, PREVIEW_SECONDS);
-      setPreviewJob({ id: job_id, media_id: entry.id, status: 'queued', progress: 0,
-        stage: 'Starting', result: null, error: null });
-    } catch (err: any) {
-      setPreviewJob({ id: '', media_id: entry.id, status: 'failed', progress: 0, stage: 'Failed',
-        result: null, error: err.message || 'Could not start the preview' });
-    }
-  };
-  const stale = preview && preview.setupKey !== setupKey(setup);
-  const showPreviewPane = Boolean(preview || jobActive);
-  const set = (patch: Partial<EyeContactSetup>) => setSetup({ ...setup, ...patch });
-  const fromDistances = Math.round(Math.atan2(setup.prompter_cm, Math.max(setup.camera_cm, 1)) * 180 / Math.PI);
-  const angle = setup.prompter_side === 'auto' ? null
-    : (setup.angle_deg > 0 ? setup.angle_deg : fromDistances);
-  return (
-    <div className="eye-dialog-backdrop" onClick={onClose}>
-      <div className={`eye-dialog ${showPreviewPane ? 'wide' : ''}`} onClick={(e) => e.stopPropagation()}>
-        <div className="eye-dialog-settings">
-        <div className="eye-dialog-title">Fix eye contact: {entry.name}</div>
-        <label>
-          Prompter is on your
-          <select value={setup.prompter_side}
-            aria-label="Prompter side"
-            onChange={(e) => set({ prompter_side: e.target.value as EyeContactSetup['prompter_side'] })}>
-            <option value="left">left of the lens</option>
-            <option value="right">right of the lens</option>
-            <option value="auto">guess from my eyes</option>
-          </select>
-        </label>
-        {setup.prompter_side !== 'auto' && (
-          <>
-            <label>
-              Re-aim angle (degrees): lower it if the eyes overshoot the lens
-              <input type="number" min={1} max={45} step={0.5} value={angle ?? fromDistances}
-                aria-label="Re-aim angle"
-                onChange={(e) => set({ angle_deg: Number(e.target.value) })} />
-            </label>
-            <div className="text-xs text-muted">or work it out from distances:</div>
-            <label>
-              Sideways distance, lens to text (cm)
-              <input type="number" min={0} max={200} step={1} value={setup.prompter_cm}
-                aria-label="Sideways distance to text"
-                onChange={(e) => set({ prompter_cm: Number(e.target.value), angle_deg: 0 })} />
-            </label>
-            <label>
-              Your distance from the camera (cm)
-              <input type="number" min={20} max={1000} step={5} value={setup.camera_cm}
-                aria-label="Distance from camera"
-                onChange={(e) => set({ camera_cm: Number(e.target.value), angle_deg: 0 })} />
-            </label>
-          </>
-        )}
-        <label>
-          Fine aim (degrees, + = toward your left)
-          <input type="number" min={-15} max={15} step={0.5} value={setup.aim_deg}
-            aria-label="Fine aim"
-            onChange={(e) => set({ aim_deg: Number(e.target.value) })} />
-        </label>
-        <label>
-          Up / down (degrees, + = look lower, − = look higher)
-          <input type="number" min={-10} max={10} step={0.5} value={setup.pitch_deg ?? 0}
-            aria-label="Up / down aim"
-            onChange={(e) => set({ pitch_deg: Number(e.target.value) })} />
-        </label>
-        <label>
-          Steadiness {Math.round(setup.steadiness * 100)}%
-          <input type="range" min={0} max={1} step={0.05} value={setup.steadiness}
-            aria-label="Steadiness"
-            onChange={(e) => set({ steadiness: Number(e.target.value) })} />
-        </label>
-        <label>
-          Quality
-          <select value={setup.quality}
-            aria-label="Quality"
-            onChange={(e) => set({ quality: e.target.value as EyeContactSetup['quality'] })}>
-            <option value="standard">standard (smaller file)</option>
-            <option value="high">high (about the source size)</option>
-            <option value="max">max</option>
-          </select>
-        </label>
-        <div className="text-xs text-muted">
-          {angle !== null ? `Re-aims your eyes about ${angle}° toward the lens. ` : ''}
-          Steadiness calms the left-right reading sweep; 0% keeps it, 100% locks the eyes on the lens.
-        </div>
-        <div className="eye-preview-row">
-          {maxStart > 0 && (
-            <label>
-              Preview {PREVIEW_SECONDS} s starting at {fmtDuration(startS) || '0:00'}
-              <input type="range" min={0} max={maxStart} step={1} value={startS}
-                aria-label="Preview start time"
-                onChange={(e) => setStartS(Number(e.target.value))} />
-            </label>
-          )}
-          <button className="btn btn-sm" onClick={runPreview} disabled={jobActive}
-            title="Correct just this stretch on the GPU and compare before/after. Nothing in the project changes.">
-            {jobActive ? 'Previewing…' : preview ? 'Preview again' : `Preview ${PREVIEW_SECONDS} s`}
-          </button>
-          {previewJob?.status === 'failed' && (
-            <div className="text-xs eye-preview-error">Preview failed: {previewJob.error}</div>
-          )}
-        </div>
-        <div className="eye-dialog-buttons">
-          <button className="btn btn-sm" onClick={onClose}>Cancel</button>
-          <button className="btn btn-sm btn-primary" onClick={() => onRun(setup)}>Fix eye contact</button>
-        </div>
-        </div>
-        {showPreviewPane && (
-          <div className="eye-dialog-preview">
-            {jobActive && previewJob && (
-              <div className="media-eye-progress eye-preview-progress">
-                <div>{previewJob.stage} {Math.round(previewJob.progress * 100)}%</div>
-                <div className="media-eye-progress-bar">
-                  <div style={{ width: `${Math.round(previewJob.progress * 100)}%` }} />
-                </div>
-              </div>
-            )}
-            {preview && (
-              <>
-                {stale && !jobActive && (
-                  <div className="text-xs eye-preview-stale">Settings changed since this preview: preview again to see them.</div>
-                )}
-                <EyePreviewPlayer key={preview.result.after_path} preview={preview.result} />
-              </>
-            )}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 export default function MediaPool() {
   const { project, setError, currentTime, updateProject } = useProjectStore();
   const { pickFiles, pickFolders } = useElectron();
@@ -439,6 +140,12 @@ export default function MediaPool() {
   const [eyeDialog, setEyeDialog] = useState<MediaEntry | null>(null);
   // Right-click on an audio/video tile: "Convert voice…" (the Voice panel's Convert tab).
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuEntry[] } | null>(null);
+  // Multicam: the audio-replace dialog, and the media id whose angle sync is measuring.
+  const [audioSync, setAudioSync] = useState<MediaEntry | null>(null);
+  const [angleSyncing, setAngleSyncing] = useState<string | null>(null);
+  // Stabilization jobs by media id while they run, and the dialog's clip.
+  const [stabJobs, setStabJobs] = useState<Record<string, StabilizeJob>>({});
+  const [stabDialog, setStabDialog] = useState<MediaEntry | null>(null);
 
   const projectId = project?.id;
   const fps = (project?.timeline as any)?.fps_num
@@ -574,7 +281,9 @@ export default function MediaPool() {
     setEyeDialog(null);
     if (!projectId || eyeJobs[entry.id]) return;
     try {
-      await saveEyeContactSetup(setup);
+      // the speaker setup only: lens marks travel with the run and are stored per recording
+      const { lens_marks: _marks, ...speaker } = setup;
+      await saveEyeContactSetup(speaker);
       const { job_id } = await startEyeContact(projectId, entry.id, setup);
       setEyeJobs(prev => ({ ...prev, [entry.id]: {
         id: job_id, media_id: entry.id, status: 'queued', progress: 0,
@@ -632,6 +341,86 @@ export default function MediaPool() {
     }, 1500);
     return () => clearInterval(timer);
   }, [activeEyeKey, reloadSources, setError]);
+
+  const handleStabilize = useCallback(async (entry: MediaEntry, setup: StabilizeSetup) => {
+    setStabDialog(null);
+    if (!projectId || stabJobs[entry.id]) return;
+    try {
+      await saveStabilizeSetup(setup);
+      const { job_id } = await startStabilize(projectId, entry.id, setup);
+      setStabJobs(prev => ({ ...prev, [entry.id]: {
+        id: job_id, media_id: entry.id, status: 'queued', progress: 0,
+        stage: 'Waiting for the GPU', result: null, error: null,
+      } }));
+    } catch (err: any) {
+      setError(err.message || 'Could not start stabilization');
+    }
+  }, [projectId, stabJobs, setError]);
+
+  const handleRevertStabilize = useCallback(async (entry: MediaEntry) => {
+    if (!projectId) return;
+    try {
+      const res = await revertStabilize(projectId, entry.id);
+      setMedia(res.media || []);
+      await reloadSources();
+      setNote(`${entry.name}: original (unstabilized) clip restored`);
+    } catch (err: any) {
+      setError(err.message);
+    }
+  }, [projectId, reloadSources, setError]);
+
+  // Poll running stabilization jobs; a finished one has already swapped the steady file in.
+  const activeStabKey = Object.values(stabJobs)
+    .filter(j => j.status === 'queued' || j.status === 'running').map(j => j.id).join(',');
+  useEffect(() => {
+    if (!activeStabKey) return;
+    const ids = activeStabKey.split(',');
+    const timer = setInterval(async () => {
+      for (const jobId of ids) {
+        try {
+          const next = await getStabilizeStatus(jobId);
+          if (next.status === 'completed' || next.status === 'failed' || next.status === 'cancelled') {
+            setStabJobs(prev => {
+              const rest = { ...prev };
+              delete rest[next.media_id];
+              return rest;
+            });
+            if (next.status === 'completed') {
+              await reloadSources();
+              const r = next.result as StabilizeReport | null;
+              setNote(r ? `Stabilized: ${stabilizeSummary(r)}, ${Math.round(r.seconds)}s` : 'Stabilized');
+            } else if (next.status === 'failed') {
+              setError(`Stabilization failed: ${next.error}`);
+            }
+          } else {
+            setStabJobs(prev => ({ ...prev, [next.media_id]: next }));
+          }
+        } catch (err) {
+          console.warn('Stabilize status poll failed:', err);
+        }
+      }
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [activeStabKey, reloadSources, setError]);
+
+  /** Register a library video as a camera angle; the result (or the 422 detail) shows inline. */
+  const handleSyncAngle = useCallback(async (entry: MediaEntry) => {
+    if (!projectId || angleSyncing) return;
+    setAngleSyncing(entry.id);
+    setBusy(`Syncing ${entry.name} as a camera angle…`);
+    setNote(null);
+    try {
+      const r = await syncAngle(projectId, entry.id);
+      await refresh();
+      setNote(`${entry.name}: angle synced · offset ${fmtOffset(r.offset_s)} · confidence `
+        + `${r.confidence.toFixed(1)} · ${fmtDrift(r.drift_ppm)}${r.warning ? ` · ⚠ ${r.warning}` : ''}`);
+    } catch (err) {
+      setNote(`${entry.name}: not synced. ${apiErrorDetail(err)}`);
+    } finally {
+      setBusy(null);
+      setAngleSyncing(null);
+    }
+  }, [projectId, angleSyncing, refresh]);
 
   /** Drop straight onto the timeline at the playhead, for people who'd rather click. */
   const handleAddToTimeline = useCallback(async (entry: MediaEntry) => {
@@ -754,6 +543,22 @@ export default function MediaPool() {
                 e.preventDefault();
                 setMenu({ x: e.clientX, y: e.clientY, items: [
                   { label: 'Convert voice…', onClick: () => openVoicePanel({ tab: 'convert', mediaId: entry.id }) },
+                  { separator: true },
+                  entry.kind === 'video'
+                    ? { label: entry.angle ? 'Re-sync camera angle' : 'Sync as camera angle',
+                        disabled: !!angleSyncing || entry.has_audio === false,
+                        hint: entry.has_audio === false ? 'Needs a soundtrack to line up' : 'Another sync is running',
+                        onClick: () => handleSyncAngle(entry) }
+                    : { label: 'Use as programme audio (sync)…', onClick: () => setAudioSync(entry) },
+                  ...(entry.kind === 'video' ? [
+                    { separator: true },
+                    { label: entry.stabilize ? 'Stabilize again…' : 'Stabilize…',
+                      disabled: !!stabJobs[entry.id], hint: 'Stabilization is running',
+                      onClick: () => setStabDialog(entry) },
+                    ...(entry.stabilize ? [{ label: 'Revert stabilization',
+                      disabled: !!stabJobs[entry.id], hint: 'Stabilization is running',
+                      onClick: () => handleRevertStabilize(entry) }] : []),
+                  ] as MenuEntry[] : []),
                 ] });
               }}
               className={`media-tile ${entry.missing ? 'missing' : ''}`}
@@ -781,9 +586,30 @@ export default function MediaPool() {
                 )}
                 {entry.duration > 0 && <span className="media-duration">{fmtDuration(entry.duration)}</span>}
                 {entry.eye_contact && !eyeJobs[entry.id] && (
-                  <span className="media-eye-badge" title={`Eyes re-aimed at the lens. Original: ${entry.eye_contact.original_path}`}>
+                  <span className="media-eye-badge" title={`Eyes re-aimed at the lens.${eyeLensSummary(entry.eye_contact.report) ? ` ${eyeLensSummary(entry.eye_contact.report)}.` : ''} Original: ${entry.eye_contact.original_path}`}>
                     eye contact
                   </span>
+                )}
+                {entry.angle && (
+                  <span className="media-angle-badge"
+                    title={`Camera angle of the main recording · offset ${fmtOffset(entry.angle.offset_s)} · confidence ${entry.angle.confidence.toFixed(1)} · ${fmtDrift(entry.angle.drift_ppm)}`}>
+                    angle · {fmtOffset(entry.angle.offset_s)}
+                  </span>
+                )}
+                {entry.stabilize && !stabJobs[entry.id] && (
+                  <span className="media-stab-badge"
+                    title={`Stabilized: ${stabilizeSummary(entry.stabilize.report) || 'done'}. Original: ${entry.stabilize.original_path}`}>
+                    stabilized
+                  </span>
+                )}
+                {stabJobs[entry.id] && !eyeJobs[entry.id] && (
+                  <div className="media-eye-progress" onClick={(e) => e.stopPropagation()}>
+                    <div>{stabJobs[entry.id].stage} {Math.round(stabJobs[entry.id].progress * 100)}%</div>
+                    <div className="media-eye-progress-bar">
+                      <div style={{ width: `${Math.round(stabJobs[entry.id].progress * 100)}%` }} />
+                    </div>
+                    <button className="btn btn-xs" onClick={() => cancelStabilize(stabJobs[entry.id].id)}>Cancel</button>
+                  </div>
                 )}
                 {eyeJobs[entry.id] && (
                   <div className="media-eye-progress" onClick={(e) => e.stopPropagation()}>
@@ -813,6 +639,16 @@ export default function MediaPool() {
                   {entry.eye_contact && !eyeJobs[entry.id] && (
                     <button className="media-action" title="Revert to the original eyes" aria-label="Revert to the original eyes"
                       onClick={(e) => { e.stopPropagation(); handleRevertEyeContact(entry); }}>↺</button>
+                  )}
+                  {entry.kind === 'video' && !entry.missing && !stabJobs[entry.id] && (
+                    <button className="media-action"
+                      title={entry.stabilize
+                        ? 'Re-run stabilization (from the original recording)'
+                        : 'Stabilize: steady handheld shake'}
+                      aria-label={entry.stabilize
+                        ? 'Re-run stabilization (from the original recording)'
+                        : 'Stabilize: steady handheld shake'}
+                      onClick={(e) => { e.stopPropagation(); setStabDialog(entry); }}>≋</button>
                   )}
                   <button className="media-action danger" title={entry.linked ? 'Remove from library' : 'Remove and delete the copy'}
                     aria-label={entry.linked ? 'Remove from library' : 'Remove and delete the copy'}
@@ -857,7 +693,15 @@ export default function MediaPool() {
       {eyeDialog && projectId && (
         <EyeContactDialog entry={eyeDialog} projectId={projectId}
           onRun={(setup) => handleEyeContact(eyeDialog, setup)}
-          onClose={() => setEyeDialog(null)} />
+          onClose={() => { setEyeDialog(null); refresh(); }} />
+      )}
+      {stabDialog && projectId && (
+        <StabilizeDialog entry={stabDialog} projectId={projectId}
+          onRun={(setup) => handleStabilize(stabDialog, setup)}
+          onClose={() => { setStabDialog(null); refresh(); }} />
+      )}
+      {audioSync && projectId && (
+        <SyncAudioDialog entry={audioSync} projectId={projectId} onClose={() => setAudioSync(null)} />
       )}
     </div>
   );

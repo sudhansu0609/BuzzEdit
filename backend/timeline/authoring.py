@@ -30,9 +30,13 @@ def _fps(timeline: Timeline) -> float:
 
 
 def _program_segments(timeline: Timeline) -> List[Tuple[int, int, int]]:
-    """(source_start, source_end, timeline_start) for each V1 cut, in order."""
+    """(source_start, source_end, timeline_start) for each V1 cut, in order.
+
+    Source frames are PRIMARY-source frames: a V1 piece showing a synced camera
+    angle is read back onto the primary's clock, which is what the words use."""
+    from .ops import v1_primary_span
     return sorted(
-        [(i.source_start_frame, i.source_end_frame, i.timeline_start_frame)
+        [(*v1_primary_span(timeline, i), i.timeline_start_frame)
          for i in timeline.items if i.track == "V1" and i.enabled and i.kind == "media"],
         key=lambda s: s[2],
     )
@@ -244,6 +248,9 @@ def _shift_all_items(timeline: Timeline, delta: int, keep_before: int = 0) -> No
 def _primary_source_id(timeline: Timeline) -> Optional[str]:
     for item in timeline.items:
         if item.track == "V1" and item.source_id:
+            source = timeline.sources.get(item.source_id)
+            if source is not None and source.synced_to:
+                return source.synced_to          # a camera angle piece, not the primary
             return item.source_id
     return next(iter(timeline.sources), None)
 

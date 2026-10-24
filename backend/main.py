@@ -182,6 +182,8 @@ app.include_router(glossary.router, prefix="/api/glossary", tags=["glossary"])
 app.include_router(kept_words.router, prefix="/api/projects", tags=["projects"])
 app.include_router(stock.router, prefix="/api/settings", tags=["stock"])
 app.include_router(eyecontact.router, prefix="/api/eyecontact", tags=["eyecontact"])
+from routes import stabilize as stabilize_routes  # noqa: E402
+app.include_router(stabilize_routes.router, prefix="/api/stabilize", tags=["stabilize"])
 app.include_router(audio.router, prefix="/api/audio", tags=["audio"])
 # Analysis, noise print and the process lane (AUDIO_SUITE_PLAN.md brief A2).
 from routes import audio_process

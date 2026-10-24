@@ -429,11 +429,11 @@ def test_convert_after_voice_speaks_at_pace_1_and_converts_with_length_adjust(en
     conv = calls["convert"][0]
     assert conv[0] == "convert" and conv[conv.index("--ref") + 1] == str(target)
     params = json.loads(conv[conv.index("--params") + 1])
-    assert params["length_adjust"] == pytest.approx(1.0 / 0.85, rel=1e-3)  # 1/the mood's own pace
+    assert params["length_adjust"] == pytest.approx(1.0 / 0.90, rel=1e-3)  # 1/the mood's own pace
     assert params["checkpoint"] == "ckpt.pth" and params["diffusion_steps"] == 40
 
     assert result["converted"] is True
-    assert result["length_adjust"] == pytest.approx(1.0 / 0.85, rel=1e-3)
+    assert result["length_adjust"] == pytest.approx(1.0 / 0.90, rel=1e-3)
     assert result["convert_ref"] == str(target) and result["checkpoint"] == "ckpt.pth"
 
 

@@ -91,9 +91,13 @@ def test_plan_reaims_by_the_prompter_angle_toward_the_lens():
     out = gaze + plan["corr"]
     assert abs(np.median(out[ok]) - (np.median(gaze[ok]) - swing)) < 0.006
     assert abs(plan["offset_deg"] - np.degrees(np.arctan2(30, 110))) < 1.0
+    assert plan["side_check"] == "ok"
+    # v2: the push direction is the measured one (a mirrored video swaps the sides); the
+    # configured side disagreeing with it is reported, not obeyed.
     right = make_plan(pts, np.full(len(pts), 10.0), FPS,
                       Settings(prompter_side="right", prompter_cm=30, camera_cm=110))
-    assert np.median(right["corr"][ok]) > 0 > np.median(plan["corr"][ok])
+    assert np.median(right["corr"][ok]) < 0 and np.median(plan["corr"][ok]) < 0
+    assert right["side_check"] == "video looks mirrored"
 
 
 def test_looking_into_the_lens_is_left_alone():

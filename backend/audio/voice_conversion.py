@@ -912,13 +912,57 @@ def apply_voice_map(project_id: str, progress: Progress = None,
                                  "voice_conversions": conversions}
         p_data["settings"] = settings
         noise.project_store.save_project(project_id, p_data)
+    flags = _attach_lipsync(project_id, sid, source.path, audio_path, str(final), conversions, report)
     report(1.0, "done")
-    result = {**state, "voice_conversions": conversions, "failed_spans": failed, "version": version}
+    result = {**state, "voice_conversions": conversions, "failed_spans": failed, "version": version,
+              "lipsync_flags": flags}
     if where == "top":
         result.update(replaced=True, undone=popped.get("path"))
     elif where == "under":
         result["warning"] = ON_TOP_WARNING
     return result
+
+
+def _attach_lipsync(project_id: str, sid: str, video: str, original: str, converted: str,
+                    conversions: List[Dict[str, Any]], report: Callable[[float, str], None]) -> int:
+    """Best effort, never fails the conversion: `audio.lipsync_check` on the converted spans
+    against the primary recording's mouth; each conversion entry gets `lipsync` (its worst span +
+    `spans`), the project metadata gets them and `lipsync_flags`. Skipped (0) when the source has
+    no video or the landmark pipeline is unavailable. Returns the number of flagged spans."""
+    from audio import lipsync_check, processes
+    from audio.analysis import json_safe
+    try:
+        if not lipsync_check.video_fps(video):
+            return 0
+        import eyecontact
+        ok, why = eyecontact.available()
+        if not ok:
+            logger.info("Lip-sync check skipped: %s", why)
+            return 0
+        spans = [span for entry in conversions for span in entry["spans"]]
+        report(0.96, "checking lip sync")
+        rows = json_safe(lipsync_check.check_spans(video, original, converted, spans))
+        k = 0
+        for entry in conversions:
+            entry["lipsync"] = lipsync_check.summary(rows[k:k + len(entry["spans"])])
+            k += len(entry["spans"])
+        flags = sum(1 for row in rows if row.get("flag"))
+        with processes._source_lock(project_id, sid):
+            p_data = noise.project_store.get_project(project_id) or {}
+            metadata = dict(p_data.get("metadata") or {})
+            metadata["voice_conversions"] = conversions
+            metadata["lipsync_flags"] = flags
+            p_data["metadata"] = metadata
+            settings = dict(p_data.get("settings") or {})
+            record = settings.get(APPLIED_KEY)
+            if isinstance(record, dict) and _same(record.get("version_path"), converted):
+                settings[APPLIED_KEY] = {**record, "voice_conversions": conversions}
+                p_data["settings"] = settings
+            noise.project_store.save_project(project_id, p_data)
+        return flags
+    except Exception as exc:
+        logger.warning("Lip-sync check after the voice map failed: %s", exc, exc_info=True)
+        return 0
 
 
 # -------------------------------------------------------------------- jobs

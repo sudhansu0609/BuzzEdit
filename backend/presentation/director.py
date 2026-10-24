@@ -854,6 +854,16 @@ async def _run_presentation_pass(
     else:
         structure_stage.remove_cold_open(timeline)
 
+    # --- the progress bar ----------------------------------------------------
+    #
+    # After the cold open (its chapter times use the same offset as the
+    # metadata) and the captions (it is placed clear of them). Replaced on
+    # every run; removed when switched off.
+    report.progress_bar = await stages.run(
+        "progress_bar",
+        _sync(_apply_progress_bar, timeline, settings, genre, plan.topics),
+        default=None)
+
     # --- the mood recipes ----------------------------------------------------
     #
     # Grade shifts, pushes and atmosphere windows per topic, and the hits at
@@ -992,6 +1002,18 @@ async def _run_presentation_pass(
         report.text_fx_placed = placed or {}
         report.person_matte_used = matte_used or "off"
         report.text_fx_skipped = fx_skipped or []
+
+    # --- emoji reactions (presentation.emoji_fx) ----------------------------
+    #
+    # After text_fx so the busy windows it reads off the timeline include the
+    # text effects. Always runs: it clears the last run's items (origin
+    # "emoji_fx") even when the setting or the genre now says off.
+    from . import emoji_fx as emoji_stage
+    report.emoji_reactions = await stages.run(
+        "emoji_reactions",
+        _sync(emoji_stage.plan_and_apply, timeline, program, settings, genre, face_anchors,
+              PROJECTS_DIR / project_id, seed),
+        default=0) or 0
 
     # --- save before rendering --------------------------------------------
     #
@@ -1230,6 +1252,120 @@ def _apply_atmosphere(timeline: Timeline, settings: PresentationSettings,
     ))
     timeline.revision += 1
     return str(values["type"])
+
+
+PROGRESS_ORIGIN = "presentation:progress"
+# Genres whose viewers navigate by chapter (explainers, infotainment). A story
+# (horror, true crime, vlog, ...) keeps its frame clean, and so does "general",
+# which is also the fallback when genre detection fails.
+PROGRESS_GENRES = ("tech", "science_education", "finance", "news", "documentary",
+                   "geopolitics", "health_fitness")
+_PROGRESS_BAR_PX = 6     # at 1080p, like everything below
+_PROGRESS_GAP_PX = 8
+
+
+def _progress_bar_wanted(settings: PresentationSettings, genre: str) -> bool:
+    if not settings.progress_bar:
+        return False
+    style = (settings.progress_bar_style or "auto").lower()
+    if style in ("off", "none"):
+        return False
+    if style == "auto":
+        from . import genre as genre_mod
+        return genre_mod.normalise(genre) in PROGRESS_GENRES
+    return True
+
+
+def _caption_band(timeline: Timeline) -> Optional[Tuple[float, float]]:
+    """(top, bottom) of the caption block in 1080p pixels, or None without captions.
+
+    Both caption engines centre the block on its pos_y anchor (drawtext
+    `_position_expressions`, ASS `_position`). The block is estimated as the
+    wrapped main lines (about 0.55 em per character over 90% of the width) plus
+    the smaller translation line (0.55x font size), the outline and any box.
+    """
+    band: Optional[Tuple[float, float]] = None
+    for item in timeline.items:
+        if item.origin != CAPTION_ORIGIN or item.text is None or not item.enabled:
+            continue
+        style = item.text.style
+        size = float(style.font_size)
+        per_line = max(1, int(1920 * 0.9 / max(1.0, size * 0.55)))
+        lines = max(1, -(-len(item.text.content or "") // per_line))
+        block = lines * size * 1.25 + (lines - 1) * style.line_spacing
+        if item.text.second_line:
+            block += size * 0.55 * 1.25
+        block += 2 * style.stroke_width + (2 * style.box_padding if style.box else 0)
+        centre = (max(-1.0, min(1.0, style.pos_y)) + 1.0) / 2.0 * 1080
+        top, bottom = centre - block / 2.0, centre + block / 2.0
+        band = (top, bottom) if band is None else (min(band[0], top), max(band[1], bottom))
+    return band
+
+
+def _progress_placement(timeline: Timeline) -> Dict[str, Any]:
+    """Where the bar goes so it never overlaps the captions (1080p pixels).
+
+    The usable bottom edge is the bottom of the picture, above the bottom
+    letterbox bar when `aspect_bars` letterboxes, because the bars are matted
+    over the bar (compiler 7c). Captions are burnt in after the bar, so the
+    rule only has to keep them apart:
+      * no captions, or captions in the top half: the bar sits at the bottom
+        edge with its chapter label;
+      * captions in the bottom half with room under them: the bar is 6 px at
+        the very bottom edge, under them, and the label is hidden;
+      * captions reaching the bottom edge: the bar sits above the caption band
+        (the margin is measured from the band's top) with its label above it.
+    """
+    edge = 0.0
+    ratio = float(timeline.aspect_bars or 0)
+    if ratio > 1920 / 1080 + 0.01:
+        edge = (1080 - 1920 / ratio) / 2.0
+    band = _caption_band(timeline)
+    if band is None or band[0] + band[1] < 1080:   # centred in the top half
+        return {"position": "bottom", "margin_px": int(round(edge)), "label": "name"}
+    usable_bottom = 1080 - edge
+    if band[1] + _PROGRESS_GAP_PX <= usable_bottom - _PROGRESS_BAR_PX:
+        return {"position": "bottom", "margin_px": int(round(edge)), "label": "none"}
+    return {"position": "bottom",
+            "margin_px": int(round(1080 - band[0] + _PROGRESS_GAP_PX)), "label": "name"}
+
+
+def _progress_accent(genre: str) -> str:
+    """The genre's accent: the thumbnail title look's second colour (yellow by
+    default). text_fx.palette_for lists text-effect styles, not colours."""
+    from .thumbnail_compose import style_for
+    rgb = style_for(genre).get("label_second") or (255, 212, 0)
+    return "#{:02X}{:02X}{:02X}".format(*rgb)
+
+
+def _apply_progress_bar(timeline: Timeline, settings: PresentationSettings,
+                        genre: str, topics) -> Optional[Dict[str, Any]]:
+    """Replace the pass's own progress bar; one the user added stays.
+
+    Returns {"chapters": n} for the report, None when the bar is off.
+    """
+    from render.atmosphere import PROGRESS_BAR_DEFAULTS
+    from timeline.schema import AtmosphereEffect
+
+    before = len(timeline.effects)
+    timeline.effects = [e for e in timeline.effects
+                        if getattr(e, "origin", None) != PROGRESS_ORIGIN]
+    if not _progress_bar_wanted(settings, genre):
+        if len(timeline.effects) != before:
+            timeline.revision += 1
+        return None
+
+    fps = timeline.fps_num / max(1, timeline.fps_den)
+    offset_s = timeline.cold_open_frames / fps   # the metadata's offset
+    chapters = [{"at_s": round(at, 3), "name": name}
+                for at, name in structure_stage.chapter_seconds(topics or [], offset_s)]
+    extra: Dict[str, Any] = {**PROGRESS_BAR_DEFAULTS, **_progress_placement(timeline),
+                             "chapters": chapters, "height_px": _PROGRESS_BAR_PX,
+                             "fill_color": _progress_accent(genre)}
+    timeline.effects.append(AtmosphereEffect(
+        type="progress_bar", intensity=1.0, origin=PROGRESS_ORIGIN, extra=extra))
+    timeline.revision += 1
+    return {"chapters": len(chapters)}
 
 
 RECREATION_ORIGIN = "recreation"

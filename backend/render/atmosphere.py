@@ -21,6 +21,7 @@ load-bearing:
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -61,6 +62,16 @@ def _moving_box(input_label: str, output_label: str, tag: str, w: float, h: floa
     ]
 
 
+# What a `progress_bar` effect added from the browser starts with. No chapters,
+# so it renders the bar alone: no ticks, no label. Sizes are authored at 1080p
+# and scaled with the canvas height.
+PROGRESS_BAR_DEFAULTS: Dict[str, object] = {
+    "chapters": [], "position": "bottom", "height_px": 6,
+    "track_color": "#FFFFFF40", "fill_color": "#FFD400",
+    "ticks": True, "label": "name", "margin_px": 0,
+}
+
+
 def available() -> List[Dict[str, object]]:
     """Catalogue for the UI."""
     return [
@@ -81,6 +92,9 @@ def available() -> List[Dict[str, object]]:
         {"id": "redaction", "label": "Redaction Bar", "description": "A black censor bar wipes across the centre; window it to a beat"},
         {"id": "spotlight", "label": "Spotlight", "description": "Edges darken so the centre reads as lit; an emphasis beat"},
         {"id": "strobe", "label": "Strobe", "description": "Rapid white flashes; window it to a hit"},
+        {"id": "progress_bar", "label": "Progress bar",
+         "description": "A thin bar that fills with programme time, with chapter ticks and the current chapter's name",
+         "extra": dict(PROGRESS_BAR_DEFAULTS)},
     ]
 
 
@@ -183,7 +197,8 @@ def _text_filter(text: str, assets_dir: Path, font_size: int, color: str,
                  width: int, height: int, x_expr: str, y_expr: str,
                  enable: Optional[str] = None, bold: bool = True,
                  alpha_expr: Optional[str] = None,
-                 extra_opts: Optional[List[str]] = None) -> Optional[str]:
+                 extra_opts: Optional[List[str]] = None,
+                 font_file: Optional[str] = None) -> Optional[str]:
     """A bare `drawtext=...` fragment (no `[in]`/`[out]`), or None with no font.
 
     Deliberately not `render.text.build_drawtext`: that one is shaped around a
@@ -204,8 +219,9 @@ def _text_filter(text: str, assets_dir: Path, font_size: int, color: str,
     if not content.strip():
         return None
     asset = write_text_asset(content, Path(assets_dir))
-    font_file = (resolve_font_file("Montserrat", bold=bold)
-                or resolve_font_file("Arial", bold=bold))
+    font_file = (font_file
+                 or resolve_font_file("Montserrat", bold=bold)
+                 or resolve_font_file("Arial", bold=bold))
     if not font_file:
         logger.warning("No font file resolved for a text effect; skipping %r", text[:40])
         return None
@@ -432,6 +448,148 @@ def _newspaper_sweep(effect: AtmosphereEffect, input_label: str, output_label: s
                        f"{color}@0.55", x_expr=x_expr, y_expr=_f(by0), enable=window)
 
 
+_INDIC_RE = re.compile(r"[ऀ-෿]")
+
+
+def _rgba(color: Optional[str], default: str, opacity: float) -> str:
+    """drawbox/color colour "0xRRGGBB@a" (or "name@a") with `opacity` folded in.
+
+    Accepts "#RRGGBB[AA]", "0xRRGGBB[AA]", "name" and "name@a"; anything
+    unparseable falls back to `default`.
+    """
+    text = str(color or default).strip()
+    alpha = 1.0
+    if "@" in text:
+        text, _, a = text.partition("@")
+        try:
+            alpha = float(a)
+        except ValueError:
+            pass
+    low = text.lower()
+    hexpart = text[1:] if text.startswith("#") else text[2:] if low.startswith("0x") else None
+    if hexpart is not None and re.fullmatch(r"[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?", hexpart):
+        if len(hexpart) == 8:
+            alpha *= int(hexpart[6:], 16) / 255.0
+        base = f"0x{hexpart[:6].upper()}"
+    elif hexpart is None and re.fullmatch(r"[A-Za-z]+", text):
+        base = text
+    elif text != default:
+        return _rgba(default, default, opacity)
+    else:
+        base = "white"
+    return f"{base}@{_f(_clamp(alpha * opacity, 0.0, 1.0))}"
+
+
+def _label_font(name: str) -> Optional[str]:
+    """A pinned font for a chapter label: drawtext without `fontfile` segfaults
+    this ffmpeg build. Indic script gets the native-caption font (Nirmala UI,
+    which shapes Devanagari); anything else the text-fx Montserrat/Arial."""
+    from utils.fonts import resolve_font_file
+    if _INDIC_RE.search(name or ""):
+        from timeline.authoring import _NATIVE_FONT
+        found = resolve_font_file(_NATIVE_FONT, bold=True)
+        if found:
+            return found
+    return (resolve_font_file("Montserrat", bold=True)
+            or resolve_font_file("Arial", bold=True))
+
+
+def _progress_bar(effect: AtmosphereEffect, input_label: str, output_label: str,
+                  width: int, height: int, programme_s: float, index,
+                  assets_dir: Optional[Path]) -> List[str]:
+    """A programme progress bar with chapter ticks and the current chapter's name.
+
+    Filter design (in order, all on the programme clock `p = t + offset`):
+      1. track: one static `drawbox` across the full width in `track_color`.
+      2. fill: a FULL-WIDTH `fill_color` box (`effect.color` overrides it) that
+         `overlay` slides in from the left (`_moving_box`): x = -W + W*min(1, p/T).
+         drawbox evaluates its geometry only once in this build, so a growing
+         width has to be drawn as a slide.
+      3. ticks: a static 2-3 px dark `drawbox` notch at each chapter's
+         x = W*at/T. The chapter at 0 gets none, and neither does one at or past T.
+      4. label: one `drawtext` per chapter, enabled between its start and the
+         next chapter's start, with a pinned font (`_label_font`). It fades from
+         0 to 70% over 1.2 s at the chapter start and stays at 70%. It is 28 px
+         at 1080p, on the left, just above a bottom bar or just below a top one.
+         `label: "none"` (or no assets_dir to write the text file to) draws no label.
+    The chunked renderer (render/chunked.sub_timeline) sets `extra._offset_s`
+    and `extra._programme_s`. Each chunk restarts t at 0, so the offset puts
+    the chunk back on programme time and T stays the length of the whole
+    programme. Without those keys T is `programme_s`. `intensity` scales every
+    opacity: 0.4 + 0.6*intensity, so 0.5 gives 70% and 1 gives the authored
+    opacity. Sizes (`height_px`, `margin_px` from the bar's edge, the label)
+    are authored at 1080p and scaled with the canvas height.
+    """
+    extra = {**PROGRESS_BAR_DEFAULTS, **(effect.extra or {})}
+    scale = height / 1080.0
+    offset = float(extra.get("_offset_s") or 0.0)
+    total = max(0.5, float(extra.get("_programme_s") or programme_s or 0.0))
+    opacity = 0.4 + 0.6 * _clamp(effect.intensity, 0.0, 1.0)
+
+    bar_h = max(2, int(round(float(extra.get("height_px") or 6) * scale)))
+    margin = max(0, int(round(float(extra.get("margin_px") or 0) * scale)))
+    top = str(extra.get("position") or "bottom").lower() == "top"
+    y_bar = min(height - bar_h, margin) if top else max(0, height - margin - bar_h)
+
+    track = _rgba(str(extra.get("track_color") or ""), "#FFFFFF40", opacity)
+    fill = _rgba(effect.color or str(extra.get("fill_color") or ""), "#FFD400", opacity)
+    p = f"(t+{_f(offset)})" if offset else "t"
+
+    chapters = []
+    for ch in extra.get("chapters") or []:
+        try:
+            at = float(ch.get("at_s", 0.0))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        chapters.append((max(0.0, at), str(ch.get("name") or "").strip()))
+    chapters.sort(key=lambda c: c[0])
+
+    tracked, filled = f"[pb_track_{index}]", f"[pb_fill_{index}]"
+    statements = [f"{input_label}drawbox=x=0:y={y_bar}:w={width}:h={bar_h}:"
+                  f"color={track}:t=fill{tracked}"]
+
+    tail: List[str] = []
+    if extra.get("ticks", True):
+        tick_w = max(2, int(round(3 * scale)))
+        tick = _rgba("black", "black", 0.75 * opacity)
+        for at, _ in chapters:
+            if at <= 0.0 or at >= total:
+                continue
+            x = max(0, int(round(width * at / total)) - tick_w // 2)
+            tail.append(f"drawbox=x={x}:y={y_bar}:w={tick_w}:h={bar_h}:color={tick}:t=fill")
+
+    if str(extra.get("label") or "none").lower() == "name" and assets_dir is not None:
+        size = max(8, int(round(28 * scale)))
+        gap = max(2, int(round(8 * scale)))
+        border = max(1, int(round(2 * scale)))
+        x_label = str(int(round(16 * scale)))
+        y_label = f"{y_bar + bar_h + gap}" if top else f"{y_bar - gap}-text_h"
+        for n, (at, name) in enumerate(chapters):
+            end = chapters[n + 1][0] if n + 1 < len(chapters) else total + 1.0
+            if not name or at >= total or end <= at:
+                continue
+            font = _label_font(name)
+            if not font:
+                logger.warning("No font for progress-bar label %r; skipping", name[:40])
+                continue
+            drawn = _text_filter(
+                name, Path(assets_dir), size, "white", width, height,
+                x_expr=x_label, y_expr=y_label,
+                enable=f"between({p},{_f(at)},{_f(end)})",
+                alpha_expr=f"{_f(0.7 * opacity)}*clip(({p}-{_f(at)})/1.2,0,1)",
+                font_file=font)
+            if drawn:
+                tail.append(drawn.replace("borderw=3", f"borderw={border}", 1))
+
+    fill_x = f"-{width}+{width}*min(1,{p}/{_f(total)})"
+    statements += _moving_box(tracked, filled if tail else output_label, f"pb_{index}",
+                              width, bar_h, fill, x_expr=fill_x, y_expr=str(y_bar),
+                              enable="1")
+    if tail:
+        statements.append(filled + ",".join(tail) + output_label)
+    return statements
+
+
 def build_effect(
     effect: AtmosphereEffect,
     input_label: str,
@@ -442,6 +600,7 @@ def build_effect(
     duration: float,
     index: Union[int, str],
     assets_dir: Optional[Path] = None,
+    programme_s: Optional[float] = None,
 ) -> List[str]:
     """Filter statements compositing one effect onto `input_label`.
 
@@ -453,8 +612,14 @@ def build_effect(
 
     `assets_dir` is only read by the presentation text-fx effects, which need
     somewhere to write the drawtext sidecar file for the word they draw.
+
+    `programme_s` is the programme's real length (no generator headroom). Only
+    `progress_bar` reads it, and it falls back to `duration` without it.
     """
     kind = (effect.type or "").lower()
+    if kind == "progress_bar":
+        return _progress_bar(effect, input_label, output_label, width, height,
+                             programme_s or duration, index, assets_dir)
     intensity = _clamp(effect.intensity, 0.0, 1.0)
     speed = _clamp(effect.speed, 0.1, 4.0)
     duration = max(0.5, duration)

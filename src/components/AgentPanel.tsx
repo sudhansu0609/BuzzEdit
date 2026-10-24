@@ -71,6 +71,14 @@ export default function AgentPanel() {
   const [voicePreset, setVoicePreset] = useState('clean');
   const [pip, setPip] = useState('auto');
   const [bilingual, setBilingual] = useState('auto');
+  // The programme progress bar with chapter ticks (PresentationSettings.progress_bar /
+  // progress_bar_style): off by default, like the backend; "auto" = explainer genres only.
+  const [progressBar, setProgressBar] = useState(false);
+  const [progressBarStyle, setProgressBarStyle] = useState('auto');
+  // Emoji reactions on key spoken words (PresentationSettings.emoji_reactions /
+  // emoji_density): "auto" = infotainment genres only; at most 6 x density per minute.
+  const [emojiReactions, setEmojiReactions] = useState('auto');
+  const [emojiDensity, setEmojiDensity] = useState(1.0);
   const [styleProfile, setStyleProfile] = useState('');
   const [styleProfiles, setStyleProfiles] = useState<StyleProfile[]>([]);
   useEffect(() => {
@@ -175,6 +183,10 @@ export default function AgentPanel() {
         pip,
         captions_bilingual: bilingual,
         style_profile: styleProfile || null,
+        progress_bar: progressBar,
+        progress_bar_style: progressBarStyle,
+        emoji_reactions: emojiReactions,
+        emoji_density: emojiDensity,
       };
       const start = await startPresentationPass(project.id, {
         target_coverage: coverage / 100,
@@ -214,7 +226,8 @@ export default function AgentPanel() {
       setProcessing(false);
     }
   }, [project, updateProject, setProcessing, setProgress, setError, coverage, zoomDepth, genre,
-      dressing, voicePreset, pip, bilingual, styleProfile]);
+      dressing, voicePreset, pip, bilingual, styleProfile, progressBar, progressBarStyle,
+      emojiReactions, emojiDensity]);
 
   // The speaker's script: shown when the project has one, aligned on demand.
   useEffect(() => {
@@ -486,6 +499,46 @@ export default function AgentPanel() {
               <option value="on">Always</option>
               <option value="off">Never</option>
             </select>
+          </label>
+          <label title="A thin bar that fills with programme time, with a tick and the name of each chapter. Placed clear of the captions."
+            style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: 12 }}>
+            <input type="checkbox" checked={progressBar}
+              aria-label="Progress bar"
+              onChange={(e) => setProgressBar(e.target.checked)} />
+            Progress bar with chapter ticks
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 12 }}
+            title="Auto: explainer genres only (tech, science, finance, news, documentary, geopolitics, health). Always / Never override the genre.">
+            <span style={{ minWidth: 100, color: '#bac2de' }}>Progress bar</span>
+            <select value={progressBarStyle} onChange={(e) => setProgressBarStyle(e.target.value)}
+              aria-label="Progress bar style" disabled={!progressBar}
+              style={{ flex: 1, minWidth: 0, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
+              <option value="auto">Auto (explainers)</option>
+              <option value="on">Always</option>
+              <option value="off">Never</option>
+            </select>
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 12 }}
+            title="A small emoji that pops up on key spoken words. Auto: infotainment genres only. Always / Never override the genre.">
+            <span style={{ minWidth: 100, color: '#bac2de' }}>Emoji reactions</span>
+            <select value={emojiReactions} onChange={(e) => setEmojiReactions(e.target.value)}
+              aria-label="Emoji reactions"
+              style={{ flex: 1, minWidth: 0, padding: '6px', background: '#313244', border: '1px solid #45475a', color: '#fff', borderRadius: '4px' }}>
+              <option value="auto">Auto (infotainment)</option>
+              <option value="on">Always</option>
+              <option value="off">Never</option>
+            </select>
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 12 }}
+            title="How often emoji reactions may appear: at most 6 x density per minute.">
+            <span style={{ minWidth: 100, color: '#bac2de' }}>Emoji density</span>
+            <input type="range" min={0.5} max={2} step={0.1} value={emojiDensity}
+              aria-label="Emoji density" disabled={emojiReactions === 'off'}
+              onChange={(e) => setEmojiDensity(Number(e.target.value))} style={{ flex: 1, minWidth: 0 }} />
+            <span style={{ minWidth: 34, textAlign: 'right', whiteSpace: 'nowrap' }}
+              title={`At most ${Math.round(6 * emojiDensity * 10) / 10} per minute`}>
+              {emojiDensity.toFixed(1)}x ({Math.round(6 * emojiDensity * 10) / 10}/min)
+            </span>
           </label>
           <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 12 }}
             title="Edit like this channel: a reference video analysed in the Style panel. Its look and transitions win over the genre's; its motion only when auto zoom is off.">

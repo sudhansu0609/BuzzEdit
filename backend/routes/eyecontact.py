@@ -10,7 +10,7 @@ import asyncio
 import logging
 import os
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -51,6 +51,13 @@ class EyeContactSetup(BaseModel):
     # raise the gaze by the head's own bow toward a prompter below the lens (eyecontact.plan)
     auto_pitch: Optional[bool] = None
     quality: Optional[str] = Field(None, pattern="^(standard|high|max)$")
+    # Seconds where the speaker looks into the lens, confirmed by the user (auto mode): the lens
+    # is measured there instead of from the automatic cluster. Stored on the media entry under
+    # LENS_MARKS_KEY so a later run reuses them; [] clears them.
+    lens_marks: Optional[List[float]] = None
+
+
+LENS_MARKS_KEY = "eye_contact_lens_marks"
 
 
 def saved_setup() -> Dict[str, Any]:
@@ -109,6 +116,7 @@ async def get_eye_contact_settings():
 @router.put("/settings")
 async def put_eye_contact_settings(body: EyeContactSetup):
     setup = _merged(body)
+    setup.pop("lens_marks", None)       # per recording, not part of the speaker's setup
     app_settings.set(SETTINGS_KEY, setup)
     return setup
 
@@ -138,7 +146,8 @@ async def start_eye_contact(project_id: str, media_id: str, body: EyeContactSetu
     jobs[job_id] = {"id": job_id, "project_id": project_id, "media_id": media_id, "job_type": "eye_contact",
                     "status": "queued", "progress": 0.0, "stage": "Waiting for the GPU", "result": None,
                     "error": None, "cancel": False}
-    asyncio.create_task(_run(job_id, project_id, media_id, src, default_output(src), _merged(body)))
+    setup = _with_marks(project_id, p_data, entry, _merged(body))
+    asyncio.create_task(_run(job_id, project_id, media_id, src, default_output(src), setup))
     return {"job_id": job_id}
 
 
@@ -149,7 +158,18 @@ def _settings(setup: Dict[str, Any]):
                     prompter_cm=float(setup["prompter_cm"]), camera_cm=float(setup["camera_cm"]),
                     steadiness=float(setup["steadiness"]), aim_deg=float(setup["aim_deg"]),
                     pitch_deg=float(setup.get("pitch_deg") or 0.0),
-                    auto_pitch=bool(setup.get("auto_pitch", True)))
+                    auto_pitch=bool(setup.get("auto_pitch", True)),
+                    lens_marks=[float(t) for t in (setup.get("lens_marks") or [])])
+
+
+def _with_marks(project_id: str, p_data, entry, setup: Dict[str, Any]) -> Dict[str, Any]:
+    """The run's lens marks: the request's (then stored on the media entry for later runs),
+    else the ones stored there."""
+    marks = setup.get("lens_marks")
+    if marks is not None:
+        entry[LENS_MARKS_KEY] = [round(float(t), 3) for t in marks]
+        project_store.save_project(project_id, p_data)
+    return {**setup, "lens_marks": list(entry.get(LENS_MARKS_KEY) or [])}
 
 
 def _cleanup(dst: str):
@@ -186,7 +206,7 @@ async def start_eye_contact_analyse(project_id: str, media_id: str, body: EyeCon
     jobs[job_id] = {"id": job_id, "project_id": project_id, "media_id": media_id,
                     "job_type": "eye_contact_analyse", "status": "queued", "progress": 0.0,
                     "stage": "Waiting for the GPU", "result": None, "error": None, "cancel": False}
-    asyncio.create_task(_run_analyse(job_id, src, _merged(body)))
+    asyncio.create_task(_run_analyse(job_id, src, _with_marks(project_id, p_data, entry, _merged(body))))
     return {"job_id": job_id}
 
 
@@ -211,6 +231,10 @@ def _plan_summary(plan, settings) -> Dict[str, Any]:
         "median_shift_px": round(float(np.median(np.abs(plan["corr"][moved]))) * w, 2) if moved.any() else 0.0,
         "eye_width_px": round(w, 1),
         "lens_per_eye": {k: round(float(v), 3) for k, v in (plan.get("lens_e") or {}).items()},
+        "lens_source": plan.get("lens_source", "geometry"),
+        # held looks into the lens (seconds) the user can confirm as lens_marks
+        "camera_look_candidates": list(plan.get("camera_look_candidates") or []),
+        "side_check": plan.get("side_check", "unclear"),
         "settings": asdict(settings),
     }
 
@@ -269,7 +293,7 @@ async def start_eye_contact_preview(project_id: str, media_id: str, body: Previe
         if j["media_id"] == media_id and j["job_type"] == "eye_contact_preview" and j["status"] in ("queued", "running"):
             j["cancel"] = True
 
-    setup = _merged(body)
+    setup = _with_marks(project_id, p_data, entry, _merged(body))
     job_id = f"eyepreview_{uuid.uuid4().hex[:8]}"
     jobs[job_id] = {"id": job_id, "project_id": project_id, "media_id": media_id,
                     "job_type": "eye_contact_preview", "status": "queued", "progress": 0.0,
@@ -279,7 +303,8 @@ async def start_eye_contact_preview(project_id: str, media_id: str, body: Previe
 
 
 async def _run_preview(job_id: str, src: str, start_s: float, duration_s: float, setup: Dict[str, Any]):
-    from eyecontact import correct_eye_contact, lens_positions, preview_clip, prune_previews
+    from dataclasses import replace
+    from eyecontact import correct_eye_contact, lens_info, preview_clip, prune_previews
     job = jobs[job_id]
     dst = ""
 
@@ -296,12 +321,17 @@ async def _run_preview(job_id: str, src: str, start_s: float, duration_s: float,
             before = await asyncio.to_thread(preview_clip, src, start_s, duration_s)
             # a distinct file per setup: the dialog may still be streaming the previous one
             dst = before.replace("_before.mp4", f"_after_{uuid.uuid4().hex[:6]}.mp4")
-            # Each eye's own lens position from the whole recording: the preview clip alone is
-            # too short to measure it, and would show the old over-pushed eyes.
-            lens = await asyncio.to_thread(lens_positions, src, _settings(setup))
+            # The lens measured over the whole recording (marks are in its seconds): the preview
+            # clip alone is too short to measure it, and would show the old over-pushed eyes.
+            whole = await asyncio.to_thread(lens_info, src, _settings(setup)) or {}
+            lens = whole.get("lens_e")
             report = await asyncio.to_thread(
-                correct_eye_contact, before, dst, _settings(setup), "high", "h264", progress,
-                lambda: job["cancel"], lens)
+                correct_eye_contact, before, dst, replace(_settings(setup), lens_marks=[]), "high", "h264",
+                progress, lambda: job["cancel"], lens)
+            if whole:
+                # in the whole recording's seconds, and where its lens came from
+                report = {**report, "camera_look_candidates": whole.get("camera_look_candidates", []),
+                          "lens_source": whole.get("lens_source", report.get("lens_source"))}
         finally:
             await gpu_broker.release_lease("eye_contact")
         prune_previews()

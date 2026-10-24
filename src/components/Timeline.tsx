@@ -9,6 +9,7 @@ import {
   cutProgramRange, restoreProgramCuts,
   splitClips, deleteClips, moveClips, trimClips, linkClips, unlinkClips, pasteClips, closeGap,
   setClipFlags, setTransform,
+  setAngle, clearAngles, useAnglesStore,
 } from '../hooks/api';
 import { MEDIA_DND_TYPE } from './MediaPool';
 import { COMMANDS, useCommandStore } from '../hooks/commands';
@@ -151,14 +152,23 @@ interface TTimeline {
   fps_num: number;
   fps_den: number;
   items: TItem[];
-  sources: Record<string, { kind?: string; path?: string; duration_seconds?: number }>;
+  sources: Record<string, {
+    kind?: string; path?: string; duration_seconds?: number;
+    /** Set on a camera angle: the primary source it is synced to, and its offset. */
+    synced_to?: string | null; sync_offset_s?: number;
+  }>;
   duration_frames?: number;
   program_offset_frames?: number;
   tracks?: Record<string, TrackState>;
   extra_tracks?: string[];
   /** Programme-frame ranges ripple-cut out of the auto-edited V1/A1 spine. */
   manual_cuts?: unknown[];
+  /** Multicam angle choices, in primary-source frames. */
+  angle_spans?: { start: number; end: number; source_id: string }[];
 }
+
+/** Display info for a camera-angle source: its 1-based number (hue = angle-1..3) and name. */
+interface AngleTag { index: number; hue: number; name: string; offset: number }
 
 type DragMode = 'move' | 'trim-start' | 'trim-end';
 interface DragState {
@@ -443,6 +453,30 @@ export default function Timeline() {
   const playFrame = Math.round(currentTime * fps);
 
   const items = tl?.items ?? [];
+
+  // Camera angles: sources synced to the primary, numbered in the order they were added.
+  // Names come from GET /angles (the library names) once loaded, else the file name.
+  const anglesState = useAnglesStore((s) => (s.projectId === projectId ? s.state : null));
+  const loadAngles = useAnglesStore((s) => s.load);
+  const angleTags = useMemo(() => {
+    const out: Record<string, AngleTag> = {};
+    let n = 0;
+    for (const [sid, src] of Object.entries(tl?.sources ?? {})) {
+      if (!src?.synced_to) continue;
+      n += 1;
+      const known = anglesState?.angles.find(a => a.source_id === sid);
+      out[sid] = {
+        index: n, hue: ((n - 1) % 3) + 1,
+        name: known?.name || (src.path ?? sid).split(/[\\/]/).pop() || sid,
+        offset: known?.offset_s ?? src.sync_offset_s ?? 0,
+      };
+    }
+    return out;
+  }, [tl?.sources, anglesState]);
+  const angleKey = Object.keys(angleTags).join(',');
+  useEffect(() => {
+    if (projectId && angleKey) loadAngles(projectId);
+  }, [projectId, angleKey, loadAngles]);
 
   // Transitions and programme effects had no representation on the lanes at all,
   // which is why applying one looked like nothing had happened: the panel said
@@ -1567,6 +1601,7 @@ export default function Timeline() {
 
     setMenu({ x: e.clientX, y: e.clientY, items: [
       ...rangeEntries(e.clientX, item.track),
+      ...angleEntries(item, all),
       cmdEntry('edit.cut', canDelete),
       cmdEntry('edit.copy', all.length > 0),
       cmdEntry('edit.paste', hasClipboard),
@@ -1619,6 +1654,45 @@ export default function Timeline() {
       cmdEntry('edit.undo', canUndo),
       cmdEntry('edit.redo', canRedo),
     ] });
+  };
+
+  /** Multicam: "Switch to" over the In/Out range when marked, else the selection's span
+   *  (programme frames, min start to max end); shown on V1, a multi-selection or a range. */
+  const angleEntries = (item: TItem, all: TItem[]): MenuEntry[] => {
+    const tags = Object.entries(angleTags);
+    if (!projectId || !tags.length) return [];
+    const marked = markIn != null && markOut != null && markIn !== markOut;
+    if (!(item.track === 'V1' || all.length > 1 || marked)) return [];
+    let start: number;
+    let end: number;
+    if (marked) {
+      start = Math.round(Math.min(markIn!, markOut!) * fps);
+      end = Math.round(Math.max(markIn!, markOut!) * fps);
+    } else {
+      start = Math.min(...all.map(i => i.timeline_start_frame));
+      end = Math.max(...all.map(i => i.timeline_end_frame));
+    }
+    const where = marked ? 'the In/Out range' : 'the selection';
+    const sw = (sourceId: string | null) => () => runOp(() => setAngle(projectId, start, end, sourceId));
+    return [
+      {
+        label: `Switch to (${where})`, disabled: end <= start, hint: 'Empty range',
+        submenu: [
+          { label: 'Primary', onClick: sw(null) },
+          ...tags.map(([sid, t]) => ({ label: `${t.index}. ${t.name}`, onClick: sw(sid) })),
+        ],
+      },
+      {
+        label: 'Clear all angles', danger: true, disabled: !tl?.angle_spans?.length,
+        hint: 'No angle is in use',
+        onClick: () => {
+          if (window.confirm('Remove every angle switch? V1 shows the main recording again (undoable).')) {
+            runOp(() => clearAngles(projectId));
+          }
+        },
+      },
+      sep,
+    ];
   };
 
   const openLaneMenu = (e: React.MouseEvent, track: string) => {
@@ -1952,6 +2026,7 @@ export default function Timeline() {
                       const primary = item.id === selectedClipId;
                       const linked = isLinked(item);
                       const chips = dressingChips(item);
+                      const angle = laneKind === 'V' ? angleTags[item.source_id] : undefined;
                       const width = Math.max(2, frameToPx(endF - startF));
                       return (
                         <div key={item.id}
@@ -1992,6 +2067,7 @@ export default function Timeline() {
                               width={width}
                             />
                           )}
+                          {angle && <span className={`clip-angle-tint angle-${angle.hue}`} />}
                           {/* The transition into this clip, drawn at its true
                               length so a 2s dissolve looks like one. Sits under
                               the trim handle and takes no pointer events, so it
@@ -2012,8 +2088,14 @@ export default function Timeline() {
                             {clipLabel(item, kind, laneKind)}
                           </span>
                           {/* Chips for dressing that is otherwise invisible on the lane. */}
-                          {(chips.length > 0 || item.mute) && (
+                          {(chips.length > 0 || item.mute || angle) && (
                             <span className="clip-chips" style={{ position: 'absolute', top: 1, right: canTrim ? HANDLE_PX + 2 : 2, zIndex: 3, pointerEvents: 'none' }}>
+                              {angle && (
+                                <span className={`clip-chip angle angle-${angle.hue}`}
+                                  title={`Camera angle ${angle.index}: ${angle.name} · offset ${angle.offset >= 0 ? '+' : '−'}${Math.abs(angle.offset).toFixed(2)} s`}>
+                                  {angle.name}
+                                </span>
+                              )}
                               {chips.map(c => (
                                 <span key={c.key} className="clip-chip" title={c.title}>{c.label}</span>
                               ))}

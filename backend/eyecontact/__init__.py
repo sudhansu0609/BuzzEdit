@@ -25,6 +25,7 @@ import numpy as np
 from config import DATA_DIR
 
 from .plan import Settings, make_plan
+from .sheet import contact_sheet, sheet_path
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ OUTPUT_SUFFIX = "_eyecontact"
 TRACK_SHARE = 0.5     # progress split between the two passes (they run at about the same speed)
 
 __all__ = ["Settings", "available", "correct_eye_contact", "default_output", "analyse",
-           "preview_clip", "prune_previews"]
+           "preview_clip", "prune_previews", "lens_info", "lens_positions", "contact_sheet"]
 
 
 def available() -> Tuple[bool, str]:
@@ -105,7 +106,8 @@ def preview_clip(src: str, start_s: float, duration_s: float) -> str:
 def prune_previews():
     """Keep only the newest preview files."""
     files = sorted(PREVIEW_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in files[PREVIEW_KEEP:]:
+    sheets = sorted(PREVIEW_DIR.glob("*_eyes.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in files[PREVIEW_KEEP:] + sheets[PREVIEW_KEEP:]:
         try:
             old.unlink()
         except OSError:
@@ -120,11 +122,14 @@ def analyse(src: str, settings: Settings = Settings(),
     from .gpu import probe
     info = probe(src)
     data = _track(src, info, progress, cancelled)
-    return info, make_plan(data["pts"], data["score"], info.fps, settings, lens_e)
+    return info, make_plan(data["pts"], data["score"], info.fps, settings, lens_e,
+                           frame_size=(info.width, info.height))
 
 
-def lens_positions(src: str, settings: Settings = Settings()) -> Optional[dict]:
-    """Where each eye sits when looking into the lens, over the whole of `src`, or None.
+def lens_info(src: str, settings: Settings = Settings()) -> Optional[dict]:
+    """The whole of `src`'s lens measurement, or None: {"lens_e": where the gaze and each eye
+    sit when looking into the lens, "lens_source": "marks" | "measured" | "geometry",
+    "camera_look_candidates": up to 3 held camera looks (seconds) for the user to confirm}.
 
     Only from landmarks already cached (a full run or an earlier preview tracked them): a
     preview must stay quick, so it never tracks a whole recording just for this."""
@@ -132,9 +137,16 @@ def lens_positions(src: str, settings: Settings = Settings()) -> Optional[dict]:
         if not _cache_path(src).exists():
             return None
         _info, plan = analyse(src, settings)
-        return plan.get("lens_e") or None
+        return {"lens_e": plan.get("lens_e") or None, "lens_source": plan.get("lens_source", "geometry"),
+                "camera_look_candidates": list(plan.get("camera_look_candidates") or [])}
     except Exception:
         return None
+
+
+def lens_positions(src: str, settings: Settings = Settings()) -> Optional[dict]:
+    """Where each eye sits when looking into the lens, over the whole of `src`, or None."""
+    info = lens_info(src, settings)
+    return (info or {}).get("lens_e") or None
 
 
 def correct_eye_contact(src: str, dst: Optional[str] = None, settings: Settings = Settings(),
@@ -158,6 +170,11 @@ def correct_eye_contact(src: str, dst: Optional[str] = None, settings: Settings 
     from .render import render
     frames = render(src, dst, plan, info, quality, codec,
                     lambda f: report(TRACK_SHARE + f * (1 - TRACK_SHARE)), cancelled)
+    sheet = None
+    try:
+        sheet = contact_sheet(src, dst, plan, sheet_path(dst))
+    except Exception as e:      # a judging aid: never fails the run
+        logger.warning("Eye contact sheet failed: %s", e)
     report(1.0)
 
     moved = np.abs(plan["corr"]) > 1e-3
@@ -187,6 +204,12 @@ def correct_eye_contact(src: str, dst: Optional[str] = None, settings: Settings 
         "mode": plan.get("mode", settings.mode),
         "auto_measured": bool(plan.get("auto_measured")),
         "measured_shift_deg": round(float(plan.get("measured_shift_deg", 0.0)), 1),
+        # Where the lens came from: the user's marks, the take's own camera looks, or the
+        # geometry; looks the user can confirm as marks; whether the video looks mirrored.
+        "lens_source": plan.get("lens_source", "geometry"),
+        "camera_look_candidates": list(plan.get("camera_look_candidates") or []),
+        "side_check": plan.get("side_check", "unclear"),
+        "contact_sheet": sheet,
         "settings": asdict(settings),
         "quality": quality,
         "seconds": round(time.time() - t0, 1),

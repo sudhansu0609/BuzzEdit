@@ -31,6 +31,12 @@ class SourceFile(BaseModel):
     # of versions, [{path, effect, params, created}] newest last; Undo pops it.
     audio_override: Optional[str] = None
     audio_history: List[Dict[str, Any]] = Field(default_factory=list)
+    # Camera angle (MULTICAM_SYNC_PLAN.md): the source this one was recorded
+    # alongside, and how its clock lines up: angle_time = primary_time +
+    # sync_offset_s, measured from the two soundtracks. None for an ordinary source.
+    synced_to: Optional[str] = None
+    sync_offset_s: float = 0.0
+    sync_confidence: float = 0.0
 
 class WordItem(BaseModel):
     id: str
@@ -527,6 +533,11 @@ class Timeline(BaseModel):
     # already implies. Reapplied by rebuild_primary_tracks after every
     # word-toggle rebuild so a hand cut survives a transcript edit.
     manual_cuts: List[List[int]] = Field(default_factory=list)
+    # Multicam angle choices: [{"start", "end", "source_id"}] spans in PRIMARY
+    # SOURCE frames (same convention as manual_cuts) during which V1 shows the
+    # synced angle `source_id` instead of the primary. Reapplied by
+    # rebuild_primary_tracks after every rebuild; A1 never follows them.
+    angle_spans: List[Dict[str, Any]] = Field(default_factory=list)
     # The AI editor's "decided under doubt" list (asr.editor_planner): calls its
     # reads disagreed on, plus cut points the listening check could not settle.
     # Each item names a take; `answer` is the user's verdict once given.

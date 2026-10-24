@@ -161,11 +161,18 @@ def pad_phrase_ends(phrases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+#: The narration engine's delivery cues (engines/tts/cli.py), stripped before captions.
+_CUE_RE = re.compile(r"\(\s*(?:pause[^)]*|beat|slow|normal|dramatic|intense|soft|calm)\s*\)", re.IGNORECASE)
+
+
 def build_caption_phrases(given_text: str, heard_words: Sequence[Dict[str, Any]],
                           total_duration: float) -> List[Dict[str, Any]]:
     """The whole pipeline: split the given text into words, align them to what
     was heard, interpolate what did not match, and cut the result into timed
-    on-screen phrases."""
+    on-screen phrases. Delivery cues meant for the voice -- "(pause)", "(pause 2s)",
+    "(beat)", "(slow)", "(dramatic)" ... -- are never spoken, so they are never shown
+    either ("(beat) Yeh sirf nakhun" reached the screen, 2026-10-24)."""
+    given_text = _CUE_RE.sub(" ", given_text or "")
     given_words = split_words(given_text)
     if not given_words:
         return []

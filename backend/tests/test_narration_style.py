@@ -47,9 +47,9 @@ def test_list_moods_has_all_seven_presets_in_table_order_with_style():
 def test_horror_narrator_mood_is_slow_grave_and_low_key():
     horror = cli.resolve_style({"mood": "horror_narrator"})
     assert horror["exaggeration"] == 0.3 and horror["cfg_weight"] == 0.25
-    assert horror["temperature"] == 0.6 and horror["pace"] == 0.85
-    assert horror["word_gap_ms"] == 70 and horror["phrase_pause_s"] == 0.3
-    assert horror["sentence_pause_s"] == 0.6
+    assert horror["temperature"] == 0.6 and horror["pace"] == 0.90   # the creator's tempo pick, slowed a touch, 2026-10-24
+    assert horror["word_gap_ms"] == 50 and horror["phrase_pause_s"] == 0.25
+    assert horror["sentence_pause_s"] == 0.5
 
 
 # --------------------------------------------------------------------------- inline mood cues

@@ -18,6 +18,7 @@ the same picture while staying inside zoompan's legal range.
 """
 
 import math
+from contextvars import ContextVar
 from typing import List, Optional, Tuple
 
 from timeline.schema import ChromaKey, ColorGrade, Transform
@@ -50,6 +51,13 @@ _ZOOM_SS_MIN_TRAVEL_PX = 15.0
 # shimmer however fast the move. 2x keeps that under half a pixel.
 _ZOOM_SS_FLOOR = 2
 
+# Overrides the zoom supersampling factor for whatever compiles in this context.
+# The draft preview (render/preview.py) sets it to 1: a 540p draft is watched
+# once, and the 2-3x intermediate frames were most of its zoompan cost. Context-
+# scoped rather than a module global, so a full render running at the same time
+# keeps its own factor.
+ZOOM_SS_OVERRIDE: ContextVar[Optional[int]] = ContextVar("zoom_ss_override", default=None)
+
 
 def _zoom_ss(canvas_w: int, canvas_h: int, base_scale: float,
              travel_px_per_frame: Optional[float] = None) -> int:
@@ -60,6 +68,9 @@ def _zoom_ss(canvas_w: int, canvas_h: int, base_scale: float,
     `travel_px_per_frame` (average window-edge travel in output pixels) picks
     the smallest factor that still hides the rounding; None keeps the base.
     """
+    override = ZOOM_SS_OVERRIDE.get()
+    if override is not None:
+        return max(1, int(override))
     long_edge = max(canvas_w, canvas_h) * max(0.05, base_scale)
     ss = _ZOOM_SS_BASE
     if travel_px_per_frame is not None and travel_px_per_frame > 0:
@@ -129,6 +140,12 @@ def build_color_chain(color: Optional[ColorGrade], clip_duration_sec: float = 0.
         # operates in linear light, so it behaves like the lens did rather than
         # like a brightness slider bolted onto gamma-encoded values.
         filters.append(f"exposure=exposure={_f(_clamp(color.exposure, -3.0, 3.0))}")
+        # `exposure` hands on float RGB planes (gbrpf32). Every integer filter
+        # after it still works, but `noise` (the grain layer) adds its strength
+        # as whole pixel values onto 0..1 floats and buries the picture: on
+        # 2026-10-24 a 0.3-stop exposure plus grain 0.15 rendered as solid
+        # static. Back to the working format here so what follows sees 8-bit.
+        filters.append("format=yuv420p")
 
     eq_parts: List[str] = []
     if color.contrast != 1.0:

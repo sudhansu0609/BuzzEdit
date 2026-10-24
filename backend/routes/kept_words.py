@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException
 
 from config import PROJECTS_DIR
 from store.project_store import ProjectStore
+from timeline.ops import v1_primary_span
 from timeline.schema import Timeline, TimelineItem, WordItem, frame_to_time
 
 router = APIRouter()
@@ -31,15 +32,18 @@ def _v1_items(timeline: Timeline) -> List[TimelineItem]:
     )
 
 
-def _programme_span(word: WordItem, items: List[TimelineItem]) -> Optional[Tuple[int, int]]:
+def _programme_span(word: WordItem, items: List[TimelineItem],
+                    timeline: Timeline) -> Optional[Tuple[int, int]]:
     """Where `word`'s source frames land on the programme timeline, via the V1
     item whose source range contains its start -- there is no speed change
     within a segment, so the mapping is a linear offset. None if the word does
     not fall inside any surviving segment (e.g. a dropped sliver)."""
     for item in items:
-        if item.source_start_frame <= word.start_frame < item.source_end_frame:
-            offset_start = max(0, word.start_frame - item.source_start_frame)
-            offset_end = max(offset_start, min(item.source_end_frame, word.end_frame) - item.source_start_frame)
+        # Primary-source frames: a camera-angle piece is on the angle's clock.
+        src_start, src_end = v1_primary_span(timeline, item)
+        if src_start <= word.start_frame < src_end:
+            offset_start = max(0, word.start_frame - src_start)
+            offset_end = max(offset_start, min(src_end, word.end_frame) - src_start)
             tl_start = item.timeline_start_frame + offset_start
             tl_end = item.timeline_start_frame + offset_end
             return tl_start, tl_end
@@ -71,7 +75,7 @@ async def get_kept_words(project_id: str) -> Dict[str, Any]:
             "tl_start": None,
             "tl_end": None,
         }
-        span = _programme_span(word, items)
+        span = _programme_span(word, items, timeline)
         if span is not None:
             entry["tl_start"] = frame_to_time(span[0], timeline.fps_num, timeline.fps_den)
             entry["tl_end"] = frame_to_time(span[1], timeline.fps_num, timeline.fps_den)

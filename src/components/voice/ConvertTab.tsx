@@ -8,12 +8,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useProjectStore } from '../../hooks/store';
-import { MediaEntry, listMedia } from '../../hooks/api';
+import { MediaEntry, getProject, listMedia } from '../../hooks/api';
 import { AudioApiError, EffectDef, audioFileUrl, errorText } from '../../hooks/audioApi';
 import {
-  ConvertFileResult, PresetsResponse, UploadedMedia, VoiceChoice, VoiceEntry, choiceLabel, convertFile,
-  defaultChoice, downloadError, downloadMedia, emptyChoice, fileName, fileStem, mediaPoolChanged,
-  notifyMediaPoolChanged, rememberChoice, samePath, startError, timeStamp, uploadMedia, uploadMissing,
+  ConvertFileResult, LipsyncCheckResult, LipsyncSpan, LipsyncSummary, PresetsResponse, UploadedMedia,
+  VoiceChoice, VoiceConversion, VoiceEntry, choiceLabel, convertFile, defaultChoice, downloadError,
+  downloadMedia, emptyChoice, fileName, fileStem, formatSeconds, mediaPoolChanged, notifyMediaPoolChanged,
+  rememberChoice, samePath, startError, startLipsyncCheck, timeStamp, uploadMedia, uploadMissing,
 } from '../../hooks/voiceApi';
 import JobProgress, { JobWatch, jobRunning, useJob, watchJob } from './JobProgress';
 import Recorder, { RecordedClip } from './Recorder';
@@ -287,6 +288,133 @@ export default function ConvertTab({ projectId, voices, presets, defs, request }
               {downloading === 'mp3' ? 'Preparing…' : 'Download MP3'}
             </button>
           </div>
+        </div>
+      )}
+      {note && <div className="audio-note">{note}</div>}
+      <LipsyncCard projectId={projectId} />
+    </div>
+  );
+}
+
+// -- lip-sync (read-only): the last voice-map apply's per-speaker check, and a re-check ----------
+
+const corrText = (n: number | null | undefined) =>
+  typeof n === 'number' && Number.isFinite(n) ? n.toFixed(2) : '–';
+
+function lipsyncTip(s: { corr_original: number | null; corr_converted: number | null; lag_frames: number | null }) {
+  return `Mouth-voice correlation: original ${corrText(s.corr_original)}, converted ${corrText(s.corr_converted)}`
+    + `; lag ${s.lag_frames ?? '–'} frames`;
+}
+
+/** The chip for one speaker's worst span: green ok, amber check, muted when not checkable. */
+function LipsyncChip({ summary }: { summary: LipsyncSummary | null | undefined }) {
+  if (!summary) {
+    return (
+      <span className="voice-lipsync-chip muted" title="No lip-sync check for this speaker (no video or no GPU landmarks)">
+        not checked
+      </span>
+    );
+  }
+  if (summary.flag) {
+    const text = summary.reason === 'lag' ? `check: lag ${summary.lag_frames ?? '?'} frames` : 'check: weak match';
+    return <span className="voice-lipsync-chip warn" title={lipsyncTip(summary)}>{text}</span>;
+  }
+  if (summary.reason === 'no_face' || summary.reason === 'short') {
+    return (
+      <span className="voice-lipsync-chip muted" title={lipsyncTip(summary)}>
+        {summary.reason === 'no_face' ? 'no face' : 'too short'}
+      </span>
+    );
+  }
+  return <span className="voice-lipsync-chip ok" title={lipsyncTip(summary)}>ok</span>;
+}
+
+function LipsyncCard({ projectId }: { projectId: string }) {
+  const [conversions, setConversions] = useState<VoiceConversion[]>([]);
+  const [watch, setWatch] = useState<JobWatch | null>(null);
+  const job = useJob(watch);
+  const [check, setCheck] = useState<LipsyncCheckResult | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const alive = useRef(true);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => { alive.current = false; };
+  }, []);
+
+  // The project route does not return `metadata`; the applied voice map's record
+  // (`settings.voice_map_applied`) carries the same `voice_conversions`, with `lipsync`.
+  useEffect(() => {
+    let live = true;
+    getProject(projectId).then((p: any) => {
+      const record = p?.settings?.voice_map_applied;
+      const list = Array.isArray(record?.voice_conversions) ? record.voice_conversions : [];
+      if (live) setConversions(list as VoiceConversion[]);
+    }).catch(() => { if (live) setConversions([]); });
+    return () => { live = false; };
+  }, [projectId]);
+
+  if (!conversions.length) return null;
+
+  // = the backend's `lipsync_flags`: flagged spans across every speaker.
+  const flags = conversions.reduce(
+    (n, c) => n + (c.lipsync?.spans || []).filter((s) => s.flag).length, 0);
+  const running = jobRunning(job);
+
+  const recheck = async () => {
+    setNote(null);
+    setCheck(null);
+    try {
+      const { job_id: jobId } = await startLipsyncCheck(projectId);
+      const w = watchJob(projectId, jobId);
+      setWatch(w);
+      void w.done.then((final) => {
+        if (final.status === 'completed' && final.result && alive.current) {
+          setCheck(final.result as unknown as LipsyncCheckResult);
+        }
+      });
+    } catch (err) {
+      setNote(startError(err, 'Lip-sync check'));
+    }
+  };
+
+  return (
+    <div className="audio-card voice-lipsync">
+      <div className="audio-card-title">Lip-sync</div>
+      {flags > 0 && (
+        <div className="voice-lipsync-flags">{flags} span{flags === 1 ? '' : 's'} flagged</div>
+      )}
+      {conversions.map((c, i) => (
+        <div key={`${c.speaker}-${c.voice}-${i}`} className="voice-lipsync-row">
+          <span className="voice-lipsync-name" title={`${c.speaker} in ${c.voice}`}>
+            {c.speaker} · {c.voice}
+          </span>
+          <span className="voice-lipsync-secs">{Number(c.seconds || 0).toFixed(1)} s</span>
+          <LipsyncChip summary={c.lipsync} />
+        </div>
+      ))}
+      <div className="voice-row">
+        <button type="button" className="audio-btn" disabled={running}
+          title="Check the converted spans against the speaker's mouth again (no re-conversion)"
+          onClick={() => void recheck()}>
+          {running ? 'Checking…' : 'Re-check lip-sync'}
+        </button>
+      </div>
+      <JobProgress watch={watch} label="Lip-sync check" />
+      {check && (
+        <div className="voice-lipsync-spans">
+          <div className="text-xs text-muted">
+            {check.lipsync_flags > 0
+              ? `${check.lipsync_flags} span${check.lipsync_flags === 1 ? '' : 's'} flagged`
+              : 'No span flagged'}
+          </div>
+          {(check.spans || []).map((s: LipsyncSpan, i: number) => (
+            <div key={i} className={`voice-lipsync-span${s.flag ? ' flagged' : ''}`} title={lipsyncTip(s)}>
+              {formatSeconds(s.start_s)}-{formatSeconds(s.end_s)} · corr {corrText(s.corr_converted)}
+              {' '}(was {corrText(s.corr_original)}) · lag {s.lag_frames ?? '–'}
+              {s.reason ? ` · ${s.reason.replace('_', ' ')}` : ''}
+            </div>
+          ))}
         </div>
       )}
       {note && <div className="audio-note">{note}</div>}

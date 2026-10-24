@@ -1782,7 +1782,8 @@ input:focus, textarea:focus, select:focus {
   color: #fff;
   text-transform: uppercase;
   letter-spacing: 0.03em;
-  pointer-events: none;
+  /* hoverable, so its tooltip (lens source, angle, per-eye px) shows */
+  cursor: help;
 }
 .media-eye-progress {
   position: absolute;
@@ -1943,6 +1944,7 @@ input:focus, textarea:focus, select:focus {
 }
 .eye-compare-controls {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
@@ -1952,6 +1954,136 @@ input:focus, textarea:focus, select:focus {
 .eye-compare-modes {
   display: flex;
   gap: 4px;
+}
+/* Eye-contact dialog, measured (auto) mode: everything inside the fixed-width settings
+   column wraps instead of widening it. */
+.eye-mode-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.eye-mode-toggle .btn {
+  flex: 1 1 auto;
+  white-space: normal;
+}
+.eye-section {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-tertiary);
+}
+.eye-section > .text-xs {
+  overflow-wrap: anywhere;
+}
+.eye-section-title {
+  font-weight: 600;
+}
+.eye-lens-pill {
+  display: inline-block;
+  max-width: 100%;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  white-space: normal;
+  color: #fff;
+  background: var(--accent);
+}
+.eye-lens-pill.marks,
+.eye-lens-pill.measured {
+  background: rgba(46, 160, 67, 0.88);
+}
+.eye-lens-pill.geometry {
+  background: var(--warning);
+  color: #111;
+}
+.eye-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-width: 100%;
+}
+.eye-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.eye-chip.mark {
+  gap: 4px;
+  padding: 1px 2px 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  background: var(--bg-active);
+}
+.eye-chip-x {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.eye-chip-x:hover {
+  color: var(--danger);
+}
+.eye-warning {
+  color: #fbbf24;
+}
+.eye-geometry > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+.eye-geometry[open] > summary {
+  margin-bottom: 8px;
+}
+.eye-geometry > label + label,
+.eye-geometry > .text-xs + label {
+  margin-top: 8px;
+}
+.eye-sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.eye-sheet img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 6px;
+  background: #000;
+  cursor: zoom-in;
+}
+.eye-sheet-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  overflow: auto;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.88);
+  cursor: zoom-out;
+}
+.eye-sheet-lightbox img {
+  display: block;
+  max-width: none;
+  margin: 0 auto;
+}
+/* Narrow windows (the floor is 640px): the preview pane goes under the settings instead
+   of squeezing the before/after player beside a 308px column. */
+@media (max-width: 900px) {
+  .eye-dialog.wide {
+    flex-direction: column;
+  }
+  .eye-dialog.wide .eye-dialog-settings {
+    width: auto;
+  }
+  .eye-dialog.wide .eye-dialog-preview {
+    flex: none;
+  }
 }
 .media-actions {
   position: absolute;
@@ -3394,3 +3526,180 @@ input:focus, textarea:focus, select:focus {
   font-size: 13px;
 }
 .timeline-dialog-actions { display: flex; justify-content: flex-end; gap: 6px; }
+
+/* Multicam angles + external audio sync (docs/MULTICAM_SYNC_PLAN.md#Frontend) */
+:root {
+  --angle-1: 236, 72, 153;   /* pink */
+  --angle-2: 20, 184, 166;   /* teal */
+  --angle-3: 245, 158, 11;   /* amber */
+}
+.media-angle-badge {
+  position: absolute;
+  top: 4px;
+  left: 22px;
+  max-width: calc(100% - 26px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(var(--angle-1), 0.88);
+  color: #fff;
+  letter-spacing: 0.03em;
+  cursor: help;
+}
+.sync-dialog { width: min(420px, calc(100vw - 32px)); }
+.sync-dialog .timeline-dialog-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sync-result { display: flex; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }
+.sync-error { color: var(--danger); overflow-wrap: anywhere; }
+
+/* A V1 piece showing a synced angle: a hue per angle over the filmstrip. */
+.clip-angle-tint {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  border-top: 3px solid rgb(var(--angle-c));
+  background: rgba(var(--angle-c), 0.28);
+}
+.clip-angle-tint.angle-1 { --angle-c: var(--angle-1); }
+.clip-angle-tint.angle-2 { --angle-c: var(--angle-2); }
+.clip-angle-tint.angle-3 { --angle-c: var(--angle-3); }
+.clip-chip.angle {
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: auto;
+  cursor: help;
+}
+.clip-chip.angle-1 { background: rgba(var(--angle-1), 0.9); }
+.clip-chip.angle-2 { background: rgba(var(--angle-2), 0.9); }
+.clip-chip.angle-3 { background: rgba(var(--angle-3), 0.9); }
+
+/* Inspector: Camera angles */
+.angle-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.angle-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+}
+.angle-row-swatch {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: rgb(var(--angle-c, 128, 128, 128));
+}
+.angle-row-swatch.angle-1 { --angle-c: var(--angle-1); }
+.angle-row-swatch.angle-2 { --angle-c: var(--angle-2); }
+.angle-row-swatch.angle-3 { --angle-c: var(--angle-3); }
+.angle-row-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.angle-row-meta { flex: 0 0 auto; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.angle-auto-modes { display: flex; flex-direction: column; gap: 3px; margin: 4px 0 6px; font-size: 11px; }
+.angle-auto-modes label { display: flex; align-items: center; gap: 6px; }
+.angle-auto-num { width: 56px; }
+
+/* Preview: the cut preview plays the primary file, so say when the edit shows an angle. */
+.preview-angle-pill {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 5;
+  /* clear of the mode buttons at top-left */
+  max-width: max(80px, calc(100% - 250px));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(var(--angle-1), 0.85);
+  color: #fff;
+  pointer-events: auto;
+  cursor: help;
+}
+
+/* Video stabilization (docs/STABILIZE_PLAN.md#Frontend) */
+.media-stab-badge {
+  position: absolute;
+  bottom: 20px;
+  right: 4px;
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(59, 130, 246, 0.88);
+  color: #fff;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  cursor: help;
+}
+.stab-shake-pill {
+  align-self: flex-start;
+  max-width: 100%;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.stab-shake-pill.shaky { border-color: var(--warning); color: var(--warning); }
+.stab-shake-pill.steady { border-color: var(--accent); }
+.eye-dialog label.stab-check {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+/* Draft preview (docs/DRAFT_PREVIEW_PLAN.md#Frontend): the FX bar gained the
+   window draft button and timing pill, so it wraps instead of running off a narrow stage. */
+.fx-stage-bar {
+  flex-wrap: wrap;
+  max-width: calc(100% - 16px);
+}
+.fx-draft-timing { color: var(--text-secondary, #bbb); }
+
+/* Progress bar effect editor (docs/PROGRESS_BAR_PLAN.md#Frontend) */
+.fx-progress-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  min-width: 0;
+}
+.fx-progress-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-secondary, #bbb);
+}
+.fx-progress-row select { min-width: 0; max-width: 60%; }
+.fx-progress-chapters { overflow-wrap: anywhere; }
+.fx-progress-editor > .btn { align-self: flex-start; }
+
+/* Voice panel: lip-sync card (ConvertTab); never widens the panel */
+.voice-lipsync { min-width: 0; }
+.voice-lipsync-flags { color: var(--warning); font-size: 11px; }
+.voice-lipsync-row { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 11px; }
+.voice-lipsync-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-lipsync-secs { flex-shrink: 0; color: var(--text-muted); }
+.voice-lipsync-chip {
+  min-width: 0; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 0 6px; border-radius: 999px; font-size: 10px; border: 1px solid currentColor;
+}
+.voice-lipsync-chip.ok { color: var(--success); }
+.voice-lipsync-chip.warn { color: var(--warning); }
+.voice-lipsync-chip.muted { color: var(--text-muted); }
+.voice-lipsync-spans { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.voice-lipsync-span { font-size: 10px; overflow-wrap: anywhere; color: var(--text-secondary, #bbb); }
+.voice-lipsync-span.flagged { color: var(--warning); }

@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
+import { create } from 'zustand';
 import { useProjectStore } from './store';
 
 declare global {
@@ -550,7 +551,7 @@ export interface PresetCatalogue {
   transition_catalogue: { group: string; transitions: string[] }[];
   /** Every atmosphere effect the renderer can build, including the ones with no
    *  named preset (glitch, VHS, shake, flash, flicker). */
-  effect_catalogue: { id: string; label: string; description: string }[];
+  effect_catalogue: { id: string; label: string; description: string; extra?: Record<string, any> }[];
 }
 
 // --- Transitions, atmosphere effects and cinematic bars ---
@@ -561,6 +562,28 @@ export interface AtmosphereEffect {
   speed: number;
   color?: string | null;
   enabled: boolean;
+  /** Who added it ("presentation:progress" for the pass's progress bar). */
+  origin?: string | null;
+  /** Free-form params for effects that need more (progress_bar: ProgressBarExtra). */
+  extra?: Record<string, any>;
+}
+
+/** A chapter tick on the progress bar: programme seconds and the label shown. */
+export interface ProgressBarChapter {
+  at_s: number;
+  name: string;
+}
+
+/** `extra` of a `progress_bar` effect (render/atmosphere.py PROGRESS_BAR_DEFAULTS). */
+export interface ProgressBarExtra {
+  chapters: ProgressBarChapter[];
+  position: 'bottom' | 'top';
+  height_px: number;
+  track_color: string;
+  fill_color: string;
+  ticks: boolean;
+  label: 'name' | 'none';
+  margin_px?: number;
 }
 
 /** Omit `itemId` to set the transition used at every cut. */
@@ -639,6 +662,16 @@ export function previewFrameUrl(
     + `?t=${t}&w=${Math.round(width)}&r=${revision ?? 0}`;
 }
 
+/** A windowed draft on disk (render/preview.py `_existing_windows`). */
+export interface ProxyWindow {
+  start_s: number;
+  end_s: number;
+  path: string;
+  /** Programme time of the window draft's first frame (its snapped start). */
+  offset_s: number;
+  revision?: number | null;
+}
+
 export interface ProxyStatus {
   state: 'none' | 'building' | 'ready' | 'error';
   path?: string;
@@ -648,16 +681,33 @@ export interface ProxyStatus {
   detail?: string;
   size_bytes?: number;
   mtime?: number;
+  /** Draft fields: a fast 540p draft, the window asked about ([start_s, end_s] or null). */
+  draft?: boolean;
+  window?: [number, number] | null;
+  /** Programme time of the proxy's first frame (0 for the full draft). */
+  offset_s?: number;
+  /** Build time in seconds, and programme seconds per build second. */
+  seconds?: number | null;
+  realtime_x?: number | null;
+  /** Build progress, 0-100, while building. */
+  progress?: number;
+  full_exists?: boolean;
+  windows?: ProxyWindow[];
 }
 
-export async function getPreviewProxy(projectId: string): Promise<ProxyStatus> {
-  return api(`/api/timeline/${projectId}/preview/proxy`);
+/** Status of the full draft, or (with `window`) of the `start_s`-`end_s` window's draft. */
+export async function getPreviewProxy(projectId: string,
+  window?: [number, number] | null): Promise<ProxyStatus> {
+  const query = window ? `?start_s=${window[0]}&end_s=${window[1]}` : '';
+  return api(`/api/timeline/${projectId}/preview/proxy${query}`);
 }
 
-export async function buildPreviewProxy(projectId: string, height = 540): Promise<ProxyStatus> {
+/** Build the full draft, or (with `window`) a draft of just that stretch of programme time. */
+export async function buildPreviewProxy(projectId: string, height = 540,
+  window?: [number, number] | null): Promise<ProxyStatus> {
   return api(`/api/timeline/${projectId}/preview/proxy`, {
     method: 'POST',
-    body: JSON.stringify({ height }),
+    body: JSON.stringify(window ? { height, start_s: window[0], end_s: window[1] } : { height }),
   });
 }
 
@@ -834,6 +884,14 @@ export interface MediaEntry {
   has_thumb?: boolean;
   /** Set once the clip has been re-aimed at the lens; original_path is what revert restores. */
   eye_contact?: { original_path: string; output_path: string; report?: EyeContactReport };
+  /** Seconds where the speaker looks into the lens, confirmed in the eye-contact dialog;
+   *  stored per recording by the backend (preview/analyse/run), reused by later runs. */
+  eye_contact_lens_marks?: number[];
+  /** Set once the clip has been stabilized; original_path is what revert restores. */
+  stabilize?: { original_path: string; output_path: string; report?: StabilizeReport };
+  /** Set once the clip is synced as a camera angle of the primary recording
+   *  (POST /api/timeline/{pid}/angles/sync). offset_s: other = primary + offset. */
+  angle?: { synced_to: string; offset_s: number; confidence: number; source_id: string; drift_ppm: number };
 }
 
 export interface MediaListing {
@@ -849,6 +907,13 @@ export function mediaThumbUrl(projectId: string, mediaId: string): string {
 /** Range-served stream of a file on disk, for hover previews and the player. */
 export function mediaStreamUrl(path: string): string {
   return `${API_BASE}/api/media/stream?path=${encodeURIComponent(path)}`;
+}
+
+/** Any backend-written file (e.g. the eye-contact sheet JPEG) by path. /api/media/stream
+ *  serves every file as-is (labelled video/mp4, which an <img> still decodes);
+ *  /api/media/download only transcodes audio, so it cannot serve an image. */
+export function mediaFileUrl(path: string): string {
+  return mediaStreamUrl(path);
 }
 
 export async function listMedia(
@@ -900,15 +965,54 @@ export async function relinkMedia(projectId: string, mediaId: string, path: stri
 
 // --- Eye contact (teleprompter gaze correction) ---
 
-export interface EyeContactReport {
-  frames: number;
+/** Where the lens position came from: the user's marks, the take's own looks into the
+ *  camera, or (no camera looks found) the prompter geometry. */
+export type EyeLensSource = 'marks' | 'measured' | 'geometry';
+
+/** What the plan measured; shared by the analyse, preview and full-run results. */
+export interface EyeContactMeasures {
   face_found_pct: number;
   corrected_pct: number;
   prompter_offset_deg: number;
   symmetry_offset_deg: number;
   reading_sweep_deg: number;
+  /** The shared push before per-eye limits, in pixels. */
   median_shift_px: number;
+  /** What each eye actually moved (keys "R" / "L"), in pixels. */
+  median_shift_px_per_eye?: Record<string, number>;
+  mode?: 'auto' | 'manual';
+  auto_measured?: boolean;
+  /** How far the reading gaze was moved sideways to reach the lens, degrees. */
+  measured_shift_deg?: number;
+  camera_look_pct?: number;
+  head_pitch_deg?: number;
+  /** + = the gaze was raised, - = lowered. */
+  eyes_raised_deg?: number;
+  lens_per_eye?: Record<string, number>;
+  lens_source?: EyeLensSource;
+  /** Held looks into the lens, in the whole recording's seconds (up to 3). */
+  camera_look_candidates?: number[];
+  /** e.g. "ok" | "video looks mirrored" | "unclear" (manual mode). */
+  side_check?: string;
+  settings?: Partial<EyeContactSetup> & { lens_marks?: number[] };
+}
+
+/** A full run's (and a preview's) report. */
+export interface EyeContactReport extends EyeContactMeasures {
+  frames: number;
   seconds: number;
+  output_path?: string;
+  lens_separation_deg?: number;
+  /** Absolute path of `<output>_eyes.jpg`: eye crops, before over after. */
+  contact_sheet?: string | null;
+  quality?: string;
+}
+
+/** POST .../analyse: the whole recording tracked and planned, nothing rendered. */
+export interface EyeContactAnalysis extends EyeContactMeasures {
+  eye_width_px?: number;
+  duration_s?: number;
+  fps?: number;
 }
 
 export interface EyeContactJob {
@@ -923,6 +1027,9 @@ export interface EyeContactJob {
 
 /** The speaker's prompter setup: saved once, pre-filled for every run. */
 export interface EyeContactSetup {
+  /** "auto": the lens is measured from the speaker's own camera looks (geometry is the
+   *  fallback); "manual": the prompter geometry below. */
+  mode: 'auto' | 'manual';
   prompter_side: 'left' | 'right' | 'auto';
   /** Degrees between prompter and lens; 0 = work it out from the two distances. */
   angle_deg: number;
@@ -932,7 +1039,11 @@ export interface EyeContactSetup {
   aim_deg: number;
   /** Vertical re-aim in degrees: + = lower the gaze (down), - = raise it. */
   pitch_deg: number;
+  auto_pitch?: boolean;
   quality: 'standard' | 'high' | 'max';
+  /** Per recording, never part of the saved speaker setup: seconds where the speaker looks
+   *  into the lens. Sent with preview/analyse/run; [] clears the stored marks, omitted keeps them. */
+  lens_marks?: number[];
 }
 
 export async function getEyeContactSetup(): Promise<EyeContactSetup> {
@@ -940,7 +1051,9 @@ export async function getEyeContactSetup(): Promise<EyeContactSetup> {
 }
 
 export async function saveEyeContactSetup(setup: Partial<EyeContactSetup>): Promise<EyeContactSetup> {
-  return api(`/api/eyecontact/settings`, { method: 'PUT', body: JSON.stringify(setup) });
+  // lens marks belong to one recording, not to the speaker's setup
+  const { lens_marks: _marks, ...speaker } = setup;
+  return api(`/api/eyecontact/settings`, { method: 'PUT', body: JSON.stringify(speaker) });
 }
 
 export async function eyeContactAvailable(): Promise<{ available: boolean; reason: string }> {
@@ -984,8 +1097,288 @@ export async function revertEyeContact(projectId: string, mediaId: string): Prom
   return api(`/api/eyecontact/projects/${projectId}/media/${mediaId}/revert`, { method: 'POST' });
 }
 
+// --- Video stabilization (backend/routes/stabilize.py) ---
+
+/** Saved once, pre-filled for every run (GET/PUT /api/stabilize/settings). */
+export interface StabilizeSetup {
+  /** 0..1 -> vidstabdetect shakiness 1..10. */
+  strength: number;
+  /** auto: zoom in just enough to hide the borders; keep: borders filled from earlier frames; black: black borders. */
+  crop: 'auto' | 'keep' | 'black';
+  /** Half-window of the camera-path smoothing, seconds. */
+  smoothing_s: number;
+  /** A fixed zoom instead of the automatic one; null = the crop mode's own. */
+  zoom_pct: number | null;
+  /** Locked-off camera: every frame held to the first. */
+  tripod: boolean;
+  quality: 'standard' | 'high' | 'max';
+}
+
+/** POST .../analyse result: the detect pass only. */
+export interface StabilizeAnalysis {
+  mean_shift_px: number;
+  max_shift_px: number;
+  shaky: boolean;
+  frames: number;
+  seconds: number;
+}
+
+/** A full run's (or a preview's) report; shift numbers are the residual shake after stabilizing. */
+export interface StabilizeReport {
+  output_path?: string;
+  frames: number;
+  seconds: number;
+  zoom_pct: number;
+  mean_shift_px: number;
+  max_shift_px: number;
+  settings?: Partial<StabilizeSetup>;
+}
+
+/** A short stabilized stretch: both files cut from the same source range. */
+export interface StabilizePreview extends StabilizeReport {
+  before_path: string;
+  after_path: string;
+  start_s: number;
+  duration_s: number;
+}
+
+export interface StabilizeJob {
+  id: string;
+  project_id?: string;
+  media_id: string;
+  job_type?: 'stabilize' | 'stabilize_analyse' | 'stabilize_preview';
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  progress: number;
+  stage: string;
+  result: StabilizeReport | StabilizeAnalysis | StabilizePreview | null;
+  error: string | null;
+}
+
+export async function stabilizeAvailable(): Promise<{ available: boolean; reason: string }> {
+  return api(`/api/stabilize/available`);
+}
+
+export async function getStabilizeSetup(): Promise<StabilizeSetup> {
+  return api(`/api/stabilize/settings`);
+}
+
+export async function saveStabilizeSetup(setup: Partial<StabilizeSetup>): Promise<StabilizeSetup> {
+  return api(`/api/stabilize/settings`, { method: 'PUT', body: JSON.stringify(setup) });
+}
+
+/** The full run: renders `<stem>_stable.mp4` and swaps it in everywhere; poll with getStabilizeStatus. */
+export async function startStabilize(projectId: string, mediaId: string,
+  setup: Partial<StabilizeSetup> = {}): Promise<{ job_id: string }> {
+  return api(`/api/stabilize/projects/${projectId}/media/${mediaId}`, {
+    method: 'POST',
+    body: JSON.stringify(setup),
+  });
+}
+
+/** Measure the shake only (cached, so a full run afterwards skips the detect pass). */
+export async function startStabilizeAnalyse(projectId: string, mediaId: string,
+  setup: Partial<StabilizeSetup> = {}): Promise<{ job_id: string }> {
+  return api(`/api/stabilize/projects/${projectId}/media/${mediaId}/analyse`, {
+    method: 'POST',
+    body: JSON.stringify(setup),
+  });
+}
+
+/** Stabilize `durationS` seconds from `startS` without touching the project. */
+export async function startStabilizePreview(projectId: string, mediaId: string, setup: StabilizeSetup,
+  startS: number, durationS = 10): Promise<{ job_id: string }> {
+  return api(`/api/stabilize/projects/${projectId}/media/${mediaId}/preview`, {
+    method: 'POST',
+    body: JSON.stringify({ ...setup, start_s: startS, duration_s: durationS }),
+  });
+}
+
+export async function getStabilizeStatus(jobId: string): Promise<StabilizeJob> {
+  return api(`/api/stabilize/status/${jobId}`);
+}
+
+export async function cancelStabilize(jobId: string): Promise<{ status: string }> {
+  return api(`/api/stabilize/cancel/${jobId}`, { method: 'POST' });
+}
+
+export async function revertStabilize(projectId: string, mediaId: string): Promise<{ media: MediaEntry[] }> {
+  return api(`/api/stabilize/projects/${projectId}/media/${mediaId}/revert`, { method: 'POST' });
+}
+
 export async function getMediaWaveform(projectId: string, mediaId: string): Promise<WaveformData> {
   return api(`/api/projects/${projectId}/media/${mediaId}/waveform`);
+}
+
+// --- Multicam angles + external audio sync (docs/MULTICAM_SYNC_PLAN.md) ---
+
+/** A synced camera angle: offset_s follows `angle_time = primary_time + offset_s`. */
+export interface AngleInfo {
+  source_id: string;
+  media_id: string | null;
+  name: string;
+  offset_s: number;
+  confidence: number;
+  width?: number;
+  height?: number;
+  fps?: number | null;
+}
+
+/** A run of V1 on an angle: start/end are PROGRAMME frames, source_start/source_end primary frames. */
+export interface AngleSpan {
+  start: number;
+  end: number;
+  source_id: string;
+  source_start: number;
+  source_end: number;
+}
+
+export interface AnglesState {
+  primary_source_id: string | null;
+  angles: AngleInfo[];
+  spans: AngleSpan[];
+}
+
+/** What /sync/audio and /angles/sync measured. */
+export interface SyncResult {
+  offset_s: number;
+  confidence: number;
+  drift_ppm: number;
+  method?: string;
+  source_id: string;
+  /** /sync/audio only */
+  version_path?: string;
+  undo?: { method: string; path: string; body: { source_id: string } };
+  /** /angles/sync only: set when the two clocks drift past 20 ppm */
+  warning?: string | null;
+}
+
+export type AutoAngleMode = 'hide_cuts' | 'rhythm' | 'off';
+
+export interface AutoAngleSummary {
+  switches: number;
+  cuts_hidden: number;
+  cuts_total: number;
+  [key: string]: unknown;
+}
+
+/** The last GET /angles, shared by the timeline chips and the Inspector section. */
+export const useAnglesStore = create<{
+  projectId: string | null;
+  state: AnglesState | null;
+  load: (projectId: string) => Promise<AnglesState | null>;
+}>((set) => ({
+  projectId: null,
+  state: null,
+  load: async (projectId) => {
+    try {
+      const state = await getAngles(projectId);
+      set({ projectId, state });
+      return state;
+    } catch (err) {
+      console.warn('Failed to load camera angles:', err);
+      return null;
+    }
+  },
+}));
+
+/** A timeline-returning response lands in the store, so it renders and is undoable
+ *  (history.ts records it) exactly like the other clip ops. */
+function pushTimeline(projectId: string, res: any): void {
+  const state = useProjectStore.getState();
+  if (res?.timeline && state.project?.id === projectId) state.updateProject({ timeline: res.timeline });
+}
+
+/** Re-read the timeline after a change to a source's audio (the override is on the source). */
+async function reloadTimeline(projectId: string): Promise<void> {
+  try {
+    pushTimeline(projectId, { timeline: await getTimeline(projectId) });
+  } catch (err) {
+    console.warn('Failed to reload the timeline:', err);
+  }
+}
+
+/** FastAPI's `detail` out of an api() error: a string, or `detail.message`. */
+export function apiErrorDetail(err: unknown): string {
+  const text = err instanceof Error ? err.message : String(err);
+  const m = /^API \d+: ([\s\S]*)$/.exec(text);
+  if (!m) return text;
+  try {
+    const body = JSON.parse(m[1]);
+    const detail = body?.detail;
+    if (typeof detail === 'string') return detail;
+    if (detail?.message) return String(detail.message);
+    if (detail !== undefined) return JSON.stringify(detail);
+  } catch {
+    /* not JSON: keep the text */
+  }
+  return m[1] || text;
+}
+
+/** Make an external recorder the programme sound of the primary source (undo: undoAudioVersion). */
+export async function syncAudio(projectId: string, mediaId: string, retranscribe = false): Promise<SyncResult> {
+  const res = await api<SyncResult>(`/api/timeline/${projectId}/sync/audio`, {
+    method: 'POST',
+    body: JSON.stringify({ media_id: mediaId, retranscribe }),
+  });
+  await reloadTimeline(projectId);
+  return res;
+}
+
+/** Put the previous audio version of a source back (POST /api/audio/{pid}/undo). */
+export async function undoAudioVersion(projectId: string, sourceId: string): Promise<any> {
+  const res = await api(`/api/audio/${encodeURIComponent(projectId)}/undo`, {
+    method: 'POST',
+    body: JSON.stringify({ source_id: sourceId }),
+  });
+  await reloadTimeline(projectId);
+  return res;
+}
+
+/** Register a library video as a camera angle of the primary recording. */
+export async function syncAngle(projectId: string, mediaId: string): Promise<SyncResult & AnglesState> {
+  const res: any = await api(`/api/timeline/${projectId}/angles/sync`, {
+    method: 'POST',
+    body: JSON.stringify({ media_id: mediaId }),
+  });
+  pushTimeline(projectId, res);
+  useAnglesStore.setState({ projectId, state: {
+    primary_source_id: res.primary_source_id ?? null, angles: res.angles ?? [], spans: res.spans ?? [],
+  } });
+  return res;
+}
+
+export async function getAngles(projectId: string): Promise<AnglesState> {
+  return api(`/api/timeline/${projectId}/angles`);
+}
+
+/** Show an angle (sourceId null = the primary) over a programme-frame range. */
+export async function setAngle(projectId: string, startFrame: number, endFrame: number,
+  sourceId: string | null): Promise<any> {
+  const res = await api(`/api/timeline/${projectId}/angles/set`, {
+    method: 'POST',
+    body: JSON.stringify({ start_frame: startFrame, end_frame: endFrame, source_id: sourceId }),
+  });
+  pushTimeline(projectId, res);
+  useAnglesStore.getState().load(projectId);
+  return res;
+}
+
+export async function clearAngles(projectId: string): Promise<any> {
+  const res = await api(`/api/timeline/${projectId}/angles`, { method: 'DELETE' });
+  pushTimeline(projectId, res);
+  useAnglesStore.getState().load(projectId);
+  return res;
+}
+
+export async function autoAngles(projectId: string, mode: AutoAngleMode,
+  opts: { min_shot_s?: number; cadence_s?: number } = {}): Promise<{ summary: AutoAngleSummary; timeline: any }> {
+  const res: any = await api(`/api/timeline/${projectId}/angles/auto`, {
+    method: 'POST',
+    body: JSON.stringify({ mode, ...opts }),
+  });
+  pushTimeline(projectId, res);
+  useAnglesStore.getState().load(projectId);
+  return res;
 }
 
 // --- LM Studio (LLM) ---

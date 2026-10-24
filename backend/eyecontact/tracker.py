@@ -165,3 +165,46 @@ def track_video(src: str, info: VideoInfo, progress: Optional[Callable[[float], 
     logger.info("Tracked %d frames (%d without a face)", len(ts), lost)
     return {"pts": np.stack(pts_all) if pts_all else np.zeros((0, len(USED), 3), np.float32),
             "score": np.asarray(scores, np.float32), "ts": np.asarray(ts, np.int64)}
+
+
+def track_window(src: str, info: VideoInfo, start_s: float, end_s: float, points,
+                 tracker: Optional[Tracker] = None, batch: int = 8) -> dict:
+    """Like track_video, but only the frames with start_s <= PTS < end_s and only `points`
+    of the mesh: PyNvVideoCodec's SimpleDecoder seeks (seek_to_index) to the window, so a
+    few seconds of a long recording cost a few seconds of decoding, not the whole file.
+    Every result is read back to the host and the stream synced before the next batch."""
+    import PyNvVideoCodec as nvc
+    ctx, stream = torch_cuda_handles()
+    dec = nvc.SimpleDecoder(src, gpu_id=0, cuda_context=ctx, cuda_stream=stream, use_device_memory=True,
+                            output_color_type=nvc.OutputColorType.NATIVE)
+    points = list(points)
+    W, H = info.width, info.height
+    tb = float(info.time_base)
+    tracker = tracker or Tracker(info.colorspace)
+    tracker.prev = None                                   # a new window re-acquires the face
+    pts_all, scores, ts = [], [], []
+    last = max(int(dec.get_stream_metadata().num_frames) - 1, 0)
+    first = min(max(int(dec.get_index_from_time_in_seconds(max(0.0, float(start_s)))), 0), last)
+    dec.seek_to_index(first)
+    done = False
+    with torch.no_grad():
+        while not done:
+            frames = dec.get_batch_frames(batch)
+            if not frames:
+                break
+            for fr in frames:
+                t = int(fr.timestamp) * tb
+                if t >= end_s:
+                    done = True
+                    break
+                if t < start_s - 1e-6:
+                    continue
+                Y, UV = planes(frame_tensor(fr, H, W, info.ten_bit), H, W)
+                pts, sc = tracker.track(Y, UV)
+                pts_all.append(pts[points].astype(np.float32) if pts is not None
+                               else np.full((len(points), 3), np.nan, np.float32))
+                scores.append(sc)
+                ts.append(int(fr.timestamp))
+            torch.cuda.current_stream().synchronize()
+    return {"pts": np.stack(pts_all) if pts_all else np.zeros((0, len(points), 3), np.float32),
+            "score": np.asarray(scores, np.float32), "ts": np.asarray(ts, np.int64)}

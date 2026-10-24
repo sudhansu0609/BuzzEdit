@@ -1,4 +1,5 @@
 import asyncio
+import mimetypes
 import os
 import re
 import subprocess
@@ -62,6 +63,24 @@ async def preview_proxy(path: str):
         result["url"] = f"/api/media/stream?path={quote(result['path'])}"
     return result
 
+# The types the player and <img> need, checked before the OS table: Windows'
+# registry maps .mov to video/quicktime and .wav to audio/x-wav, which Chromium
+# will not play. Eye-contact contact sheets (JPEG) come through /stream too.
+_STREAM_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
+    ".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
+    ".mp4": "video/mp4", ".mov": "video/mp4", ".mkv": "video/x-matroska", ".webm": "video/webm",
+}
+
+
+def _stream_content_type(file_path: Path) -> str:
+    known = _STREAM_TYPES.get(file_path.suffix.lower())
+    if known:
+        return known
+    guessed, _ = mimetypes.guess_type(file_path.name)
+    return guessed or "video/mp4"
+
+
 @router.get("/stream")
 async def stream_media(path: str, request: Request, range: str = Header(None)):
     """
@@ -72,9 +91,7 @@ async def stream_media(path: str, request: Request, range: str = Header(None)):
         raise HTTPException(status_code=404, detail="Media file not found")
 
     file_size = file_path.stat().st_size
-    content_type = "video/mp4"
-    if file_path.suffix.lower() in (".mp3", ".wav", ".aac", ".flac"):
-        content_type = "audio/mpeg" if file_path.suffix.lower() == ".mp3" else "audio/wav"
+    content_type = _stream_content_type(file_path)
 
     if not range:
         return StreamingResponse(

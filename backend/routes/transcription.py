@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -15,7 +16,7 @@ from asr import transcribe_checkpoint as ckpt
 from asr import whisper_engine
 from asr.auto_edit import plan_auto_edit, public_report, record_cut_coverage
 from asr.transliterate import to_hinglish
-from timeline import Transition, build_timeline_from_transcript
+from timeline import Transition, build_timeline_from_transcript, rebuild_primary_tracks
 from timeline.authoring import CAPTION_TRACK
 from timeline.schema import Timeline, frame_to_time
 
@@ -70,8 +71,65 @@ async def _join_running(job_id: str) -> Optional[dict]:
     raise HTTPException(status_code=409, detail="A transcription is already running for this project")
 
 
+def _transcription_audio(p_data: dict, source_video: str) -> str:
+    """What to transcribe: the primary source's `audio_override` when one is set
+    (an external recorder synced by /api/timeline/{id}/sync/audio, or a processed
+    version), else the video itself. The override is laid on the source's own
+    clock and is exactly as long as it, so word timings stay source time."""
+    try:
+        tl = p_data.get("timeline") or {}
+        sources = tl.get("sources") or {}
+        target = os.path.normcase(os.path.abspath(source_video))
+        primary = next((s for s in sources.values()
+                        if os.path.normcase(os.path.abspath(str(s.get("path") or ""))) == target),
+                       next(iter(sources.values()), None))
+        override = (primary or {}).get("audio_override")
+        if override and Path(override).exists():
+            return str(override)
+    except Exception:
+        logging.getLogger("transcription").debug("audio_override lookup failed", exc_info=True)
+    return source_video
+
+
 def _save_project_sync(project_id: str, p_data: dict) -> None:
     project_store.save_project(project_id, p_data)
+
+
+def _carry_project_state(old_timeline, tl: Timeline, source_video: str) -> None:
+    """Hand the user's multicam and audio work from the timeline a re-transcribe
+    or re-cut replaces onto the freshly built one: the primary source's
+    audio_override/audio_history, the synced camera-angle sources, the angle
+    spans and the manual cuts. All of these are in primary SOURCE frames (or
+    hang off a source), so they stay valid for a new word plan. The builder
+    names the primary afresh, so the angles are re-pointed at the new id and
+    V1 is rebuilt to lay the cuts and angles back on."""
+    if not isinstance(old_timeline, dict):
+        return
+    try:
+        old = Timeline.model_validate(old_timeline)
+    except Exception:  # noqa: BLE001 - an unreadable old timeline has nothing to carry
+        logging.getLogger("transcription").debug("old timeline unreadable; nothing carried", exc_info=True)
+        return
+    new_primary = next(iter(tl.sources.values()), None)
+    if new_primary is None:
+        return
+    target = os.path.normcase(os.path.abspath(source_video))
+    old_primary = next((s for s in old.sources.values() if not s.synced_to
+                        and os.path.normcase(os.path.abspath(str(s.path or ""))) == target), None)
+    if old_primary is None:
+        return                      # a different recording: its angles and audio do not apply
+    new_primary.audio_override = old_primary.audio_override
+    new_primary.audio_history = [dict(h) for h in old_primary.audio_history]
+    for source in old.sources.values():
+        if source.synced_to and source.id != old_primary.id and source.id not in tl.sources:
+            angle = source.model_copy(deep=True)
+            if angle.synced_to == old_primary.id:
+                angle.synced_to = new_primary.id
+            tl.sources[angle.id] = angle
+    tl.angle_spans = [dict(span) for span in old.angle_spans]
+    tl.manual_cuts = [list(cut) for cut in old.manual_cuts]
+    if tl.angle_spans or tl.manual_cuts:
+        rebuild_primary_tracks(tl, new_primary.id)
 
 
 @router.get("/jobs")
@@ -109,7 +167,7 @@ async def transcribe_video(job: TranscribeJob):
         # 1. Extract WAV audio. ffmpeg is blocking; off the event loop so the
         #    server stays responsive during a long extraction.
         _stage(job_id, "extracting audio")
-        audio_path = await asyncio.to_thread(extract_audio, source_video)
+        audio_path = await asyncio.to_thread(extract_audio, _transcription_audio(p_data, source_video))
 
         # 2. Get Video info
         v_info = await asyncio.to_thread(get_video_info, source_video)
@@ -253,6 +311,7 @@ async def transcribe_video(job: TranscribeJob):
                                 else Transition(type="fade", duration=float(settings.get("transition_seconds", 0.25)))),
             keep_full_source=precut,
         )
+        await asyncio.to_thread(_carry_project_state, p_data.get("timeline"), tl, source_video)
         # The builder rebuilds V1/A1 itself, so this only scores the result: are
         # the words the planner cut actually absent from what will be rendered?
         if not precut:
@@ -385,7 +444,7 @@ async def recut_project(project_id: str):
                     "status": "running", "progress": 0.0}
     try:
         _stage(job_id, "extracting audio")
-        audio_path = await asyncio.to_thread(extract_audio, source_video)
+        audio_path = await asyncio.to_thread(extract_audio, _transcription_audio(p_data, source_video))
         v_info = await asyncio.to_thread(get_video_info, source_video)
         _stage(job_id, "planning the cut")
         _with_script_text(settings, p_data)
@@ -415,6 +474,7 @@ async def recut_project(project_id: str):
                                 else Transition(type="fade", duration=float(settings.get("transition_seconds", 0.25)))),
             keep_full_source=False,
         )
+        await asyncio.to_thread(_carry_project_state, p_data.get("timeline"), tl, source_video)
         await asyncio.to_thread(record_cut_coverage, tl, edit_report)
         first = segments[0] if segments else {}
         seg = TranscriptSegment(

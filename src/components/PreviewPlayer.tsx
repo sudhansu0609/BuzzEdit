@@ -140,6 +140,14 @@ export default function PreviewPlayer() {
   const programmeDuration = cutDuration + programOffset;
 
   const [proxy, setProxy] = useState<ProxyStatus>({ state: 'none', stale: true });
+  // The draft the FX player follows: null = the full draft, else a window of
+  // programme time ([start_s, end_s]) drafted around the playhead. Its status,
+  // staleness and offset are the window's own (GET with start_s/end_s).
+  const [draftWindow, setDraftWindow] = useState<[number, number] | null>(null);
+  const windowKey = (w: [number, number] | null) => (w ? `${w[0]}-${w[1]}` : 'full');
+  const windowKeyRef = useRef('full');
+  windowKeyRef.current = windowKey(draftWindow);
+  useEffect(() => { setDraftWindow(null); }, [project?.id]);
   const [fxFrame, setFxFrame] = useState<string | null>(null);
   const [fxLoading, setFxLoading] = useState(false);
   const [fxEmpty, setFxEmpty] = useState(false);
@@ -162,7 +170,14 @@ export default function PreviewPlayer() {
   // The proxy is only worth playing when it was built from the edit you are
   // looking at; a stale one is offered, but labelled.
   const proxyReady = proxy.state === 'ready' && !!proxy.path;
-  const useProxyVideo = mode === 'fx' && proxyReady;
+  // Programme time of the proxy's first frame: 0 for the full draft, the
+  // window's snapped start for a windowed one. video.currentTime + this = programme time.
+  const proxyOffset = proxyReady ? (proxy.offset_s ?? 0) : 0;
+  // A windowed draft only covers its own stretch; outside it the stage falls
+  // back to the exact still.
+  const inDraftWindow = !draftWindow
+    || (programmeTime >= proxyOffset - 0.05 && programmeTime <= draftWindow[1] + 0.05);
+  const useProxyVideo = mode === 'fx' && proxyReady && inDraftWindow;
 
   useEffect(() => {
     if (!layoutMode) { setPictureRect(null); return; }
@@ -185,12 +200,15 @@ export default function PreviewPlayer() {
 
   const refreshProxy = useCallback(async () => {
     if (!project?.id) return;
+    const key = windowKey(draftWindow);
     try {
-      setProxy(await getPreviewProxy(project.id));
+      const next = await getPreviewProxy(project.id, draftWindow);
+      // an answer about a draft the player has since moved off is dropped
+      if (windowKeyRef.current === key) setProxy(next);
     } catch {
-      setProxy({ state: 'none', stale: true });
+      if (windowKeyRef.current === key) setProxy({ state: 'none', stale: true });
     }
-  }, [project?.id]);
+  }, [project?.id, draftWindow]);
 
   useEffect(() => { refreshProxy(); }, [refreshProxy, revision]);
 
@@ -201,15 +219,33 @@ export default function PreviewPlayer() {
     return () => clearInterval(timer);
   }, [proxy.state, refreshProxy]);
 
-  const startProxy = useCallback(async () => {
+  /** Build the full draft (window null) or a window's draft, and follow it. */
+  const buildDraft = useCallback(async (window: [number, number] | null) => {
     if (!project?.id) return;
-    setProxy({ state: 'building', elapsed: 0 });
+    const key = windowKey(window);
+    windowKeyRef.current = key;
+    setDraftWindow(window);
+    setProxy({ state: 'building', elapsed: 0, progress: 0, window });
     try {
-      await buildPreviewProxy(project.id, 540);
+      await buildPreviewProxy(project.id, 540, window);
+      // the status read once the build is registered, so polling cannot stop early
+      const next = await getPreviewProxy(project.id, window);
+      if (windowKeyRef.current === key) setProxy(next);
     } catch {
-      setProxy({ state: 'error', detail: 'Could not start the build' });
+      if (windowKeyRef.current === key) setProxy({ state: 'error', detail: 'Could not start the build' });
     }
   }, [project?.id]);
+
+  const startProxy = useCallback(() => buildDraft(null), [buildDraft]);
+  const rebuildDraft = useCallback(() => buildDraft(draftWindow), [buildDraft, draftWindow]);
+  // Two minutes of programme around the playhead: a late stretch costs only its own length.
+  const startWindowDraft = useCallback(() => {
+    const start = Math.max(0, programmeTime - 60);
+    let end = programmeTime + 60;
+    if (programmeDuration > 0) end = Math.min(end, programmeDuration);
+    if (end <= start) return;
+    buildDraft([Math.round(start * 10) / 10, Math.round(end * 10) / 10]);
+  }, [buildDraft, programmeTime, programmeDuration]);
 
   // The still: fetched when the playhead settles, not while it moves. A frame
   // costs about half a second of ffmpeg, so firing on every scrub tick would
@@ -258,6 +294,8 @@ export default function PreviewPlayer() {
   const intervalsRef = useRef(keptIntervals); intervalsRef.current = keptIntervals;
   const proxyRef = useRef(useProxyVideo); proxyRef.current = useProxyVideo;
   const offsetRef = useRef(programOffset); offsetRef.current = programOffset;
+  const proxyOffsetRef = useRef(proxyOffset); proxyOffsetRef.current = proxyOffset;
+  const draftWindowRef = useRef(draftWindow); draftWindowRef.current = draftWindow;
 
   useEffect(() => {
     const video = videoRef.current;
@@ -267,10 +305,11 @@ export default function PreviewPlayer() {
 
     const handleTimeUpdate = () => {
       if (scrubRef.current) return;
-      // The proxy runs on programme time; the store speaks source time. Convert
-      // on the way out so the timeline and transcript stay where they were.
+      // The proxy runs on programme time (shifted by a windowed draft's
+      // offset_s); the store speaks source time. Convert on the way out so the
+      // timeline and transcript stay where they were.
       setCurrentTime(proxyRef.current
-        ? editToSrc(video.currentTime - offsetRef.current)
+        ? editToSrc(video.currentTime + proxyOffsetRef.current - offsetRef.current)
         : video.currentTime);
     };
     const handlePlay = () => setIsPlaying(true);
@@ -403,7 +442,7 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
   }, [mode, keptIntervals, setCurrentTime, timeline]);
 
   useEffect(() => {
-    const target = useProxyVideo ? programmeTime : currentTime;
+    const target = useProxyVideo ? Math.max(0, programmeTime - proxyOffset) : currentTime;
     if (videoRef.current && Math.abs(videoRef.current.currentTime - target) > 0.3) {
       videoRef.current.currentTime = target;
     }
@@ -411,7 +450,7 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
     // approximation on top would double every zoom.
     updateVideoTransform(videoRef.current, currentTime, timeline,
                          useProxyVideo ? 'result' : mode);
-  }, [currentTime, programmeTime, useProxyVideo, timeline, mode]);
+  }, [currentTime, programmeTime, proxyOffset, useProxyVideo, timeline, mode]);
 
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
@@ -428,6 +467,17 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
     // directly and the frame follows the playhead.
     if (modeRef.current === 'fx' && !proxyRef.current) {
       setCurrentTime(editToSrc(x * cutDuration));
+      return;
+    }
+    // A windowed draft: the bar spans the programme; a click inside the window
+    // seeks the draft (minus its offset), one outside it moves the playhead and
+    // the stage falls back to the exact still.
+    const win = draftWindowRef.current;
+    if (modeRef.current === 'fx' && proxyRef.current && win) {
+      const prog = x * (cutDuration + offsetRef.current);
+      const inside = prog >= proxyOffsetRef.current && prog <= win[1];
+      if (inside && videoRef.current) videoRef.current.currentTime = prog - proxyOffsetRef.current;
+      setCurrentTime(editToSrc(prog - offsetRef.current));
       return;
     }
     const video = videoRef.current;
@@ -468,10 +518,32 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
   // playhead position counts only kept seconds behind it.
   const isCutMode = mode === 'cut' && hasCut;
   const isFx = mode === 'fx';
+  // The cut preview plays the primary file, so inside an angle span (stored in primary
+  // frames, which is what currentTime counts here) it is not showing the switch: say so.
+  const angleHere: string | null = (() => {
+    if (!isCutMode || !timeline?.angle_spans?.length) return null;
+    const tlFps = (timeline.fps_num ?? 30) / (timeline.fps_den ?? 1) || 30;
+    const f = currentTime * tlFps;
+    const span = (timeline.angle_spans as { start: number; end: number; source_id: string }[])
+      .find((sp) => sp.start <= f && f < sp.end);
+    if (!span) return null;
+    const path: string = timeline.sources?.[span.source_id]?.path ?? span.source_id;
+    return path.split(/[\\/]/).pop() || span.source_id;
+  })();
   const duration = isFx ? (programmeDuration || 60)
     : isCutMode ? cutDuration : (videoRef.current?.duration || 60);
   const displayTime = isFx ? programmeTime
     : isCutMode ? srcToEdit(currentTime) : currentTime;
+
+  const fmtClock = (seconds: number) => {
+    const t = Math.max(0, Math.round(seconds));
+    return `${Math.floor(t / 60)}:${(t % 60).toString().padStart(2, '0')}`;
+  };
+  const windowLabel = draftWindow ? `${fmtClock(draftWindow[0])}–${fmtClock(draftWindow[1])}` : '';
+  // How long the shown draft took to build, from its status (kept across restarts).
+  const draftTiming = proxyReady && proxy.seconds
+    ? `drafted in ${Math.round(proxy.seconds)}s${proxy.realtime_x ? ` (${proxy.realtime_x.toFixed(1)}x realtime)` : ''}`
+    : null;
 
   const MODES: Array<{ id: PreviewMode; label: string; show: boolean; title: string }> = [
     { id: 'cut', label: 'Cut', show: hasCut,
@@ -500,33 +572,62 @@ function updateVideoTransform(video: HTMLVideoElement | null, t: number, timelin
             ))}
           </div>
         )}
+        {angleHere && (
+          <div className="preview-angle-pill"
+            title="The edit shows this camera angle here. The Cut preview plays the main recording; switch to ✦ FX to see the angle.">
+            angle: {angleHere}
+          </div>
+        )}
         {mode === 'fx' && (
           <div className="fx-stage-bar">
             {useProxyVideo ? (
               <>
                 <span className={`fx-pill ${proxy.stale ? 'warn' : 'ok'}`}>
-                  {proxy.stale ? '✦ proxy · behind the edit' : '✦ proxy · current'}
+                  {draftWindow ? `✦ draft ${windowLabel}` : '✦ proxy'}
+                  {proxy.stale ? ' · behind the edit' : ' · current'}
                 </span>
-                <button className="btn btn-xs" onClick={startProxy}
-                  title="Re-encode the dressed programme from the timeline as it stands now">
+                {draftTiming && <span className="fx-pill fx-draft-timing">{draftTiming}</span>}
+                <button className="btn btn-xs" onClick={rebuildDraft}
+                  title={draftWindow
+                    ? 'Re-draft this window from the timeline as it stands now'
+                    : 'Re-encode the dressed programme from the timeline as it stands now'}>
                   Rebuild
                 </button>
               </>
             ) : proxy.state === 'building' ? (
               <span className="fx-pill">
                 <span className="spinner" style={{ width: 10, height: 10 }} />
-                Building FX preview… {proxy.elapsed ? `${Math.round(proxy.elapsed)}s` : ''}
+                {draftWindow ? `Drafting ${windowLabel}…` : 'Building FX preview…'}
+                {proxy.progress ? ` ${Math.round(proxy.progress)}%` : ''}
+                {proxy.elapsed ? ` · ${Math.round(proxy.elapsed)}s` : ''}
               </span>
             ) : (
               <>
                 <span className={`fx-pill ${fxLoading ? '' : 'ok'}`}>
                   {fxLoading ? '✦ composing…' : '✦ exact frame'}
                 </span>
+                {draftWindow && proxyReady && (
+                  <span className="fx-pill" title="The playhead is outside the drafted window, so the stage shows the exact still">
+                    outside draft {windowLabel}
+                  </span>
+                )}
                 <button className="btn btn-xs" onClick={startProxy}
-                  title="Encode the whole dressed programme small, so it plays and scrubs live with the effects moving. Roughly 2.5× realtime to build.">
+                  title="Encode the whole dressed programme small, so it plays and scrubs live with the effects moving.">
                   Build moving preview
                 </button>
               </>
+            )}
+            {proxy.state !== 'building' && (
+              <button className="btn btn-xs" onClick={startWindowDraft}
+                title="Draft just the two minutes around the playhead (one minute either side): much quicker than the whole programme on a long edit">
+                Draft around playhead (2 min)
+              </button>
+            )}
+            {draftWindow && proxy.state !== 'building' && proxy.full_exists && (
+              <button className="btn btn-xs" onClick={() => setDraftWindow(null)}
+                title="Go back to the full-programme draft">
+                Full draft
+              </button>
             )}
             {proxy.state === 'error' && (
               <span className="fx-pill warn" title={proxy.detail}>build failed</span>

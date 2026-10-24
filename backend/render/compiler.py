@@ -8,6 +8,7 @@ from config import TEMP_DIR
 from render import transitions
 from render.atmosphere import build_aspect_bars, build_effect
 from timeline.schema import Timeline, TimelineItem, Transform, frame_to_time
+from timeline.ops import is_angle_switch
 from render.effects import (
     build_canvas_transform,
     build_chroma_key_chain,
@@ -165,6 +166,13 @@ class FilterGraphCompiler:
         for item in self.timeline.items:
             if item.track == "V1" and item.source_id:
                 src = self.timeline.sources.get(item.source_id)
+                if src and src.synced_to:
+                    # A camera angle opening the programme: the canvas is still the
+                    # primary recording's (or the timeline's, when only the angle is here).
+                    primary = self.timeline.sources.get(src.synced_to)
+                    if primary and primary.width and primary.height:
+                        return int(primary.width), int(primary.height)
+                    return int(self.timeline.width or 1920), int(self.timeline.height or 1080)
                 if src and src.width and src.height:
                     return int(src.width), int(src.height)
         return int(self.timeline.width or 1920), int(self.timeline.height or 1080)
@@ -673,7 +681,11 @@ class FilterGraphCompiler:
 
         # 7b. Generated atmosphere — rain, light leaks, grain. After the grade so
         #     it is not itself graded, before the text so captions stay readable
-        #     through it.
+        #     through it. The `progress_bar` layer is drawn here too: above
+        #     B-roll, cards and the grade, under only the letterbox bars (7c)
+        #     and the burnt-in text (8). The presentation pass places it clear
+        #     of the captions. It needs the programme's real length and
+        #     somewhere to write its chapter-label text files.
         for index, effect in enumerate(self.timeline.effects):
             if not effect.enabled:
                 continue
@@ -681,6 +693,7 @@ class FilterGraphCompiler:
             statements = build_effect(
                 effect, current_v_label, out_label,
                 self.canvas_w, self.canvas_h, self.fps, total_seconds, index,
+                assets_dir=self.assets_dir, programme_s=program_seconds,
             )
             if statements:
                 filters.extend(statements)
@@ -749,6 +762,9 @@ class FilterGraphCompiler:
             position = index + offset
             if position == 0:
                 continue                      # nothing precedes the first clip
+            if (item.transition is None and index > 0
+                    and is_angle_switch(self.timeline, v1_items[index - 1], item)):
+                continue                      # a camera change inside one moment is a hard cut
             chosen = item.transition or default
             if chosen and chosen.duration > 0 and transitions.is_valid(chosen.type):
                 junctions[position] = chosen
