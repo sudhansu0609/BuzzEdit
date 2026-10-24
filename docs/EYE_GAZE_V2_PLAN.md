@@ -126,3 +126,20 @@ the stored ones.
 - A preview's own report carries `settings.lens_marks = []` (backend design), so the "From your N
   marks" count for a preview is the dialog's mark count at request time.
 - Not exercised in the running app (Electron not run, no frontend tests).
+
+## Studio
+
+BuzzcafStudio (`backend/app/api/eye_contact_api.py`, `frontend/src/components/EyeContactSettings.tsx`,
+their tests). Working tree only, not committed.
+
+### Status
+
+| # | Deliverable | Status |
+|---|---|---|
+| S1 | Defaults + migration (STUDIO_DEFAULTS mode only; pre-v2 nudges dropped in auto unless `nudges_v2`) | done. `STUDIO_DEFAULTS = {"mode": "auto"}`; `_overrides` drops aim/angle/pitch in auto without `nudges_v2`; PUT sets `nudges_v2` on the first saved nudge and clears the other pre-v2 nudges then; docstring paragraph |
+| S2 | lens_marks + new report fields + contact_sheet_url via the file route | done. `lens_marks` in SETUP_FIELDS + schema (<= 50, >= 0); analysis keeps the whole report; preview clip report keeps PREVIEW_REPORT_FIELDS + `contact_sheet_url`; `_preview_dir_ok` accepts `*_eyes.jpg` in cache/eyecontact/preview; file route serves image/jpeg |
+| S3 | Production step: redo only pre-v2 results (no `report.lens_source`) | done. `correct_recording` skips only when project + setup match AND `applied.report.lens_source`; produce_api unchanged (it calls correct_recording) |
+| S4 | EyeContactSettings.tsx (lens pill, candidates, marks, sheets, side_check, nudges, sweep label) + build | done. Auto: lens pill (from your N marks / measured from your looks / geometry fallback) + measured_shift_deg + per-eye px (preview) else median px (analysis); candidates as "m:ss · Mark" buttons; marks chips with x (PUT lens_marks, sorted, 0.1 s); side_check warning line (any mode, unless ok/unclear); contact sheet `<img>` under each preview clip (link opens full size); in Auto the angle/aim/up-down sliders read "nudges on top of the measurement (0 = measured)", show 0 until `nudges_v2`, dragging one sets it; steadiness -> "Calm the reading sweep"; FALLBACK angle/aim 0. `npx tsc --noEmit` clean; `npm run build` clean (existing >500 kB chunk notice) -> backend/app/static/assets/index-Ctc2pFCO.js |
+| S5 | Tests (13 existing adapted, <= 2 new) | done. 15 passed (C:Python314python.exe -m pytest tests/test_eye_contact_api.py tests/test_eye_contact_preview.py). Adapted: nudges_v2 in the saved setup, manual mode for the resume test, `{"mode": "auto"}` sent by analyse, preview clip lens_source + contact_sheet_url, sheet served as image/jpeg. New: pre-v2 nudges dropped + pre-v2 result redone; lens_marks round trip + 422s |
+| S6 | Live check (BuzzEdit settings, Raat3Baje overrides before/after, analyse) | done. GET /api/eyecontact/settings: angle 0, aim 0, pitch 0 (steadiness 0.95, prompter_cm 16). Raat3Baje 2026-10-11 setup (auto, side auto, angle 13, aim -11.5, prompter_cm 16; no pitch_deg stored): before {mode auto, aim -11.5, angle 13, side auto, prompter_cm 16} -> after {mode auto, side auto, prompter_cm 16}. Its applied result (2026-10-21) has no lens_source, so the next production redoes it once. Analyse on 674aefab with the after overrides, called on BuzzEdit directly (not saved to the Studio project): 5 s, lens_source measured, measured_shift_deg 7.9, candidates [104.5, 138.6, 1851.4], side_check ok, median 1.59 px, eyes raised 8.7 deg |
+| S7 | Studio docs paragraph | done. BuzzcafStudio CHANGELOG.md "Eye contact: BuzzEdit eye gaze v2 in the Studio (2026-10-24)" (eye contact is described there; PROGRESS.md / docs/ only mention it in passing). BuzzcafStudioMac left alone: its eye_contact_api.py already differed from the Studio's before this change |
