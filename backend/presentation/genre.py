@@ -461,7 +461,7 @@ def genre_block(genre: Optional[str], art_style: Optional[str] = None) -> str:
     photographic) and the medium's own block follows."""
     from . import art_style as art_mod
     name = normalise(genre)
-    drawn = art_style is not None and not art_mod.is_real(art_style)
+    drawn = art_style is not None and not art_mod.is_photoreal_base(art_style)
     out = ""
     if name != "general":
         style = GENRE_STYLES[name]
@@ -489,7 +489,7 @@ def apply_look(prompt: Optional[str], genre: Optional[str],
     if not prompt:
         return prompt
     from . import art_style as art_mod
-    if art_style is not None and not art_mod.is_real(art_style):
+    if art_style is not None and not art_mod.is_photoreal_base(art_style):
         parts = [p for p in (art_mod.genre_mood(normalise(genre)), art_mod.look_for(art_style))
                  if p and p.lower() not in prompt.lower()]
         out = f"{prompt}, {', '.join(parts)}" if parts else prompt
@@ -508,7 +508,7 @@ def apply_negative(negative: str, genre: Optional[str],
                    secondary: Optional[str] = None,
                    art_style: Optional[str] = None) -> str:
     from . import art_style as art_mod
-    if art_style is not None and not art_mod.is_real(art_style):
+    if art_style is not None and not art_mod.is_photoreal_base(art_style):
         drawn = art_mod.negative_for(art_style)
         if drawn and drawn not in (negative or ""):
             negative = f"{negative}, {drawn}" if negative else drawn

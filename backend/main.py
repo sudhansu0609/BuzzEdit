@@ -211,6 +211,10 @@ try:
     app.include_router(audio_live.router, prefix="/api/audio", tags=["audio"])
 except ImportError as exc:
     logger.info("Live audio routes not loaded: %s", exc)
+# The Motion Gallery: every registered composition rendered with sample props
+# into a dated folder (BuzzcafStudio docs/MOTION_GRAPHICS_PLAN.md M11).
+from routes import motion_gallery
+app.include_router(motion_gallery.router, prefix="/api/motion", tags=["motion"])
 
 @app.get("/")
 async def root():

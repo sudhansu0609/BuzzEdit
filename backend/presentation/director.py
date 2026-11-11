@@ -464,6 +464,25 @@ async def _run_presentation_pass(
 
     # A split beat is two pictures; expand it before anything counts assets.
     plan.beats = composite_stage.expand_splits(plan.beats)
+    # A paper-collage beat (MOTION_GRAPHICS_PLAN.md M5) carries 2-4 prompts;
+    # expand it into generated-but-not-placed broll_image sub-beats the same
+    # way, right above.
+    from . import motion_collage as motion_collage_stage
+    plan.beats = motion_collage_stage.expand_collages(plan.beats, genre, genre_secondary,
+                                                       settings.art_style)
+    # A stick_scene beat whose `bg` names a scene (STICK_WORLD_PLAN.md SW2)
+    # needs a background picture of its own before the Remotion render can
+    # run at all; expand it into a generated-but-not-placed broll_image
+    # sub-beat the same way, right above.
+    from . import motion_stick as motion_stick_stage
+    plan.beats = motion_stick_stage.expand_stick_backgrounds(plan.beats, genre, genre_secondary,
+                                                              settings.art_style)
+    # A callout beat (MOTION_GRAPHICS_PLAN.md M10) carries one image prompt;
+    # expand it into its own generated-but-not-placed broll_image sub-beat
+    # the same way, right above.
+    from . import motion_ui as motion_ui_stage
+    plan.beats = motion_ui_stage.expand_callouts(plan.beats, genre, genre_secondary,
+                                                 settings.art_style)
 
     # --- the bilingual line ------------------------------------------------------
     #
@@ -560,6 +579,20 @@ async def _run_presentation_pass(
                 f"prompt_drift: '{worst[0]}' is in {round(100 * float(worst[1]))}% of the prompts; "
                 "check the world/look line")
         generated, failures = result if result else ([], [])
+        # A paper-collage beat's sub-pictures just generated (MOTION_GRAPHICS_
+        # PLAN.md M5): stash their files on the parent beat so build_paper_
+        # collage and its fallback can find them without needing `generated`
+        # threaded through MotionContext.
+        motion_collage_stage.annotate_collage_assets(plan.beats, generated)
+        # A stick_scene beat's own background picture just generated
+        # (STICK_WORLD_PLAN.md SW2): stash its file and measured luma on the
+        # parent beat so build_stick_scene and its fallback can find them
+        # without needing `generated` threaded through MotionContext.
+        motion_stick_stage.annotate_stick_backgrounds(plan.beats, generated)
+        # A callout beat's own still just generated (MOTION_GRAPHICS_PLAN.md
+        # M10): stash its file on the parent beat so build_callout and its
+        # fallback can find it the same way.
+        motion_ui_stage.annotate_callout_assets(plan.beats, generated)
         comfyui_made = [a for a in generated if getattr(a, "source", "generated") == "generated"]
         report.assets_generated = sum(1 for a in comfyui_made if not a.cache_hit)
         report.assets_cached = sum(1 for a in comfyui_made if a.cache_hit)
@@ -579,8 +612,12 @@ async def _run_presentation_pass(
     # the same placement path as the generated B-roll.
     local_assets: List = []
     designed = any(b.kind in graphics_stage.DRAWN_CUTAWAY_KINDS for b in plan.beats)
+    from . import motion as motion_stage
+    # Not gated on settings.motion_graphics: a beat from a `[kinetic: ...]` the
+    # user wrote still needs its static fallback drawn when the engine is off.
+    has_motion = any(b.kind in motion_stage.BUILDERS for b in plan.beats)
     if plan.beats and (settings.maps or settings.cards or settings.newspapers
-                       or settings.case_files or designed):
+                       or settings.case_files or designed or has_motion):
         report_progress(0.60, "Drawing maps, charts, newspapers and case files")
         drawn = await stages.run(
             "maps_charts",
@@ -589,11 +626,36 @@ async def _run_presentation_pass(
             default=([], []))
         local_assets, local_failures = drawn if drawn else ([], [])
         report.assets_failed = list(report.assets_failed) + list(local_failures)
+    # A `stat_callout` a motion render already turned into its own animated
+    # cutaway (MOTION_GRAPHICS_PLAN.md M2) must not also get cards.py's plain
+    # text card below -- that would draw the same number twice.
+    motion_stat_ids = {
+        a.beat_id for a in local_assets
+        if getattr(a, "source", "") == "motion"
+        and next((b.kind for b in plan.beats if b.id == a.beat_id), None) == "stat_callout"
+    }
     if local_assets:
         # A drawn card replaces anything generated for the same beat (a
         # source quote's background picture is inside the card already).
         drawn_ids = {a.beat_id for a in local_assets}
         generated = [a for a in generated if a.beat_id not in drawn_ids] + local_assets
+
+    # --- C3. 2.5D parallax on a share of the stills (MOTION_GRAPHICS_PLAN.md
+    # M6) -- after every still (generated + drawn) exists, before placement,
+    # so a chosen still is placed exactly like any other motion render
+    # (placement.py: source=="motion" -> no 5s floor, no extra Ken Burns) and
+    # one that is skipped or fails keeps the ordinary Ken Burns still it
+    # already was.
+    if plan.beats and generated and settings.parallax_share > 0:
+        from . import motion_parallax as motion_parallax_stage
+        generated, parallax_stats = await stages.run(
+            "parallax",
+            asyncio.to_thread(motion_parallax_stage.apply_parallax, generated, plan.beats,
+                              PROJECTS_DIR / project_id, timeline.width, timeline.height,
+                              genre, settings, seed),
+            default=(generated, {}))
+        if parallax_stats:
+            report.generation["parallax"] = parallax_stats
 
     # --- D. placement ------------------------------------------------------
     report_progress(0.62, "Cutting in the B-roll")
@@ -635,6 +697,16 @@ async def _run_presentation_pass(
         report.beats_dropped = list(report.beats_dropped) + live_dropped
         logger.info("Presentation: live settings applied before placement (%s): %d beat(s) dropped, %d clip(s)",
                     live_mod.describe(live_now), len(live_dropped), report.live_overrides["clips_kept"])
+    # A paper-collage sub-beat's picture was generated to be cut out inside
+    # the collage (MOTION_GRAPHICS_PLAN.md M5), never as its own cutaway.
+    generated = motion_collage_stage.drop_collage_subs(generated, plan.beats)
+    # A stick_scene background sub-beat's picture is drawn *under* the
+    # figures inside the StickScene composition (STICK_WORLD_PLAN.md SW2),
+    # never its own cutaway.
+    generated = motion_stick_stage.drop_stick_background_subs(generated, plan.beats)
+    # A callout sub-beat's picture is drawn onto inside the Callout
+    # composition (MOTION_GRAPHICS_PLAN.md M10), never its own cutaway.
+    generated = motion_ui_stage.drop_callout_subs(generated, plan.beats)
     rejected: List[Dict[str, str]] = []
     if (settings.broll or local_assets) and generated:
         report.broll_placed = await stages.run(
@@ -723,7 +795,7 @@ async def _run_presentation_pass(
         placed_cards = await stages.run(
             "place_cards",
             _sync(cards_stage.place_cards, timeline, plan.beats, program, settings,
-                  genre, genre_secondary, popup_windows, face_anchors),
+                  genre, genre_secondary, popup_windows, face_anchors, motion_stat_ids),
             default={})
         report.cards_placed = placed_cards or {}
 
@@ -825,11 +897,15 @@ async def _run_presentation_pass(
     #
     # Effect windows the writer placed in the script ([fx: flicker], [atmos:
     # fog], [grade: saturation=0.7]) become adjustment layers over the moment
-    # they were spoken. Replaced on every run; effects the user added stay.
+    # they were spoken; the five transition stingers ([fx: shape_wipe dur=0.8],
+    # MOTION_GRAPHICS_PLAN.md M3) become a Remotion overlay instead -- hence
+    # the extra project/size/genre/settings args _apply_script_fx now takes.
+    # Replaced on every run; effects the user added stay.
     if directives.get("fx"):
         await stages.run(
             "script_fx",
-            _sync(_apply_script_fx, timeline, directives.get("fx") or [], program),
+            _sync(_apply_script_fx, timeline, directives.get("fx") or [], program,
+                  PROJECTS_DIR / project_id, timeline.width, timeline.height, genre, settings),
             default=0)
 
     # --- the cold open ------------------------------------------------------
@@ -926,7 +1002,8 @@ async def _run_presentation_pass(
                     settings, genre, seed, comfyui_online=bool(report.comfyui_online),
                     acts=[t.act or "" for t in plan.topics],
                     music_cues=list(directives.get("music_cues") or []),
-                    duration=program.duration_s),
+                    duration=program.duration_s,
+                    progress=lambda msg: report_progress(0.845, msg)),
                 default=None)
         report_progress(0.85, "Sound design")
         # Scene sounds: the script's [sfx: <effect>] cues first, then the sound
@@ -1387,7 +1464,7 @@ def _apply_recreations(timeline: Timeline, settings: PresentationSettings,
 
     clear_generated(timeline, RECREATION_ORIGIN)
     from . import art_style as art_mod
-    if genre not in RECREATION_GENRES or not art_mod.is_real(settings.art_style):
+    if genre not in RECREATION_GENRES or not art_mod.is_photoreal_base(settings.art_style):
         # A drawing is not a reconstruction: no grain on a stick figure.
         return 0
 
@@ -1421,15 +1498,27 @@ def _apply_recreations(timeline: Timeline, settings: PresentationSettings,
 SCRIPT_FX_ORIGIN = "script_fx"
 
 
-def _apply_script_fx(timeline: Timeline, fx_list: List[Dict[str, Any]], program) -> int:
-    """Place the effect windows the script asked for as adjustment layers.
+def _apply_script_fx(timeline: Timeline, fx_list: List[Dict[str, Any]], program,
+                     project_dir: Optional[Path] = None, width: int = 0, height: int = 0,
+                     genre: str = "general",
+                     settings: Optional[PresentationSettings] = None) -> int:
+    """Place the effect windows the script asked for.
 
     Each `[fx: ...]` / `[atmos: ...]` / `[grade: ...]` directive from the script
     becomes an adjustment item at the moment it was spoken, carrying an
-    AtmosphereEffect (or a colour grade) over its window. Only this pass's own
-    layers are replaced on a re-run; effects the user added by hand stay."""
+    AtmosphereEffect (or a colour grade) over its window -- except the five
+    Remotion transition stingers (MOTION_GRAPHICS_PLAN.md M3: shape_wipe, iris,
+    ink, bars, paper_tear), which are not a filter over the footage but a
+    transparent overlay of their own, rendered and placed by
+    `motion_transitions.place_stinger` centred on `at` instead. `project_dir`/
+    `width`/`height`/`genre`/`settings` are only needed for those; omitted (as
+    every existing caller still may), a stinger directive simply falls back to
+    whiteflash like a render failure would. Only this pass's own layers are
+    replaced on a re-run; effects the user added by hand stay."""
     from timeline.authoring import clear_generated
     from timeline.schema import AtmosphereEffect, time_to_frame
+
+    from . import motion_transitions as transitions_stage
 
     clear_generated(timeline, SCRIPT_FX_ORIGIN)
     if not fx_list:
@@ -1439,6 +1528,16 @@ def _apply_script_fx(timeline: Timeline, fx_list: List[Dict[str, Any]], program)
     for fx in fx_list:
         at = max(0.0, float(fx.get("at") or 0.0))
         dur = max(0.2, float(fx.get("dur") or 1.0))
+        effect_name = fx.get("effect")
+        if fx.get("kind") == "fx" and effect_name in transitions_stage.STINGER_NAMES:
+            if project_dir is not None and settings is not None and transitions_stage.place_stinger(
+                    timeline, effect_name, at, dur, program, project_dir, width, height, genre,
+                    settings, origin=SCRIPT_FX_ORIGIN):
+                count += 1
+                continue
+            logger.warning("Transition stinger %r unavailable; falling back to whiteflash",
+                           effect_name)
+            fx = {**fx, "effect": "whiteflash"}
         start_frame = time_to_frame(at, timeline.fps_num, timeline.fps_den)
         frames = max(1, time_to_frame(dur, timeline.fps_num, timeline.fps_den))
         try:
@@ -1549,9 +1648,31 @@ def _draw_local_assets(beats, project_dir: Path, width: int, height: int, genre:
     from . import charts as charts_stage
     from . import dossier as dossier_stage
     from . import maps as maps_stage
+    from . import motion as motion_stage
     from . import newspaper as newspaper_stage
     assets: List = []
     failures: List[Dict[str, str]] = []
+
+    # Motion-template graphics (presentation/motion.py; MOTION_GRAPHICS_PLAN.md)
+    # run first: a beat they handle is skipped by every PIL renderer below, and
+    # one they could not (engine down, a bad prop) gets its static fallback --
+    # a motion failure must never fail the render.
+    motion_handled: set = set()
+    if settings.motion_graphics:
+        m_assets, m_failures, motion_handled = motion_stage.render_motion_assets(
+            beats, project_dir, width, height, genre, settings)
+        assets += m_assets
+        by_id = {b.id: b for b in beats}
+        for failure in m_failures:
+            beat = by_id.get(failure.get("beat_id"))
+            fallback = motion_stage.render_fallback(beat, project_dir, width, height)
+            if fallback is not None:
+                assets.append(fallback)
+                motion_handled.add(beat.id)
+                failure = dict(failure, reason=f"{failure.get('reason')}; drew a static card instead")
+            failures.append(failure)
+    beats = [b for b in beats if b.id not in motion_handled]
+
     if settings.maps:
         drawn, failed = maps_stage.render_map_assets(beats, project_dir, width, height,
                                                      genre, settings.map_style)

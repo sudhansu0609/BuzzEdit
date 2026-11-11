@@ -942,6 +942,35 @@ async def test_a_starved_card_skips_the_video_phase_and_keeps_stills(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_a_cached_clip_is_reused_even_when_the_card_is_starved(tmp_path, monkeypatch):
+    from presentation import assets as assets_stage_mod
+    from runtime import gpu_handover
+    queue = _video_queue(assets_stage_mod, tmp_path)
+    assets_stage = _wire_assets(monkeypatch, tmp_path, queue)
+    monkeypatch.setattr(assets_stage.workflows, "resolve",
+                        lambda role: {"broll_image": _fake_image_workflow(),
+                                      "broll_video": _i2v_workflow()}.get(role))
+    monkeypatch.setattr(assets_stage, "_probe", lambda path: (832, 480, 6.0))
+    beats = [_beat(id="v1", kind="broll_video", topic="clip", start_s=5.0, end_s=11.0)]
+    first, _ = await assets_stage.generate_assets(beats, tmp_path, PresentationSettings(), stats={})
+    assert [a.kind for a in first] == ["video"]
+
+    async def starved(name, need_vram_mb, need_ram_mb, settle_s=3.0):
+        ok = name != "video"
+        return {"phase": name, "ready": ok, "reason": "" if ok else "0.1 GB RAM free, needs 9.8 GB"}
+
+    monkeypatch.setattr(gpu_handover, "prepare_for_phase", starved)
+    queue.order.clear()
+    stats = {}
+    again, failures = await assets_stage.generate_assets(beats, tmp_path, PresentationSettings(), stats=stats)
+
+    assert failures == []
+    assert [(a.beat_id, a.kind) for a in again] == [("v1", "video")]
+    assert "video" not in queue.order, "the clip came from the cache, nothing was generated"
+    assert stats["video_phase"]["cached"] == 1
+
+
+@pytest.mark.asyncio
 async def test_one_timed_out_clip_ends_the_video_phase(tmp_path, monkeypatch):
     from presentation import assets as assets_stage_mod
     queue = _video_queue(assets_stage_mod, tmp_path,

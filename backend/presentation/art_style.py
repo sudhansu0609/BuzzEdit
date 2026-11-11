@@ -1,6 +1,9 @@
 """The art style: the medium every generated picture, clip, thumbnail scene
 and text card is made in -- real (photoreal, the default), explainer (flat
-vector), stick_figure (whiteboard marker) or cartoon (2D cel).
+vector), stick_figure (whiteboard marker), cartoon (2D cel), painterly,
+illustrated, mixed (real + stick figure + maps & charts) or mixed_quirky
+(illustrated + stick figure + a little real) -- the two mixes chosen per shot
+by the caller, not by this table (see `is_photoreal_base`).
 
 Set by the caller (`PresentationSettings.art_style`; BuzzcafStudio resolves it
 per channel and project and keeps the same table in
@@ -120,6 +123,62 @@ STYLES: Dict[str, ArtStyle] = {
                     "stroke_color": "#FBF3E6", "stroke_width": 4,
                     "animation": "fade", "animation_duration": 0.5},
     ),
+    # 2026-10-29 (STICK_WORLD_PLAN.md): dressed stick figures standing in an
+    # illustrated period world (vocabulary shared with `motion/src/
+    # stick_world.json`). Plain pictures are the PLACE only (rich period
+    # detail, nobody close up); a person moment is a `stick` beat instead.
+    "stick_world": ArtStyle(
+        label="Stick world (dressed stick figures in illustrated scenes)",
+        look=("hand-painted storybook illustration of the place and its period -- architecture, "
+              "materials, light and colour of the era, rich historical detail -- wide and open, "
+              "nobody close up, soft painted brushwork, the colour and mood of the story's "
+              "moment, an illustrated graphic-novel background"),
+        motion=("gentle hand-animated movement, drawings held and stepped, soft easing, no fast "
+                "motion, no shaking"),
+        # Never "modern" or "neon" here: the present-day, 1990s and future eras
+        # are stick-world periods too (stick_world.json).
+        negative=("photograph, photorealistic, 3d render, CGI, unreal engine, anime, glossy, "
+                  "text, watermark, close-up faces"),
+        thumbnail="hand-painted illustration, rich period detail, one clear subject, strong mood",
+        face_swap=False,
+        card_style={"font_family": "Georgia", "color": "#4A3B2E",
+                    "stroke_color": "#FBF3E6", "stroke_width": 4,
+                    "animation": "fade", "animation_duration": 0.5},
+    ),
+    # 2026-10-27 (MIXED_ART_STYLE_PLAN): the medium is chosen per shot by the
+    # caller (BuzzcafStudio stamps "art": "real" | "stick_figure" on each
+    # picture beat), not by this table -- so "mixed" behaves like "real" for
+    # face swap, photographic genre look and the thumbnail (`is_photoreal_base`
+    # below), and only its text cards take the explainer's look.
+    "mixed": ArtStyle(
+        label="Mixed (real + stick figure + maps & charts)",
+        look="",
+        motion="slow steady cinematic motion, subtle natural movement, no fast motion, no shaking",
+        negative="",
+        thumbnail="cinematic film still, one clear subject, close framing, strong contrast",
+        face_swap=True,
+        card_style={"font_family": "Poppins", "bold": True, "color": "#FFFFFF",
+                    "stroke_color": "#1E2A44", "stroke_width": 4, "shadow_x": 0, "shadow_y": 0,
+                    "animation": "fade", "animation_duration": 0.3},
+    ),
+    # 2026-10-27 (MIXED_ART_STYLE_PLAN, "Second mix"): mostly drawn -- the
+    # creator wanted "more of illustrated style and stick figure and less
+    # real" for quirky, engaging documentaries. Unlike "mixed" this one is
+    # NOT a photoreal base: no recreation grain, no photographic genre look
+    # words (`is_photoreal_base` is False), but a per-shot `art=real` still
+    # gets its face swapped in, so `face_swap` stays True.
+    "mixed_quirky": ArtStyle(
+        label="Quirky documentary (illustrated + stick figure, a little real)",
+        look="",
+        motion=("gentle hand-animated movement, drawings held and stepped, soft easing, no fast "
+                "motion, no shaking"),
+        negative="",
+        thumbnail="soothing hand-drawn illustration, soft pastel palette, one clear subject, storybook calm",
+        face_swap=True,
+        card_style={"font_family": "Poppins", "bold": True, "color": "#FFFFFF",
+                    "stroke_color": "#1E2A44", "stroke_width": 4, "shadow_x": 0, "shadow_y": 0,
+                    "animation": "fade", "animation_duration": 0.3},
+    ),
 }
 
 ART_STYLES: Tuple[str, ...] = tuple(STYLES.keys())
@@ -133,6 +192,10 @@ _ALIASES = {
     "animated": "cartoon", "animation": "cartoon", "toon": "cartoon", "anime": "cartoon",
     "oil": "painterly", "gouache": "painterly", "watercolor": "painterly", "watercolour": "painterly",
     "painting": "painterly",
+    "mix": "mixed", "combo": "mixed", "hybrid": "mixed", "mixed_media": "mixed",
+    "quirky": "mixed_quirky", "quirky_doc": "mixed_quirky", "quirky_documentary": "mixed_quirky",
+    "stickworld": "stick_world", "dressed_stick": "stick_world", "dressed_stick_figure": "stick_world",
+    "period_stick": "stick_world",
 }
 
 #: Genre mood words that survive into a drawn style (the genre's own `look`
@@ -166,6 +229,15 @@ def get(style: Any) -> ArtStyle:
 
 def is_real(style: Any) -> bool:
     return normalise(style) == DEFAULT
+
+
+def is_photoreal_base(style: Any) -> bool:
+    """True for "real" and "mixed": the caller (BuzzcafStudio) stamps and
+    strips a per-shot `art=` option before BuzzEdit ever sees the directive,
+    so by the time it gets here a "mixed" shot is real unless told otherwise.
+    Used wherever a non-real style drops photographic genre look words, skips
+    the recreation genres or falls back to a drawn prompt."""
+    return normalise(style) in ("real", "mixed")
 
 
 def uses_face_swap(style: Any) -> bool:

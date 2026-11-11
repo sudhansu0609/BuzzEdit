@@ -1,0 +1,21 @@
+{
+  "id": "BuzzEdit",
+  "name": "BuzzEdit",
+  "description": "AI video editor: auto-cut, pictures, clips, music and narration",
+  "version": "1.0.0",
+  "launch_target": "%WINDIR%\\System32\\wscript.exe",
+  "launch_args": "\"{root}\\START_APP.vbs\"",
+  "icon": "build\\icon.ico",
+  "setup_script": "installer\\setup_env.ps1",
+  "env_summary": "Python 3.11 + CUDA PyTorch, Electron, narration and voice engines; ~25 GB",
+  "estimated_mb": 25000,
+  "self_test": {"python": ".venv\\Scripts\\python.exe", "script": "installer\\selftest.py", "result": "installer\\selftest.json", "timeout_s": 240},
+  "health_paths": [
+    ".venv\\Scripts\\python.exe",
+    "engines\\tts\\.venv\\Scripts\\python.exe",
+    "engines\\seedvc\\.venv\\Scripts\\python.exe",
+    "node_modules\\electron\\dist\\electron.exe",
+    "dist\\index.html",
+    "motion\\node_modules\\@remotion\\renderer\\package.json"
+  ]
+}

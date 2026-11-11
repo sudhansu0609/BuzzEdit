@@ -390,6 +390,23 @@ def test_render_errors_report_ffmpegs_diagnostic_line_not_the_graph_tail():
     assert "xxxxx" not in summary
 
 
+def test_a_fully_silent_v1_track_gets_a_bounded_null_audio_source():
+    """A V1 track with no audio stream at all (e.g. a motion-stinger overlay
+    test clip) falls back to `anullsrc` for the programme's audio -- bare,
+    that source never ends, and without `-shortest` on the final command
+    ffmpeg renders forever (MOTION_GRAPHICS_PLAN.md M3 surfaced this on a real
+    render). It must be trimmed to the programme's own length."""
+    from timeline.schema import SourceFile
+
+    timeline = Timeline(fps_num=30, fps_den=1, width=320, height=180)
+    timeline.sources["s"] = SourceFile(id="s", path="C:/silent.mp4", duration_seconds=4.0,
+                                       width=320, height=180, kind="video", has_audio=False)
+    clip_ops.add_media_item(timeline, "s", "V1", 0, 0, 120)
+    graph = _graph(timeline)
+    assert "anullsrc=r=48000:cl=stereo,atrim=duration=" in graph
+    assert "anullsrc=r=48000:cl=stereo[anull]" not in graph
+
+
 def test_loudness_measurement_runs_only_the_audio_part_of_the_graph():
     from render.audio import audio_subgraph
     graph = ("[0:v]trim=start=0:end=2,setpts=PTS-STARTPTS,zoompan=z=1.1[v1_0];"

@@ -14,10 +14,31 @@ from presentation.models import PresentationSettings
 
 
 def test_styles_normalise_and_the_default_is_real():
-    assert A.ART_STYLES == ("real", "explainer", "stick_figure", "cartoon", "painterly", "illustrated")
+    assert A.ART_STYLES == ("real", "explainer", "stick_figure", "cartoon", "painterly",
+                            "illustrated", "stick_world", "mixed", "mixed_quirky")
     assert A.normalise("whiteboard") == "stick_figure" and A.normalise(None) == "real"
     assert A.uses_face_swap("real") and not A.uses_face_swap("cartoon")
     assert PresentationSettings().art_style == "real"
+
+
+def test_mixed_is_real_based_but_cards_take_the_explainer_look():
+    assert A.normalise("mix") == "mixed" and A.normalise("combo") == "mixed"
+    assert A.normalise("hybrid") == "mixed" and A.normalise("mixed_media") == "mixed"
+    assert A.uses_face_swap("mixed")
+    assert A.card_style("mixed") == A.card_style("explainer")
+    assert A.is_photoreal_base("mixed") and A.is_photoreal_base("real")
+    assert not A.is_photoreal_base("stick_figure")
+    assert not A.is_real("mixed"), "is_real stays true only for \"real\""
+
+
+def test_mixed_quirky_is_mostly_drawn_but_still_face_swaps():
+    assert A.normalise("quirky") == "mixed_quirky"
+    assert A.normalise("quirky_doc") == "mixed_quirky"
+    assert A.normalise("quirky_documentary") == "mixed_quirky"
+    assert A.uses_face_swap("mixed_quirky"), "a per-shot art=real still gets the face swap"
+    assert A.card_style("mixed_quirky") == A.card_style("explainer")
+    assert not A.is_photoreal_base("mixed_quirky"), "mostly drawn: no grain, no photographic look"
+    assert not A.is_real("mixed_quirky")
 
 
 def test_a_drawn_style_replaces_the_genre_look_with_its_medium_and_mood():

@@ -18,6 +18,8 @@ pydub>=0.25.1
 # Audio suite (audio/analysis.py, audio/noise.py): spectra and resampling,
 # and Noise Reduction (process) with a captured noise print.
 scipy>=1.11
+# Music generation (presentation/music_gen.py): measures a generated bed's real tempo and key.
+librosa>=0.10
 noisereduce>=3.0
 # Voice Changer (audio/voice_changer.py): WORLD vocoder, formant shift independent of pitch.
 pyworld>=0.3.4

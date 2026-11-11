@@ -44,9 +44,11 @@ CLIP_NEEDS_5S_REASON = "a clip needs 5 s; no room"
 # A shot timed by the script may start this far inside, or after, the one
 # before it (rounding) and is moved to start exactly where that one ends.
 HELD_OVERLAP_SLACK_S = 0.25
-BROLL_ZOOM_MIN = 0.06
-BROLL_ZOOM_MAX = 0.14
-BROLL_PAN = 0.04
+# Ken Burns on stills: raised 2026-10-26 (was 0.06-0.14 zoom, 0.04 pan) when
+# story videos went from 50% to 35% clips -- more stills, so each moves visibly.
+BROLL_ZOOM_MIN = 0.10
+BROLL_ZOOM_MAX = 0.20
+BROLL_PAN = 0.06
 # Cutaway durations and the on-camera gap between cutaways come from the
 # settings (`planned_duration_s` per beat, `PresentationSettings.cutaway_gap_s`)
 # — the planner budgeted with them, and a second set of constants here silently
@@ -218,6 +220,15 @@ def place_broll(timeline: Timeline, beats: List[Beat], assets: List[Asset],
         )
 
         duration_frames = max(1, time_to_frame(duration_s, timeline.fps_num, timeline.fps_den))
+        if getattr(asset, "source", "generated") == "own":
+            # The creator's own clip: shown from `in=`, as it is (no move, no
+            # look), its own sound under the voice at `natsound`.
+            _place_own(timeline, beat, asset, source_id, start_s, duration_frames)
+            placed.append((start_s, start_s + duration_s))
+            count += 1
+            logger.info("Beat %s: own clip at %.1fs for %.1fs (%s)",
+                        beat.id, start_s, duration_s, beat.topic)
+            continue
         if beat.kind == "graphic":
             # A graphic is an element ON the picture, not a picture: it sits in
             # a corner at under half size and slides in, keeping its alpha. It
@@ -263,6 +274,34 @@ def place_broll(timeline: Timeline, beats: List[Beat], assets: List[Asset],
     return count
 
 
+OWN_AUDIO_TRACK = "A2"
+OWN_DUCK = 0.5  # how hard the voice pushes a clip's own sound down (item.duck)
+
+
+def _place_own(timeline: Timeline, beat: Beat, asset: Asset, source_id: str,
+               start_s: float, duration_frames: int) -> None:
+    """Cut the creator's clip in from `asset.own_in_s`, and its sound (its own
+    source entry, so the picture's stays silent like every cutaway) on A2."""
+    fps_num, fps_den = timeline.fps_num, timeline.fps_den
+    in_frame = time_to_frame(asset.own_in_s, fps_num, fps_den)
+    timeline.sources[source_id].duration_seconds = asset.own_in_s + asset.duration_s
+    start_frame = time_to_frame(start_s, fps_num, fps_den)
+    item = clip_ops.add_media_item(timeline, source_id, BROLL_TRACK, start_frame,
+                                   in_frame, in_frame + duration_frames, origin=BROLL_ORIGIN)
+    item.label = f"own clip: {beat.topic[:24]}"
+    if not asset.has_audio or asset.natsound <= 0:
+        return
+    audio_id = f"src_ownaud_{beat.id}_{uuid.uuid4().hex[:4]}"
+    timeline.sources[audio_id] = SourceFile(
+        id=audio_id, path=asset.path, duration_seconds=asset.own_in_s + asset.duration_s,
+        width=0, height=0, fps_num=fps_num, fps_den=fps_den, has_audio=True, kind="video")
+    sound = clip_ops.add_media_item(timeline, audio_id, OWN_AUDIO_TRACK, start_frame,
+                                    in_frame, in_frame + duration_frames, origin=BROLL_ORIGIN)
+    sound.volume = asset.natsound
+    sound.duck = OWN_DUCK
+    sound.label = f"own sound: {beat.topic[:24]}"
+
+
 def _still_of(asset: Asset) -> Asset:
     """A clip's phase-1 still (Asset.still_path) as an image asset of its own."""
     width = height = 0
@@ -296,7 +335,13 @@ def _window_for(beat: Beat, asset: Asset, program: Program,
         settings.broll_seconds_min, min(settings.broll_seconds_max, beat.duration_s))
     available = min(beat.end_s, program.duration_s) - start_s
     duration_s = min(planned, max(0.0, available))
-    if asset.kind == "video" and asset.duration_s > 0:
+    # A motion-template render (MOTION_GRAPHICS_PLAN.md) is a graphic, not a
+    # clip: no 5 s floor, and a window longer than the render holds its last
+    # frame (the overlay compositing already does this once the window is not
+    # capped to the render's own length — see render/compiler.py's
+    # `_build_overlay_input`) rather than being cut short to match it.
+    is_motion = getattr(asset, "source", "generated") == "motion"
+    if asset.kind == "video" and asset.duration_s > 0 and not is_motion:
         duration_s = min(duration_s, asset.duration_s)
     floor = min(settings.broll_seconds_min, 3.0)
     if duration_s < floor:
@@ -305,9 +350,11 @@ def _window_for(beat: Beat, asset: Asset, program: Program,
             return start_s, 0.0, "no room inside the beat's span"
         duration_s = min(floor, available)
     # A clip of 5 s or more is never cut under 5 s (the creator's rule): a slot
-    # that cannot hold it is reported, not filled with a flash of motion.
+    # that cannot hold it is reported, not filled with a flash of motion. Does
+    # not apply to a motion-template render, which is never a "clip".
     if (asset.kind == "video" and asset.duration_s >= VIDEO_SECONDS_MIN
-            and duration_s + 1e-3 < VIDEO_SECONDS_MIN):
+            and duration_s + 1e-3 < VIDEO_SECONDS_MIN and not is_motion
+            and getattr(asset, "source", "generated") != "own"):
         return start_s, 0.0, CLIP_NEEDS_5S_REASON
 
     # Slide the window onto the nearest jump cut. The word-boundary snap above
@@ -340,7 +387,9 @@ def _held_window(beat: Beat, asset: Asset, program: Program,
     the speaker between two shots or push one onto the next. Only a sliver of
     overlap (float rounding) is trimmed rather than the shot thrown away."""
     duration_s = min(beat.planned_duration_s, max(0.0, program.duration_s - start_s))
-    if asset.kind == "video" and asset.duration_s > 0:
+    # See _window_for: a motion-template render holds its last frame instead
+    # of being cut short to its own length.
+    if asset.kind == "video" and asset.duration_s > 0 and getattr(asset, "source", "generated") != "motion":
         duration_s = min(duration_s, asset.duration_s)
     for other_start, other_end in placed:
         if other_start <= start_s < other_end:

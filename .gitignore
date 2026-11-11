@@ -57,3 +57,8 @@ data/narration/
 data/narration_probe/
 data/voice_training/
 data/sfx_cache/
+
+# Written by installer\BuzzEdit Setup.exe (installed marker, read by SmartCleaner)
+installer/installed.json
+installer/setup.running
+installer/selftest.json

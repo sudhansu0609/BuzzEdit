@@ -106,6 +106,24 @@ def test_shot_kind_defaults_to_still():
     assert all(s.kind == "still" for s in req.shots)
 
 
+def test_stick_shot_is_accepted_without_a_prompt_and_becomes_a_stick_scene_beat():
+    """STICK_WORLD_PLAN.md SW2: a `kind: "stick"` shot takes action/scene/
+    era/outfit/bg/caption instead of `prompt`, and `build_beats` turns it
+    into a `stick_scene` beat the same `[stick: ...]` directive would."""
+    req = VibeReelRequest(**_request(world="a quiet hill town", shots=[
+        {"kind": "stick", "action": "point", "scene": "a Greek court", "era": "ancient_greece",
+         "outfit": "chiton+laurel+scroll+beard", "bg": "a Greek library courtyard",
+         "seconds": 6.0}] * 4))
+    assert all(s.kind == "stick" for s in req.shots)
+
+    beat = vr.build_beats(req)[0]
+    assert beat.kind == "stick_scene"
+    assert beat.data["era"] == "ancient_greece"
+    assert beat.data["outfits"] == ["chiton+laurel+scroll+beard"]
+    assert beat.data["figures"] == 1
+    assert beat.data["bg"] == "a Greek library courtyard, a quiet hill town"
+
+
 # --- camera words --------------------------------------------------------------
 
 @pytest.mark.parametrize("word", ["camera", "DSLR", "tripod", "lens", "shot on a Canon 5D", "photo of"])

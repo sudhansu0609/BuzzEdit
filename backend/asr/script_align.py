@@ -42,7 +42,11 @@ DIRECTIVES = ("map", "sfx", "broll", "video", "text", "title", "card", "chapter"
               # designed graphics (presentation/graphics.py; grammar in
               # presentation/script.py::directive_beats)
               "statement", "canvas", "pills", "point", "name", "source_quote",
-              "document", "timeline")
+              "document", "timeline",
+              # motion-template graphics (presentation/motion.py;
+              # MOTION_GRAPHICS_PLAN.md); grammar in
+              # presentation/script.py::directive_beats
+              "kinetic", "stick", "collage", "flow", "icons", "ui", "callout")
 _DIRECTIVE_RE = re.compile(
     r"\[\s*(" + "|".join(DIRECTIVES) + r")\s*:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 _HEADING_RE = re.compile(r"^\s*#{1,6}\s+(.+?)\s*$")

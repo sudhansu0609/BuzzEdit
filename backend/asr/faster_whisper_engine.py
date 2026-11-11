@@ -79,6 +79,26 @@ def register_cuda_dll_directories():
                 except Exception as e:
                     logger.debug(f"Failed adding DLL dir {bin_dir}: {e}")
 
+    # 1b. Torch's own CUDA 12 / cuDNN 9 libraries, when the nvidia wheels are not
+    #     installed (the venv rebuilt after the 2026-10-24 SmartCleaner wipe has
+    #     none). CTranslate2 4.x is built against the same generation, and torch
+    #     only puts this folder on the DLL path once it is imported -- so a
+    #     transcription that ran before anything imported torch failed with
+    #     "cublas64_12.dll is not found", fell back to the CPU and hung
+    #     (2026-10-26, trans_74f0d3c9, 9 h at 0%).
+    if not registered:
+        try:
+            import importlib.util
+            spec = importlib.util.find_spec("torch")
+            torch_lib = Path(spec.origin).parent / "lib" if spec and spec.origin else None
+            if torch_lib and (torch_lib / "cublas64_12.dll").exists():
+                os.add_dll_directory(str(torch_lib))
+                os.environ["PATH"] = str(torch_lib) + os.pathsep + os.environ.get("PATH", "")
+                logger.info(f"Registered torch's CUDA DLL directory: {torch_lib}")
+                registered += 1
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Could not register torch's CUDA DLL directory: {e}")
+
     # 2. A borrowed CUDA toolchain, used only if this venv has none of its own.
     #
     # This used to point at a cu118 ComfyUI build unconditionally, and *ahead of*

@@ -26,6 +26,21 @@ BeatKind = Literal[
     "statement_card", "canvas_card", "source_quote", "document", "timeline",
     # ...and overlays on the speaker
     "pill_labels", "numbered_point", "name_title",
+    # motion-template graphics (presentation/motion.py; MOTION_GRAPHICS_PLAN.md):
+    # full-frame animated cutaways, rendered by the Remotion engine with a PIL
+    # still as the fallback when it cannot. stick_scene (M7) is a stick-figure
+    # rig acting out a pose, not a still. paper_collage (M5) cuts out 2-4
+    # already-generated stills (its own broll_image sub-beats, expanded by
+    # presentation/motion_collage.py::expand_collages, generated but never
+    # placed) and animates them in on paper. flow_diagram/icon_list (M9) are
+    # boxes-and-arrows and a label list/pros-cons grid, never ComfyUI stills.
+    # ui_mockup (M10) is a generic social/UI card (no real platform logos).
+    # callout (M10) cuts out the same way paper_collage does -- one
+    # already-generated still (its own broll_image sub-beat, expanded by
+    # presentation/motion_ui.py::expand_callouts) with a hand-drawn mark or
+    # magnifier drawn onto a region of it.
+    "kinetic_text", "stick_scene", "paper_collage", "flow_diagram", "icon_list",
+    "ui_mockup", "callout",
 ]
 BEAT_KINDS: Tuple[str, ...] = (
     "broll_image", "broll_video", "map", "chart", "newspaper", "case_file", "split",
@@ -33,10 +48,14 @@ BEAT_KINDS: Tuple[str, ...] = (
     "stat_callout", "definition_card", "quote_card", "end_screen",
     "statement_card", "canvas_card", "source_quote", "document", "timeline",
     "pill_labels", "numbered_point", "name_title",
+    "kinetic_text", "stick_scene", "paper_collage", "flow_diagram", "icon_list",
+    "ui_mockup", "callout",
 )
 CUTAWAY_KINDS: Tuple[str, ...] = (
     "broll_image", "broll_video", "map", "chart", "newspaper", "case_file", "split",
     "statement_card", "canvas_card", "source_quote", "document", "timeline",
+    "kinetic_text", "stick_scene", "paper_collage", "flow_diagram", "icon_list",
+    "ui_mockup", "callout",
 )
 TEXT_KINDS: Tuple[str, ...] = (
     "location_card", "character_card", "source_card", "chapter_title",
@@ -159,6 +178,12 @@ class Beat(BaseModel):
     # (presentation.camera): the clip is generated locked off and placement
     # puts the move back as a slow timeline zoom. None = the clip moves itself.
     camera_move: Optional[str] = None
+    # The creator's own clip (`[video: ... | own=<path> | in=<s> | natsound=<0..1>]`,
+    # OWN_FOOTAGE_PLAN.md): shown from `own_in_s`, never generated, never
+    # re-planned; its own sound is mixed in at `natsound`.
+    own_path: Optional[str] = None
+    own_in_s: float = 0.0
+    natsound: float = 0.15
 
     @property
     def duration_s(self) -> float:
@@ -240,6 +265,11 @@ class Asset(BaseModel):
     # A clip made from a phase-1 still: that still's file, kept so placement can
     # show it when the clip's slot cannot hold the 5 s a clip needs.
     still_path: Optional[str] = None
+    # source == "own": the creator's clip is shown from `own_in_s`; `has_audio`
+    # and `natsound` say whether its sound is mixed in and how loud.
+    own_in_s: float = 0.0
+    has_audio: bool = False
+    natsound: float = 0.0
 
 
 # --- Stage E: zooms --------------------------------------------------------
@@ -397,6 +427,20 @@ class PresentationSettings(BaseModel):
     # Off by default: an animated zoom on a transparent PNG composites a black
     # box, because the canvas transform pads with black. See placement.py.
     graphics: bool = False
+    # The Remotion motion-template engine (presentation/motion.py;
+    # MOTION_GRAPHICS_PLAN.md): kinetic text today, maps/charts/transitions
+    # later. A render it cannot make (engine down, a bad prop) always falls
+    # back to the existing PIL still -- this only turns the attempt off.
+    motion_graphics: bool = True
+    # How many Remotion render jobs run at once, one Node subprocess batch at a
+    # time (BELOW_NORMAL priority, no window) -- the PC must not lag mid-shoot.
+    motion_concurrency: int = 4
+    # M6 2.5D parallax (presentation/motion_parallax.py): the share of
+    # already-generated stills with real depth contrast that get a small
+    # camera-dolly render over a depth-displaced plane instead of the plain
+    # Ken Burns move -- every channel including story channels, placed as a
+    # still (not counted as a clip). 0 turns the effect off.
+    parallax_share: float = 0.3
     face_zoom: bool = True
     captions: bool = True
     caption_preset: str = "karaoke_pop"

@@ -740,7 +740,8 @@ def balance_video_share(beats: List[Beat], settings: PresentationSettings) -> Li
     # Stage directions name their kind ([broll:] is a still, [video:] a clip)
     # and are neither promoted nor demoted; maps and charts are drawn locally
     # and have no video form.
-    movable = [i for i in cutaway_idx if out[i].origin == "llm" and out[i].is_generated]
+    movable = [i for i in cutaway_idx if out[i].origin == "llm" and out[i].is_generated
+               and not out[i].own_path]
     for i in sorted((i for i in movable if out[i].kind == "broll_video"),
                     key=lambda i: out[i].priority):
         if video_secs / total <= ceiling:
@@ -1247,7 +1248,7 @@ def fallback_plan(program: Program, settings: PresentationSettings,
             image_prompt=genre_mod.apply_look(
                 (f"Cinematic documentary photograph representing {subject}, "
                  f"natural lighting, 35mm film still, shallow depth of field")
-                if art_mod.is_real(settings.art_style) else f"A simple picture representing {subject}",
+                if art_mod.is_photoreal_base(settings.art_style) else f"A simple picture representing {subject}",
                 genre, genre_secondary, settings.art_style),
             negative_prompt=genre_mod.apply_negative(
                 "text, watermark, logo, deformed hands, blurry", genre, genre_secondary, settings.art_style),

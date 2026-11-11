@@ -72,7 +72,8 @@ def steady_for_genre(beats: Iterable, genre: Optional[str]) -> int:
         return 0
     changed = 0
     for beat in beats:
-        if getattr(beat, "kind", None) != "broll_video" or getattr(beat, "camera_move", None):
+        if (getattr(beat, "kind", None) != "broll_video" or getattr(beat, "camera_move", None)
+                or getattr(beat, "own_path", None)):
             continue
         move = camera_move(beat.video_prompt)
         if not move:

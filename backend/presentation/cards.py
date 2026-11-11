@@ -163,7 +163,8 @@ def place_cards(timeline: Timeline, beats: Sequence[Beat], program: Program,
                 settings: PresentationSettings, genre: str = "general",
                 genre_secondary: Optional[str] = None,
                 popup_windows: Optional[Sequence[Tuple[float, float]]] = None,
-                face_anchors: Optional[Dict[str, Tuple[float, float]]] = None) -> Dict[str, int]:
+                face_anchors: Optional[Dict[str, Tuple[float, float]]] = None,
+                skip_ids: Optional[set] = None) -> Dict[str, int]:
     """Put every text beat on the timeline that can be placed without a clash.
 
     Returns counts per kind. Beats of other kinds are ignored.
@@ -177,9 +178,15 @@ def place_cards(timeline: Timeline, beats: Sequence[Beat], program: Program,
     `genre_secondary`, when given, biases which kind wins a shared zone slot
     at a tie — see `_KIND_AFFINITY` / `_affinity_boost` — without changing
     anything else about placement.
+
+    `skip_ids`, when given, drops beats already drawn in full elsewhere --
+    today a `stat_callout` a motion-template render already turned into its
+    own animated cutaway (MOTION_GRAPHICS_PLAN.md M2; presentation/motion.py),
+    so its text card here would double the same number on screen.
     """
     clear_generated(timeline, CARD_ORIGIN)
-    cards = [b for b in beats if b.is_text and (b.text or "").strip()]
+    skip_ids = skip_ids or set()
+    cards = [b for b in beats if b.is_text and (b.text or "").strip() and b.id not in skip_ids]
     if not cards:
         return {}
 

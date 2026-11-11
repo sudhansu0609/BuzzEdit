@@ -299,22 +299,28 @@ _FONT_FILES = {
 # --- request models ----------------------------------------------------------
 
 class Shot(BaseModel):
-    prompt: str
+    prompt: str = ""
     motion: str = ""
     seconds: float = 6.0
     # "still": a Z-Image picture only, held with a slow breathing push (the
-    # only motion a still gets). "video": a Wan clip, its own motion, no zoom.
+    # only motion a still gets). "video": a Wan clip, its own motion, no
+    # zoom. "stick" (STICK_WORLD_PLAN.md SW2): a StickScene, over its own
+    # `bg` picture (made like a still shot) or today's plain ground -- the
+    # fields below are `[stick: ...]`'s own (presentation/script.py::
+    # directive_beats), `prompt` unused.
     kind: str = "still"
     # VR4: this shot is the reel's lead character -- the request's own
     # `character` must be set, and `generate_assets` swaps that one face in.
     shows_character: bool = False
-
-    @field_validator("prompt")
-    @classmethod
-    def _prompt_not_blank(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("a shot's prompt must not be empty")
-        return v
+    # kind="stick" only -- see presentation/script.py::directive_beats'
+    # `stick` branch for what each of these means; `action` defaults to
+    # "idle" exactly as the directive does, everything else is optional.
+    action: str = "idle"
+    scene: str = ""
+    era: Optional[str] = None
+    outfit: Optional[str] = None
+    bg: Optional[str] = None
+    caption: Optional[str] = None
 
     @field_validator("seconds")
     @classmethod
@@ -327,9 +333,15 @@ class Shot(BaseModel):
     @classmethod
     def _kind_known(cls, v: str) -> str:
         v = (v or "still").strip().lower()
-        if v not in ("still", "video"):
-            raise ValueError("a shot's kind must be 'still' or 'video'")
+        if v not in ("still", "video", "stick"):
+            raise ValueError("a shot's kind must be 'still', 'video' or 'stick'")
         return v
+
+    @model_validator(mode="after")
+    def _prompt_required_unless_stick(self) -> "Shot":
+        if self.kind != "stick" and not (self.prompt or "").strip():
+            raise ValueError("a shot's prompt must not be empty")
+        return self
 
 
 class Line(BaseModel):
@@ -469,8 +481,8 @@ class VibeReelRequest(BaseModel):
     @classmethod
     def _style_known(cls, v: str) -> str:
         v = (v or "real").strip().lower()
-        if v not in ("real", "painterly", "illustrated"):
-            raise ValueError("art_style must be 'real', 'painterly' or 'illustrated'")
+        if v not in ("real", "painterly", "illustrated", "stick_world"):
+            raise ValueError("art_style must be 'real', 'painterly', 'illustrated' or 'stick_world'")
         return v
 
     @field_validator("quality")
@@ -582,6 +594,35 @@ def font_for_script(script: str) -> str:
     return DEVANAGARI_FONT if script == "devanagari" else ROMAN_FONT
 
 
+def _stick_shot_beat(shot: Shot, index: int, start_s: float, seconds: float, world: str) -> Beat:
+    """A `kind: "stick"` shot (STICK_WORLD_PLAN.md SW2) -> a `stick_scene`
+    beat, the same `data` shape `[stick: ...]` builds (presentation/
+    script.py::directive_beats) -- `action`/`scene`/`era`/`outfits`/`bg`/
+    `caption`, `figures` defaulting to the number of outfits named (else
+    1). `bg`, when named, gets the reel's own `world` appended and its
+    camera words stripped, the same way every other shot's prompt does."""
+    data: Dict[str, Any] = {"action": (shot.action or "idle").strip().lower() or "idle",
+                            "scene": shot.scene or ""}
+    era = (shot.era or "").strip().lower() or None
+    if era:
+        data["era"] = era
+    outfits = [o.strip().lower() for o in (shot.outfit or "").split(";") if o.strip()][:3]
+    if outfits:
+        data["outfits"] = outfits
+    data["figures"] = len(outfits) if outfits else 1
+    bg = strip_camera_words(shot.bg or "").strip()
+    if bg:
+        if world:
+            bg = f"{bg}, {world}"
+        data["bg"] = bg
+    caption = (shot.caption or "").strip()[:60] or None
+    if caption:
+        data["caption"] = caption
+    return Beat(id=f"shot{index}", start_s=start_s, end_s=start_s + seconds,
+               topic="vibe reel scene", kind="stick_scene", data=data,
+               text=caption or "", planned_duration_s=seconds, origin="vibe_reel")
+
+
 def build_beats(req: VibeReelRequest, durations: Optional[List[float]] = None) -> List[Beat]:
     """One `broll_image` (still) or `broll_video` (clip) beat per shot, in
     order, each carrying the shared `world` so every scene reads as one
@@ -600,6 +641,10 @@ def build_beats(req: VibeReelRequest, durations: Optional[List[float]] = None) -
     beats: List[Beat] = []
     t = 0.0
     for i, (shot, seconds) in enumerate(zip(req.shots, plan)):
+        if shot.kind == "stick":
+            beats.append(_stick_shot_beat(shot, i, t, seconds, req.world))
+            t += seconds
+            continue
         scene = strip_camera_words(shot.prompt)
         if req.world:
             scene = f"{scene}, {req.world}"
@@ -1060,7 +1105,8 @@ def build_video_graph(shot_durations: List[float], shot_kinds: List[str],
     desaturation on top either way."""
     if not shot_durations:
         raise VibeReelError("no shots to render")
-    stepped = look_pass and art_style == "illustrated"
+    # stick_world's pictures are the illustrated look too (STICK_WORLD_PLAN.md).
+    stepped = look_pass and art_style in ("illustrated", "stick_world")
     parts: List[str] = []
     for i, (seconds, kind) in enumerate(zip(shot_durations, shot_kinds)):
         pad = shot_pads[i] if i < len(shot_pads) else 0.0
@@ -1082,7 +1128,7 @@ def build_video_graph(shot_durations: List[float], shot_kinds: List[str],
         f"fade=t=out:st={fade_out_start:.3f}:d={FADE_OUT_S:.3f}[faded]")
     graded_label = "faded"
     if look_pass:
-        chain = (ILLUSTRATED_LOOK_PASS_FILTER if art_style == "illustrated"
+        chain = (ILLUSTRATED_LOOK_PASS_FILTER if art_style in ("illustrated", "stick_world")
                  else f"{HANDHELD_DRIFT_FILTER},{LOOK_PASS_FILTER}")
         if grade == GRADE_BW:
             chain += f",{BW_FILTER}"
@@ -1287,6 +1333,49 @@ async def _generate_shot(beat: Beat, project_dir: Path, settings: PresentationSe
             continue
         return path, actual, pad, "", workflow_file
     return None, 0.0, 0.0, last_reason, ""
+
+
+async def _generate_stick_shot(beat: Beat, project_dir: Path, settings: PresentationSettings,
+                               seed_base: int) -> Tuple[Optional[Path], float, float, str, str]:
+    """A `kind: "stick"` shot (STICK_WORLD_PLAN.md SW2): its own background
+    picture, when `bg` named one, is made exactly like an ordinary still
+    shot (`_generate_shot` on a one-off `broll_image` beat, same retries);
+    the figures are then drawn over it -- or over today's plain ground, with
+    no picture at all -- by `presentation.motion`'s own StickScene builder,
+    at this reel's own size. Returns (path, duration_s, pad_s, reason,
+    "still"|"video") -- "video" only when the motion engine actually
+    rendered; the picture itself (or `motion_stick.render_stick_still` when
+    there is none) is the fallback, placed as a still shot like any other
+    scene -- never failing the whole reel."""
+    from . import motion as motion_stage
+    from . import motion_stick as motion_stick_stage
+
+    wanted_s = beat.planned_duration_s or beat.duration_s
+    bg_prompt = motion_stick_stage.compose_bg_prompt(beat.data or {})
+    if bg_prompt:
+        style = art_mod.get(settings.art_style)
+        full_prompt = f"{bg_prompt}, {style.look}" if style.look else bg_prompt
+        bg_beat = Beat(id=f"{beat.id}_bg", start_s=beat.start_s, end_s=beat.start_s,
+                       kind="broll_image", image_prompt=full_prompt)
+        bg_path, _actual, _pad, bg_reason, _wf = await _generate_shot(
+            bg_beat, project_dir, settings, seed_base=seed_base)
+        if bg_path is not None:
+            beat.data["bg_image"] = str(bg_path)
+            beat.data["bg_luma"] = motion_stick_stage.measure_bg_luma(str(bg_path))
+        else:
+            logger.info("Stick shot %s: background picture failed (%s); drawing the plain ground",
+                       beat.id, bg_reason)
+
+    assets, failures, handled = await asyncio.to_thread(
+        motion_stage.render_motion_assets, [beat], project_dir, WIDTH, HEIGHT, "general", settings)
+    if beat.id in handled and assets:
+        asset = assets[0]
+        return Path(asset.path), asset.duration_s, 0.0, "", "video"
+    fallback = motion_stage.render_fallback(beat, project_dir, WIDTH, HEIGHT)
+    if fallback is not None and Path(fallback.path).is_file():
+        return Path(fallback.path), wanted_s, 0.0, "", "still"
+    reason = failures[0]["reason"] if failures else "stick scene could not be made"
+    return None, 0.0, 0.0, reason, "still"
 
 
 # --- continuous shots: chaining several image-to-video segments (VR7) -----------
@@ -1767,6 +1856,7 @@ async def render_vibe_reel(req: VibeReelRequest,
         shot_pads: List[float] = []
         shot_workflows: List[str] = []
         shot_chains: List[int] = []
+        shot_kinds_resolved: List[str] = []
         failures: List[Dict[str, str]] = []
         for i, beat in enumerate(beats):
             # Master pause (BuzzcafStudio docs/STUDIO_DIRECTOR_PLAN.md Part
@@ -1790,6 +1880,25 @@ async def render_vibe_reel(req: VibeReelRequest,
             # varies, since its own seed also carries the beat id.
             seed_base = CHARACTER_SEED_BASE if beat.shows_character else 1000 + i * 7
             wanted_s = beat.planned_duration_s or beat.duration_s
+            if beat.kind == "stick_scene":
+                for _retry in range(2):
+                    path, actual, pad, reason, resolved_kind = await _generate_stick_shot(
+                        beat, shot_dir, settings, seed_base=seed_base)
+                    if path is not None or not master_control.is_paused():
+                        break
+                    await master_control.wait_if_paused_async(
+                        f"vibe_reel: shot {i + 1}/{len(beats)} (retry after the pause)", report)
+                if path is None:
+                    failures.append({"beat_id": beat.id, "reason": reason})
+                    continue
+                shot_paths.append(path)
+                shot_durations.append(actual)
+                shot_pads.append(pad)
+                shot_workflows.append("")
+                shot_chains.append(1)
+                shot_kinds_resolved.append(resolved_kind)
+                report(0.05 + 0.55 * (i + 1) / len(beats), f"Scene {i + 1}/{len(beats)} ready")
+                continue
             chained = beat.kind == "broll_video" and wanted_s > CHAIN_SEGMENT_SECONDS_MAX + SHOT_PAD_TOLERANCE_S
             # "now" mode interrupts ComfyUI mid-shot (master_control._interrupt_comfyui_now):
             # that reads here as an ordinary generation failure. Hold instead of
@@ -1820,6 +1929,7 @@ async def render_vibe_reel(req: VibeReelRequest,
             shot_pads.append(pad)
             shot_workflows.append(workflow_file)
             shot_chains.append(segments)
+            shot_kinds_resolved.append(req.shots[i].kind)
             report(0.05 + 0.55 * (i + 1) / len(beats), f"Scene {i + 1}/{len(beats)} ready")
 
         if failures:
@@ -1827,7 +1937,11 @@ async def render_vibe_reel(req: VibeReelRequest,
                 f"{len(failures)} shot(s) could not be made: "
                 + "; ".join(f"{f['beat_id']} ({f['reason']})" for f in failures))
 
-        shot_kinds = [s.kind for s in req.shots]
+        # A "stick" shot resolves to "video" (the motion engine actually
+        # rendered it) or "still" (its picture, or motion_stick.
+        # render_stick_still, as a fallback) -- never literally "stick",
+        # which build_video_graph does not know (STICK_WORLD_PLAN.md SW2).
+        shot_kinds = shot_kinds_resolved
         total_estimate = sum(shot_durations) - max(0, len(shot_durations) - 1) * dissolve_s
 
         music_path: Optional[Path] = None

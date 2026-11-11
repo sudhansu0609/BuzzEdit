@@ -42,6 +42,11 @@ def _stage(job_id: str, text: str) -> None:
 #: first one, and the longest it waits for it.
 _JOIN_POLL_SECONDS = 5.0
 _JOIN_MAX_SECONDS = 8 * 60 * 60
+#: A running job whose stage has not changed for this long is hung, not busy:
+#: Whisper reports nothing inside its stage, so the stage's age is all there is.
+#: Matches the Studio's own "no progress for 120 minutes" (2026-10-26: four
+#: Studio retries joined trans_74f0d3c9, stuck at 0% for 9 h, and waited 2 h each).
+_STUCK_SECONDS = 110 * 60
 
 
 async def _join_running(job_id: str) -> Optional[dict]:
@@ -55,6 +60,15 @@ async def _join_running(job_id: str) -> Optional[dict]:
     running = jobs.get(job_id)
     if not running or running.get("status") != "running":
         return None
+    stuck_for = time.time() - float(running.get("updated_at") or time.time())
+    if stuck_for > _STUCK_SECONDS:
+        # Its thread is wedged in native code and still holds the Whisper lease,
+        # so a second run would only queue behind it: fail fast and say why.
+        msg = (f"{job_id} has been stuck at '{running.get('stage')}' for {int(stuck_for // 60)} min; "
+               "BuzzEdit's backend needs a restart to free Whisper")
+        running.update(status="failed", error=msg)
+        logging.getLogger("transcription").error(msg)
+        raise HTTPException(status_code=503, detail=msg)
     logging.getLogger("transcription").info(
         "%s is already running (%s); joining it instead of starting another.", job_id, running.get("stage"))
     started = time.monotonic()

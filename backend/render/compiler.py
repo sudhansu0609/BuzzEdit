@@ -503,8 +503,18 @@ class FilterGraphCompiler:
         #    neighbouring speech over every join. The declick is already handled
         #    by each segment's 8ms edge fades.
         if not a1_labels:
+            # Bounded, not a bare anullsrc: an unterminated silence source
+            # left mapped straight to the output is infinite, and without
+            # -shortest on the final command ffmpeg never returns (the same
+            # sharp edge preview.py's one-frame compose_frame works around by
+            # sinking it instead -- see its own docstring). A fully silent V1
+            # track (no audio stream at all, e.g. a motion-stinger test clip)
+            # hits this path on a real render, not just the preview.
             base_a_label = "[anull]"
-            filters.append(f"anullsrc=r=48000:cl=stereo{base_a_label}")
+            filters.append(
+                f"anullsrc=r=48000:cl=stereo,atrim=duration={program_seconds + 1.0:.3f},"
+                f"asetpts=PTS-STARTPTS{base_a_label}"
+            )
         else:
             audio_durations = [self._sec(i.duration_frames) for i in a1_items if not i.mute]
             if pad_frames > 0:

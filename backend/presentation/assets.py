@@ -17,6 +17,7 @@ import hashlib
 import json
 import re
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -394,6 +395,82 @@ def _probe(path: Path) -> Tuple[int, int, float]:
             return 0, 0, 0.0
 
 
+# --- the creator's own clips (`own=` on a `[video:]` direction) -----------------------------
+# OWN_FOOTAGE_PLAN.md OF3. Such a beat never reaches ComfyUI, stock or a near match: its
+# file is copied into the project once and shown from `in=` for the beat's length.
+OWN_HOLD_MAX_S = 0.5     # a clip this much shorter than its beat holds its last frame
+OWN_MIN_SEGMENT_S = 0.3  # less than this left after `in=` is no shot at all
+
+
+def _probe_own(path: Path) -> Tuple[int, int, float, bool]:
+    """(width, height, duration, has_audio) of a clip; zeros if unreadable."""
+    try:
+        from utils.ffmpeg_utils import get_video_info
+        info = get_video_info(str(path))
+        return (int(info.get("width") or 0), int(info.get("height") or 0),
+                float(info.get("duration") or 0.0),
+                (info.get("audio_codec") or "none") != "none")
+    except Exception:
+        return 0, 0, 0.0, False
+
+
+def _own_copy(source: Path, project_dir: Path) -> Path:
+    """The clip inside the project's own assets, made once per path+size+mtime."""
+    stat = source.stat()
+    key = hashlib.sha1(f"{source.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode()).hexdigest()[:16]
+    directory = Path(project_dir) / "assets" / "own"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{key}{source.suffix.lower()}"
+    if not target.exists():
+        try:
+            os.link(source, target)
+        except OSError:
+            shutil.copy2(source, target)
+    return target
+
+
+def resolve_own_assets(beats: List[Beat], project_dir: Path
+                       ) -> Tuple[List[Asset], List[Dict[str, str]]]:
+    """An Asset for every beat with `own_path`; a beat whose clip is missing,
+    unreadable or used up by `in=` is dropped with its reason (the face shows).
+    A clip up to OWN_HOLD_MAX_S short of its beat holds its last frame; a
+    shorter one shortens the beat (logged)."""
+    assets: List[Asset] = []
+    failures: List[Dict[str, str]] = []
+    for beat in beats:
+        source = Path(beat.own_path or "")
+        if not source.is_file() or source.suffix.lower() not in _VIDEO_SUFFIXES:
+            logger.warning("Beat %s: own clip %s is missing; the speaker stays on screen",
+                           beat.id, beat.own_path)
+            failures.append({"beat_id": beat.id, "reason": f"own clip not found: {beat.own_path}"})
+            continue
+        try:
+            local = _own_copy(source, project_dir)
+        except OSError as e:
+            failures.append({"beat_id": beat.id, "reason": f"own clip could not be copied: {e}"})
+            continue
+        width, height, length, has_audio = _probe_own(local)
+        left = length - max(0.0, beat.own_in_s)
+        if length <= 0 or left < OWN_MIN_SEGMENT_S:
+            reason = "own clip unreadable" if length <= 0 else f"in={beat.own_in_s:g} is past the clip's end"
+            logger.warning("Beat %s: %s (%s); dropped", beat.id, reason, source.name)
+            failures.append({"beat_id": beat.id, "reason": reason})
+            continue
+        wanted = beat.planned_duration_s or beat.duration_s
+        segment = wanted
+        if wanted - left > OWN_HOLD_MAX_S:
+            segment = left
+            beat.planned_duration_s = round(segment, 3)
+            beat.end_s = beat.start_s + segment
+            logger.info("Beat %s: own clip has %.1fs after in=%g; the shot is shortened from %.1fs",
+                        beat.id, left, beat.own_in_s, wanted)
+        assets.append(Asset(beat_id=beat.id, kind="video", path=str(local), width=width,
+                            height=height, duration_s=round(segment, 3), source="own",
+                            own_in_s=max(0.0, beat.own_in_s), has_audio=has_audio,
+                            natsound=beat.natsound if has_audio else 0.0))
+    return assets, failures
+
+
 # How often a pass found without ComfyUI checks again, and the budget it gets
 # before giving up -- see `_wait_for_comfyui`. 2026-10-20: an 8-day outage
 # rendered 263 planned beats with zero B-roll rather than waiting or failing;
@@ -525,6 +602,17 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
     at that size so they fill the frame instead of being letterboxed or cropped.
     An explicit gen_image_size / gen_video_size setting still overrides it.
     """
+    own_beats = [b for b in beats if b.own_path]
+    if own_beats:
+        # The creator's own clips are resolved here and the rest is generated
+        # as before; none of them is ever generated, fetched or near-matched.
+        own_assets, own_failures = await asyncio.to_thread(resolve_own_assets, own_beats, project_dir)
+        rest_assets, rest_failures = await generate_assets(
+            [b for b in beats if not b.own_path], project_dir, settings, progress_cb, seed_base,
+            canvas_size, stats, character, character_cache_dir, workflow_files,
+            gen_size_override, start_image_override)
+        return own_assets + list(rest_assets), own_failures + list(rest_failures)
+
     report = progress_cb or (lambda fraction, message="": None)
     wanted = [b for b in beats if b.kind in ("broll_image", "broll_video", "graphic", "canvas_card")
               or (b.kind == "source_quote" and b.image_prompt)]
@@ -704,6 +792,35 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
     if video_beats and (video_workflow is None or video_workflow.output_kind != "video"):
         video_stats["skipped_reason"] = "no video workflow configured"
         video_beats = []
+    cached_video_secs = 0.0
+    if video_beats:
+        # A clip already on disk needs no memory: take every cached one before
+        # the memory gate, so a busy machine only keeps the uncached beats as
+        # stills (2026-10-24: a re-voiced reel's cached clip was skipped at 0.1 GB
+        # free and the reel failed on the still).
+        from . import live as live_mod
+        uncached: List[Beat] = []
+        for b in video_beats:
+            try:
+                found = await _generate_one(b, resolved, directory, queue_manager, seed_base, canvas_size,
+                                            cache_only=True, face=face if b.shows_character else None,
+                                            boilerplate=boilerplate, used_paths=used_paths,
+                                            size_override=gen_size_override)
+            except Exception as e:
+                logger.debug("Cache lookup for clip %s failed: %s", b.id, e)
+                found = None
+            if found is None or found.kind != "video":
+                uncached.append(b)
+                continue
+            still = stills_by_beat.get(b.id)
+            if still is not None:
+                assets.remove(still)
+                found.still_path = still.path
+            assets.append(found)
+            video_stats["made"] += 1
+            video_stats["cached"] = video_stats.get("cached", 0) + 1
+            cached_video_secs += live_mod.planned_length(b)
+        video_beats = uncached
     if video_beats:
         ready = await gpu_handover.prepare_for_phase(
             "video", need_vram_mb=float(_setting("gen_video_min_vram_mb", VIDEO_PHASE_MIN_VRAM_MB)),
@@ -734,7 +851,7 @@ async def generate_assets(beats: List[Beat], project_dir: Path,
                           key=lambda b: (-float(b.priority or 0.0), b.start_s))
     candidates = list(video_beats) + extra_stills
     cutaways_all = [b for b in wanted if b.is_cutaway]
-    video_secs_made = 0.0
+    video_secs_made = cached_video_secs
     live_applied: Optional[Dict[str, Any]] = None
     number = -1
     for beat in candidates:

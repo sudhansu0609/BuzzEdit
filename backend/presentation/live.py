@@ -154,7 +154,8 @@ def rebalance_clips(beats: List[Beat], settings: PresentationSettings,
     (`made_clips`, by beat id) are kept as video first, then the highest
     priority ones, until the share is met; the rest become stills."""
     share = max(0.0, min(1.0, float(settings.video_broll_share)))
-    cutaways = [b for b in beats if b.is_cutaway and b.is_generated]
+    # The creator's own clips (`own_path`) stay the clips they are.
+    cutaways = [b for b in beats if b.is_cutaway and b.is_generated and not b.own_path]
     quota = clip_quota_seconds(cutaways, share)
     made_clips = made_clips or set()
     out = {b.id: b for b in beats}

@@ -468,6 +468,60 @@ def style_for(genre: str, requested: str = "auto") -> str:
     return "noir" if genre in ("horror", "true_crime") else "clean"
 
 
+def places_for_beat(beat: Beat) -> List[Place]:
+    """The place(s) a map beat names, geocoded -- one, or several in order for
+    a `route` beat (`beat.place` split on →/->/to). Shared by the PIL
+    renderer and the motion builder (motion_data.py) so both draw the same
+    places for the same beat."""
+    names = [n.strip() for n in re.split(r"\s*(?:→|->|to)\s*", beat.place) if n.strip()] \
+        if beat.data.get("route") else [beat.place]
+    return [p for p in (geocode(n) for n in names) if p is not None]
+
+
+# A Natural Earth country can run thousands of points per ring (50m
+# resolution) -- far more than a few seconds of motion graphic needs. Capped
+# by even stride (good enough at the small scale a highlight fill is seen
+# at); a tiny outlying ring (a scatter of islands) is dropped rather than
+# sent across the wire for a shape no one will see at that size.
+_MOTION_RING_MAX_POINTS = 180
+_MOTION_RING_MIN_AREA_FRACTION = 0.03
+
+
+def _simplify_ring(ring: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    if len(ring) <= _MOTION_RING_MAX_POINTS:
+        return ring
+    stride = math.ceil(len(ring) / _MOTION_RING_MAX_POINTS)
+    simplified = ring[::stride]
+    if simplified[-1] != ring[-1]:
+        simplified = simplified + [ring[-1]]
+    return simplified
+
+
+def motion_feature(place: Place) -> Optional[Dict[str, Any]]:
+    """The one Natural Earth polygon a `MotionMap` highlight needs for a
+    country/state place -- its own rings only, the biggest kept (a mainland,
+    not every scattered island), simplified and rounded to 2 decimals, so the
+    prop payload stays small (MOTION_GRAPHICS_PLAN.md M2: "Python sends only
+    in-view features ... coordinates rounded"). None for a city (a point has
+    no shape) or when the source geometry cannot be found."""
+    if place.kind not in ("country", "state"):
+        return None
+    source = _country_index() if place.kind == "country" else _state_index()
+    entry = source.get(_norm(place.name))
+    if not entry:
+        return None
+    rings = [r for r in _rings(entry["geometry"]) if len(r) >= 3]
+    if not rings:
+        return None
+    areas = [_geometry_bbox({"type": "Polygon", "coordinates": [r]}) for r in rings]
+    areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in areas]
+    biggest = max(areas) or 1e-9
+    kept = [r for r, a in zip(rings, areas) if a >= biggest * _MOTION_RING_MIN_AREA_FRACTION] \
+        or [rings[areas.index(biggest)]]
+    out_rings = [[[round(lon, 2), round(lat, 2)] for lon, lat in _simplify_ring(r)] for r in kept]
+    return {"rings": out_rings}
+
+
 def render_map_assets(beats: Sequence[Beat], project_dir: Path, width: int, height: int,
                       genre: str = "general", requested_style: str = "auto") -> Tuple[List[Asset], List[Dict[str, str]]]:
     """A PNG per map beat, cached by place + style + size. Returns (assets, failures)."""
@@ -484,9 +538,7 @@ def render_map_assets(beats: Sequence[Beat], project_dir: Path, width: int, heig
     directory.mkdir(parents=True, exist_ok=True)
 
     for beat in wanted:
-        names = [n.strip() for n in re.split(r"\s*(?:→|->|to)\s*", beat.place) if n.strip()] \
-            if beat.data.get("route") else [beat.place]
-        places = [p for p in (geocode(n) for n in names) if p is not None]
+        places = places_for_beat(beat)
         if not places:
             failures.append({"beat_id": beat.id, "reason": f"unknown place {beat.place!r}"})
             continue

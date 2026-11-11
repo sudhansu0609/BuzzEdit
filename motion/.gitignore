@@ -1,0 +1,7 @@
+# node_modules/ is already ignored repo-wide; these are this project's own
+# generated/cached output (installer/setup_env.ps1 regenerates all of it via
+# `npm install`, never `npm ci`).
+.bundle/
+.selftest/
+public/fonts/*.woff2
+public/world/*.json

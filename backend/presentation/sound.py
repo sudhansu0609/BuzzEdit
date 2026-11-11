@@ -34,7 +34,7 @@ import logging
 import random
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from config import DATA_DIR, FFMPEG_BIN
 from utils.proc import NO_WINDOW
@@ -477,7 +477,8 @@ MAX_GAP_TRACKS = 3   # act moods filled per video, at most
 async def _warm_music(settings: PresentationSettings, genre: str, seed: int,
                       acts: Optional[Sequence[str]],
                       music_cues: Optional[Sequence[Tuple[float, str]]],
-                      duration: float, counts: Dict[str, int]) -> bool:
+                      duration: float, counts: Dict[str, int],
+                      progress: Callable[[str], None] = lambda _msg: None) -> bool:
     """Generate the music this video needs; True when the genre still has no
     bed at all (no music model, or it made nothing), so the caller can fall
     back to a Stable Audio Open loop."""
@@ -524,7 +525,11 @@ async def _warm_music(settings: PresentationSettings, genre: str, seed: int,
         "music", need_vram_mb=music_gen.MUSIC_PHASE_MIN_VRAM_MB,
         need_ram_mb=music_gen.MUSIC_PHASE_MIN_RAM_MB)
     rng = random.Random(seed)
-    for job in jobs:
+    for index, job in enumerate(jobs, 1):
+        # One line per track: a batch of a dozen tracks takes an hour on a
+        # shared card, and a job whose message never changes looks hung to the
+        # Studio (2026-10-26: a render was failed as "stuck" mid-music).
+        progress(f"Making the music: track {index} of {len(jobs)}")
         try:
             if "cue" in job:
                 recipe, engine, text = job["cue"]
@@ -692,7 +697,8 @@ async def warm_generated_cache(settings: PresentationSettings, genre: str, seed:
                                comfyui_online: bool = True,
                                acts: Optional[Sequence[str]] = None,
                                music_cues: Optional[Sequence[Tuple[float, str]]] = None,
-                               duration: float = 0.0) -> Dict[str, int]:
+                               duration: float = 0.0,
+                               progress: Callable[[str], None] = lambda _msg: None) -> Dict[str, int]:
     """Best-effort pre-generation of the SFX/music the library does not cover.
 
     Run BEFORE the (synchronous) planning/placement pass so `_resolve_sfx` and
@@ -713,7 +719,7 @@ async def warm_generated_cache(settings: PresentationSettings, genre: str, seed:
     # names, every act mood the video needs that the library cannot cover gets
     # a track in the genre's style for that mood. Everything lands in the
     # library, so later videos reuse it.
-    music_wanted = await _warm_music(settings, genre, seed, acts, music_cues, duration, counts)
+    music_wanted = await _warm_music(settings, genre, seed, acts, music_cues, duration, counts, progress)
 
     if workflows.resolve("audio") is None:
         return counts

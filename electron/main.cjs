@@ -375,7 +375,12 @@ async function startComfyUI(adopt) {
     COMFY_PYTHON,
     // ComfyUI's own main.py takes --listen/--port; this is how the port we
     // picked is handed down to the sub-service (rule 7).
-    ['main.py', '--base-directory', COMFY_DATA, '--listen', HOST, '--port', String(comfyPort)],
+    // Memory (creator rule 2026-10-26: the PC must not lag or hang): ComfyUI
+    // drops its cache once free RAM falls under 6 GB (default ~3 GB), and pins
+    // no RAM -- 13 GB of pinned memory Windows cannot page out filled the
+    // commit limit and crashed ComfyUI and the Studio window that night.
+    ['main.py', '--base-directory', COMFY_DATA, '--listen', HOST, '--port', String(comfyPort),
+      '--cache-ram', '6', '--disable-pinned-memory'],
     {
       cwd: COMFY_CODE,
       // PYTHONIOENCODING: ComfyUI logs emoji, and on the cp1252 codepage the
